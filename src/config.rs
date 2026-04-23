@@ -1,0 +1,45 @@
+use anyhow::Context;
+use std::{collections::HashSet, net::{IpAddr, SocketAddr}};
+
+pub struct Config {
+    pub mongo_uri: String,
+    pub mongo_db: String,
+    pub rpc_url: String,
+    pub ws_bind: SocketAddr,
+    pub whitelist_ips: HashSet<IpAddr>,
+    pub poll_interval_secs: u64,
+}
+
+impl Config {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let mongo_uri = std::env::var("MONGO_URI").context("MONGO_URI not set")?;
+        let mongo_db = std::env::var("MONGO_DB").context("MONGO_DB not set")?;
+        let rpc_url = std::env::var("RPC_URL").context("RPC_URL not set")?;
+        let ws_bind = std::env::var("WS_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:9001".into())
+            .parse()
+            .context("WS_BIND must be a socket address like 0.0.0.0:9001")?;
+        let whitelist_ips = std::env::var("WHITELIST_IPS")
+            .context("WHITELIST_IPS not set")?
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<IpAddr>())
+            .collect::<Result<HashSet<_>, _>>()
+            .context("WHITELIST_IPS contains an invalid IP")?;
+        let poll_interval_secs = std::env::var("POLL_INTERVAL_SECS")
+            .ok()
+            .map(|s| s.parse::<u64>())
+            .transpose()
+            .context("POLL_INTERVAL_SECS must be a positive integer")?
+            .unwrap_or(3600);
+        Ok(Self {
+            mongo_uri,
+            mongo_db,
+            rpc_url,
+            ws_bind,
+            whitelist_ips,
+            poll_interval_secs,
+        })
+    }
+}
