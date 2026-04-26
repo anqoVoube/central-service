@@ -31,7 +31,7 @@ async fn scan_once(
     rpc: &RpcClient,
     tx: &broadcast::Sender<ServerMsg>,
 ) -> anyhow::Result<()> {
-    let pools = repo.load_pump_fun().await?;
+    let pools = repo.load_pump_fun_confirmed().await?;
     if pools.is_empty() {
         return Ok(());
     }

@@ -8,6 +8,7 @@ pub struct Config {
     pub ws_bind: SocketAddr,
     pub whitelist_ips: HashSet<IpAddr>,
     pub poll_interval_secs: u64,
+    pub wallet_keypair_b58: String,
 }
 
 impl Config {
@@ -33,6 +34,8 @@ impl Config {
             .transpose()
             .context("POLL_INTERVAL_SECS must be a positive integer")?
             .unwrap_or(3600);
+        let wallet_keypair_b58 =
+            std::env::var("WALLET_KEYPAIR").context("WALLET_KEYPAIR not set")?;
         Ok(Self {
             mongo_uri,
             mongo_db,
@@ -40,6 +43,7 @@ impl Config {
             ws_bind,
             whitelist_ips,
             poll_interval_secs,
+            wallet_keypair_b58,
         })
     }
 }

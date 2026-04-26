@@ -12,15 +12,20 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc::UnboundedSender};
 
-use crate::{mongo::Repo, pool::PoolDoc};
+use crate::{mongo::Repo, pool::{PoolAccounts, PoolDoc}};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
     Init {
         pools: Vec<PoolDoc>,
+    },
+    NewPool {
+        pool: String,
+        #[serde(flatten)]
+        accounts: PoolAccounts,
     },
     CreatorChange {
         pool: String,
@@ -29,11 +34,18 @@ pub enum ServerMsg {
     },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientMsg {
+    DiscoveredPool { pool: String },
+}
+
 #[derive(Clone)]
 struct AppState {
     repo: Arc<Repo>,
     whitelist: Arc<HashSet<IpAddr>>,
     tx: broadcast::Sender<ServerMsg>,
+    discover_tx: UnboundedSender<String>,
 }
 
 pub async fn serve(
@@ -41,11 +53,13 @@ pub async fn serve(
     whitelist_ips: HashSet<IpAddr>,
     repo: Arc<Repo>,
     tx: broadcast::Sender<ServerMsg>,
+    discover_tx: UnboundedSender<String>,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
         whitelist: Arc::new(whitelist_ips),
         tx,
+        discover_tx,
     };
     let app = Router::new()
         .route("/ws", get(upgrade))
@@ -78,7 +92,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
 
     let mut rx = state.tx.subscribe();
 
-    let init = match state.repo.load_all().await {
+    let init = match state.repo.load_all_confirmed().await {
         Ok(pools) => ServerMsg::Init { pools },
         Err(e) => {
             tracing::error!("failed to load pools for init: {e:#}");
@@ -114,6 +128,11 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             inbound = receiver.next() => match inbound {
+                Some(Ok(Message::Text(t))) => {
+                    if let Ok(ClientMsg::DiscoveredPool { pool }) = serde_json::from_str(&t) {
+                        let _ = state.discover_tx.send(pool);
+                    }
+                }
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Err(e)) => {
                     tracing::warn!("ws recv error from {addr}: {e}");
