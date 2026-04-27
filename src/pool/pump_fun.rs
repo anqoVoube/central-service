@@ -19,6 +19,8 @@ pub struct PumpFunAccounts {
     pub pool_quote_token_account: String,
     pub coin_creator: String,
     pub owner_program: String,
+    #[serde(default)]
+    pub is_cashback: bool,
 }
 
 pub struct ParsedPool {
