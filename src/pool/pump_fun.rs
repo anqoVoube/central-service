@@ -10,9 +10,8 @@ const POOL_BASE_VAULT_OFF: usize = 139;
 const POOL_QUOTE_VAULT_OFF: usize = 171;
 const COIN_CREATOR_OFF: usize = 211;
 pub const POOL_DATA_MIN: usize = 243;
-// Offset of the is_cashback_coin bool field added in the April-28 2025 upgrade.
-// Verify against a live cashback pool and update if needed.
-pub const IS_CASHBACK_COIN_OFF: usize = 300;
+// Offset of the is_cashback_coin bool field in the pool account.
+pub const IS_CASHBACK_COIN_OFF: usize = 244;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PumpFunAccounts {
