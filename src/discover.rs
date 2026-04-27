@@ -5,30 +5,6 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair};
 use tokio::sync::{broadcast, mpsc::UnboundedReceiver};
 
-const PUMP_FUN_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-
-// pool_v2 layout (Anchor): [discriminator(8), pool_pubkey(32), creator_cashback_bps(u16), ...]
-const POOL_V2_CASHBACK_BPS_OFFSET: usize = 40;
-
-/// Derive pool_v2 PDA and check if creator_cashback_bps > 0.
-pub async fn detect_cashback(rpc: &RpcClient, base_mint: &Pubkey) -> bool {
-    let program = match Pubkey::from_str(PUMP_FUN_PROGRAM) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-    let (pool_v2, _) =
-        Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &program);
-    match rpc.get_account(&pool_v2).await {
-        Ok(acct) if acct.data.len() >= POOL_V2_CASHBACK_BPS_OFFSET + 2 => {
-            let bps = u16::from_le_bytes([
-                acct.data[POOL_V2_CASHBACK_BPS_OFFSET],
-                acct.data[POOL_V2_CASHBACK_BPS_OFFSET + 1],
-            ]);
-            bps > 0
-        }
-        _ => false,
-    }
-}
 
 use crate::{
     ata,
@@ -80,12 +56,13 @@ async fn handle_one(
     let parsed = pump_fun::parse_pool(&pool_acc.data)
         .with_context(|| format!("parse_pool({pool_pk})"))?;
 
+    let is_cashback = pump_fun::parse_is_cashback_coin(&pool_acc.data);
+
     let base_mint = parsed.base_mint;
-    let (mint_acc, is_cashback) = tokio::join!(
-        rpc.get_account(&base_mint),
-        detect_cashback(&rpc, &base_mint),
-    );
-    let mint_acc = mint_acc.with_context(|| format!("getAccountInfo(base_mint={base_mint})"))?;
+    let mint_acc = rpc
+        .get_account(&base_mint)
+        .await
+        .with_context(|| format!("getAccountInfo(base_mint={base_mint})"))?;
     let token_program = mint_acc.owner;
 
     let doc = PoolDoc {
