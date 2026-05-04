@@ -23,6 +23,13 @@ pub struct PumpFunAccounts {
     pub owner_program: String,
     #[serde(default)]
     pub is_cashback: bool,
+    /// Decimals of the base (token) mint. Defaults to 6 if absent in old docs.
+    #[serde(default = "default_decimals")]
+    pub token_decimals: u8,
+}
+
+fn default_decimals() -> u8 {
+    6
 }
 
 pub struct ParsedPool {

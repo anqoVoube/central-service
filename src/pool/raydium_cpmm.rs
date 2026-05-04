@@ -8,4 +8,11 @@ pub struct RaydiumCpmmAccounts {
     pub token_1_vault: String,
     pub observation_key: String,
     pub amm_config: String,
+    /// Decimals of the non-WSOL (token) side. Defaults to 6 if absent in old docs.
+    #[serde(default = "default_decimals")]
+    pub token_decimals: u8,
+}
+
+fn default_decimals() -> u8 {
+    6
 }

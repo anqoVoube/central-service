@@ -64,6 +64,12 @@ async fn handle_one(
         .await
         .with_context(|| format!("getAccountInfo(base_mint={base_mint})"))?;
     let token_program = mint_acc.owner;
+    // SPL Token Mint layout: byte 44 is the decimals field (Token-2022 keeps this).
+    let token_decimals = mint_acc
+        .data
+        .get(44)
+        .copied()
+        .with_context(|| format!("mint {base_mint} data too short for decimals field"))?;
 
     let doc = PoolDoc {
         pool: pool_str.clone(),
@@ -75,6 +81,7 @@ async fn handle_one(
             coin_creator: parsed.coin_creator.to_string(),
             owner_program: token_program.to_string(),
             is_cashback,
+            token_decimals,
         }),
         ata_status: AtaStatus::Pending,
         ata_attempts: 0,

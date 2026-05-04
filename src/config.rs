@@ -1,5 +1,5 @@
 use anyhow::Context;
-use std::{collections::HashSet, net::{IpAddr, SocketAddr}};
+use std::{collections::HashSet, net::{IpAddr, SocketAddr}, path::PathBuf};
 
 pub struct Config {
     pub mongo_uri: String,
@@ -9,6 +9,7 @@ pub struct Config {
     pub whitelist_ips: HashSet<IpAddr>,
     pub poll_interval_secs: u64,
     pub wallet_keypair_b58: String,
+    pub positions_log: PathBuf,
 }
 
 impl Config {
@@ -36,6 +37,9 @@ impl Config {
             .unwrap_or(3600);
         let wallet_keypair_b58 =
             std::env::var("WALLET_KEYPAIR").context("WALLET_KEYPAIR not set")?;
+        let positions_log = std::env::var("POSITIONS_LOG")
+            .unwrap_or_else(|_| "positions.jsonl".into())
+            .into();
         Ok(Self {
             mongo_uri,
             mongo_db,
@@ -44,6 +48,7 @@ impl Config {
             whitelist_ips,
             poll_interval_secs,
             wallet_keypair_b58,
+            positions_log,
         })
     }
 }

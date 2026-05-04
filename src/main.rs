@@ -9,6 +9,7 @@ mod discover;
 mod mongo;
 mod poll;
 mod pool;
+mod positions;
 mod ws;
 
 #[tokio::main]
@@ -30,6 +31,8 @@ async fn main() -> anyhow::Result<()> {
 
     let repo = Arc::new(mongo::Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?);
     repo.ensure_indexes().await?;
+
+    let positions = positions::Positions::load_and_spawn(cfg.positions_log.clone()).await?;
 
     let (broadcast_tx, _rx) = broadcast::channel::<ws::ServerMsg>(1024);
     let (discover_tx, discover_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -54,5 +57,14 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(discover::run(discover_rx, rpc_url, kp, repo, tx));
     }
 
-    ws::serve(cfg.ws_bind, cfg.whitelist_ips, repo, broadcast_tx, discover_tx).await
+    ws::serve(
+        cfg.ws_bind,
+        cfg.whitelist_ips,
+        repo,
+        positions,
+        cfg.positions_log,
+        broadcast_tx,
+        discover_tx,
+    )
+    .await
 }
