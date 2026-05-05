@@ -47,11 +47,15 @@ pub enum ServerMsg {
         ts_ms: u64,
     },
     /// Forwarded to all locations after the lander reports it. Each location
-    /// uses this to clear `Holding::Empty`.
+    /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
+    /// default to 0.0 / 0 from older bots.
     PositionClosed {
         pool: String,
         sig: String,
         ts_ms: u64,
+        sell_price_sol: f64,
+        tokens_sold: u64,
+        landed_location_idx: u8,
     },
 }
 
@@ -222,13 +226,16 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     }
                     Ok(ClientMsg::PositionClosed(r)) => {
                         tracing::info!(
-                            "[position_closed] pool={} sig={}",
-                            r.pool, r.sig
+                            "[position_closed] pool={} sig={} sell_price={} tokens_sold={}",
+                            r.pool, r.sig, r.sell_price_sol, r.tokens_sold
                         );
                         let broadcast = ServerMsg::PositionClosed {
                             pool: r.pool.clone(),
                             sig: r.sig.clone(),
                             ts_ms: r.ts_ms,
+                            sell_price_sol: r.sell_price_sol,
+                            tokens_sold: r.tokens_sold,
+                            landed_location_idx: r.landed_location_idx,
                         };
                         state.positions.record_close(r);
                         let _ = state.tx.send(broadcast);

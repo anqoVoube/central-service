@@ -42,7 +42,20 @@ pub struct ClosedReport {
     pub pool: String,
     pub sig: String,
     pub ts_ms: u64,
+    /// Lamports per raw-token at the moment the sell landed. 0.0 if missing
+    /// (older bot that doesn't carry it).
+    #[serde(default)]
+    pub sell_price_sol: f64,
+    /// Raw-unit count of tokens that left the wallet ATA on the sell. 0 if
+    /// missing.
+    #[serde(default)]
+    pub tokens_sold: u64,
+    /// Location whose tx landed the sell. `u8::MAX` if missing.
+    #[serde(default = "unknown_location")]
+    pub landed_location_idx: u8,
 }
+
+fn unknown_location() -> u8 { u8::MAX }
 
 /// On-disk event shape. `kind` discriminator keeps the file forward-compatible.
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,6 +73,12 @@ enum LogEvent {
         ts_ms: u64,
         pool: String,
         sig: String,
+        #[serde(default)]
+        sell_price_sol: f64,
+        #[serde(default)]
+        tokens_sold: u64,
+        #[serde(default = "unknown_location")]
+        landed_location_idx: u8,
     },
 }
 
@@ -130,6 +149,9 @@ impl Positions {
             ts_ms: r.ts_ms,
             pool: r.pool,
             sig: r.sig,
+            sell_price_sol: r.sell_price_sol,
+            tokens_sold: r.tokens_sold,
+            landed_location_idx: r.landed_location_idx,
         });
     }
 }
