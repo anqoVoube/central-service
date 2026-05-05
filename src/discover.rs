@@ -71,6 +71,8 @@ async fn handle_one(
         .copied()
         .with_context(|| format!("mint {base_mint} data too short for decimals field"))?;
 
+    let (token_name, token_symbol) = fetch_token_meta(&base_mint).await;
+
     let doc = PoolDoc {
         pool: pool_str.clone(),
         accounts: PoolAccounts::PumpFun(PumpFunAccounts {
@@ -85,6 +87,8 @@ async fn handle_one(
         }),
         ata_status: AtaStatus::Pending,
         ata_attempts: 0,
+        token_name,
+        token_symbol,
     };
 
     let inserted = repo.upsert_pending(&doc).await.context("upsert_pending")?;
@@ -104,4 +108,58 @@ async fn handle_one(
     ));
 
     Ok(())
+}
+
+/// Best-effort Dexscreener lookup. 3s timeout. On any failure (network,
+/// status, parse, or no matching token in the response) returns `(None, None)`.
+async fn fetch_token_meta(mint: &Pubkey) -> (Option<String>, Option<String>) {
+    let url = format!("https://api.dexscreener.com/latest/dex/tokens/{mint}");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            eprintln!("[dexscreener] {url} → {}", r.status());
+            return (None, None);
+        }
+        Err(e) => {
+            eprintln!("[dexscreener] {url} failed: {e}");
+            return (None, None);
+        }
+    };
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[dexscreener] {mint} parse failed: {e}");
+            return (None, None);
+        }
+    };
+    let mint_s = mint.to_string();
+    let pairs = match v.get("pairs").and_then(|x| x.as_array()) {
+        Some(p) => p,
+        None => return (None, None),
+    };
+    for p in pairs {
+        for side in ["baseToken", "quoteToken"] {
+            let Some(t) = p.get(side) else { continue };
+            let addr = t.get("address").and_then(|x| x.as_str()).unwrap_or("");
+            if addr == mint_s {
+                let name = t
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_owned());
+                let symbol = t
+                    .get("symbol")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_owned());
+                return (name, symbol);
+            }
+        }
+    }
+    (None, None)
 }

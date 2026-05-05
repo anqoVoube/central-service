@@ -25,6 +25,10 @@ pub struct OpenPosition {
     pub buy_price_sol: f64,
     pub landed_location_idx: u8,
     pub ts_ms: u64,
+    /// Buy-side tx signature. Empty string for legacy lines (pre-this-change)
+    /// where the field wasn't recorded.
+    #[serde(default)]
+    pub sig: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +133,7 @@ impl Positions {
             buy_price_sol: r.buy_price_sol,
             landed_location_idx: r.landed_location_idx,
             ts_ms: r.ts_ms,
+            sig: r.sig.clone(),
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -181,7 +186,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 token_amount,
                 buy_price_sol,
                 landed_location_idx,
-                ..
+                sig,
             } => {
                 out.insert(
                     pool.clone(),
@@ -191,6 +196,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         buy_price_sol,
                         landed_location_idx,
                         ts_ms,
+                        sig,
                     },
                 );
             }

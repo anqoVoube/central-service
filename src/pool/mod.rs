@@ -38,4 +38,11 @@ pub struct PoolDoc {
     pub ata_status: AtaStatus,
     #[serde(default)]
     pub ata_attempts: i32,
+    /// Token display name (Dexscreener `name`). `None` if lookup failed
+    /// or pool was inserted before the field existed.
+    #[serde(default)]
+    pub token_name: Option<String>,
+    /// Token display symbol (Dexscreener `symbol`). Same fallback rules.
+    #[serde(default)]
+    pub token_symbol: Option<String>,
 }
