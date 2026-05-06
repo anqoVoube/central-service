@@ -10,6 +10,7 @@ pub struct Config {
     pub poll_interval_secs: u64,
     pub wallet_keypair_b58: String,
     pub positions_log: PathBuf,
+    pub alts_db_path: PathBuf,
 }
 
 impl Config {
@@ -40,6 +41,9 @@ impl Config {
         let positions_log = std::env::var("POSITIONS_LOG")
             .unwrap_or_else(|_| "positions.jsonl".into())
             .into();
+        let alts_db_path = std::env::var("ALTS_DB_PATH")
+            .unwrap_or_else(|_| "alts.db".into())
+            .into();
         Ok(Self {
             mongo_uri,
             mongo_db,
@@ -49,6 +53,7 @@ impl Config {
             poll_interval_secs,
             wallet_keypair_b58,
             positions_log,
+            alts_db_path,
         })
     }
 }

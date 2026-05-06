@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::broadcast;
 
+mod alts;
 mod ata;
 mod config;
 mod discover;
@@ -37,6 +38,13 @@ async fn main() -> anyhow::Result<()> {
     let (broadcast_tx, _rx) = broadcast::channel::<ws::ServerMsg>(1024);
     let (discover_tx, discover_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
+    let alts = alts::AltStore::open(
+        &cfg.alts_db_path,
+        cfg.rpc_url.clone(),
+        broadcast_tx.clone(),
+    )?;
+    tracing::info!("alts db opened at {}", cfg.alts_db_path.display());
+
     {
         let repo = Arc::clone(&repo);
         let tx = broadcast_tx.clone();
@@ -65,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.positions_log,
         broadcast_tx,
         discover_tx,
+        alts,
     )
     .await
 }

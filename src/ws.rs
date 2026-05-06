@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::io::ReaderStream;
 
 use crate::{
+    alts::AltStore,
     mongo::Repo,
     pool::{PoolAccounts, PoolDoc},
     positions::{ClosedReport, OpenedReport, Positions},
@@ -45,6 +46,11 @@ pub enum ServerMsg {
         landed_location_idx: u8,
         sig: String,
         ts_ms: u64,
+        landed_path: u8,
+        token_name: Option<String>,
+        token_symbol: Option<String>,
+        dump_pct: f64,
+        opportunity_sig: String,
     },
     /// Forwarded to all locations after the lander reports it. Each location
     /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
@@ -56,17 +62,29 @@ pub enum ServerMsg {
         sell_price_sol: f64,
         tokens_sold: u64,
         landed_location_idx: u8,
+        landed_path: u8,
+    },
+    /// Broadcast after central resolves an ALT (either newly-seen, or refetched
+    /// because a bot reported it stale). Each location replaces the cache
+    /// entry — addresses are the full current on-chain list.
+    AltResolved {
+        table: String,
+        addresses: Vec<String>,
     },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
 /// `position_opened` / `position_closed` come from the lander.
+/// `alts_unknown` comes from any location's shred path on a v0 tx whose
+/// referenced ALT is missing or stale — central re-fetches and broadcasts
+/// `alt_resolved` to all clients.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     DiscoveredPool { pool: String },
     PositionOpened(OpenedReport),
     PositionClosed(ClosedReport),
+    AltsUnknown { tables: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -77,6 +95,7 @@ struct AppState {
     tx: broadcast::Sender<ServerMsg>,
     discover_tx: UnboundedSender<String>,
     positions_log: Arc<PathBuf>,
+    alts: AltStore,
 }
 
 pub async fn serve(
@@ -87,6 +106,7 @@ pub async fn serve(
     positions_log: PathBuf,
     tx: broadcast::Sender<ServerMsg>,
     discover_tx: UnboundedSender<String>,
+    alts: AltStore,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -95,10 +115,12 @@ pub async fn serve(
         tx,
         discover_tx,
         positions_log: Arc::new(positions_log),
+        alts,
     };
     let app = Router::new()
         .route("/ws", get(upgrade))
         .route("/positions.jsonl", get(serve_positions_log))
+        .route("/alts.bin", get(serve_alts_snapshot))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -142,6 +164,30 @@ async fn serve_positions_log(
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(Body::from_stream(stream))
         .expect("build streamed body")
+}
+
+/// Bot-init endpoint. Bots fetch this once at startup before opening the WS,
+/// then receive incremental `alt_resolved` broadcasts. IP-whitelisted; same
+/// list as the WS upgrade and `/positions.jsonl`.
+async fn serve_alts_snapshot(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        tracing::warn!("rejecting alts.bin from non-whitelisted ip {}", addr.ip());
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let bytes = match state.alts.snapshot_bincode() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("alts snapshot build failed: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response();
+        }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes))
+        .expect("build alts body")
 }
 
 async fn upgrade(
@@ -220,9 +266,26 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             landed_location_idx: r.landed_location_idx,
                             sig: r.sig.clone(),
                             ts_ms: r.ts_ms,
+                            landed_path: r.landed_path,
+                            token_name: r.token_name.clone(),
+                            token_symbol: r.token_symbol.clone(),
+                            dump_pct: r.dump_pct,
+                            opportunity_sig: r.opportunity_sig.clone(),
                         };
                         state.positions.record_open(r);
                         let _ = state.tx.send(broadcast);
+                    }
+                    Ok(ClientMsg::AltsUnknown { tables }) => {
+                        let mut parsed: Vec<solana_sdk::pubkey::Pubkey> = Vec::with_capacity(tables.len());
+                        for s in &tables {
+                            match s.parse() {
+                                Ok(pk) => parsed.push(pk),
+                                Err(e) => tracing::warn!("alts_unknown bad pubkey {s}: {e}"),
+                            }
+                        }
+                        if !parsed.is_empty() {
+                            state.alts.handle_unknown(parsed);
+                        }
                     }
                     Ok(ClientMsg::PositionClosed(r)) => {
                         tracing::info!(
@@ -236,6 +299,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             sell_price_sol: r.sell_price_sol,
                             tokens_sold: r.tokens_sold,
                             landed_location_idx: r.landed_location_idx,
+                            landed_path: r.landed_path,
                         };
                         state.positions.record_close(r);
                         let _ = state.tx.send(broadcast);

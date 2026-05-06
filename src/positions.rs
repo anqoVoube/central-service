@@ -29,6 +29,23 @@ pub struct OpenPosition {
     /// where the field wasn't recorded.
     #[serde(default)]
     pub sig: String,
+    /// 0=GEYSER, 1=SHREDS, 2=DASHBOARD. Legacy lines default to GEYSER.
+    #[serde(default)]
+    pub landed_path: u8,
+    /// Display name from Dexscreener. Empty for legacy / no-data pools.
+    #[serde(default)]
+    pub token_name: Option<String>,
+    /// Display symbol from Dexscreener.
+    #[serde(default)]
+    pub token_symbol: Option<String>,
+    /// Price drop % at trigger time (negative number, e.g. -3.52). 0.0 if
+    /// not captured (legacy lines or manual buys, of which we have none today).
+    #[serde(default)]
+    pub dump_pct: f64,
+    /// Signature of the external tx that triggered our buy (the dumper).
+    /// Empty for legacy / manual.
+    #[serde(default)]
+    pub opportunity_sig: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +56,16 @@ pub struct OpenedReport {
     pub landed_location_idx: u8,
     pub sig: String,
     pub ts_ms: u64,
+    #[serde(default)]
+    pub landed_path: u8,
+    #[serde(default)]
+    pub token_name: Option<String>,
+    #[serde(default)]
+    pub token_symbol: Option<String>,
+    #[serde(default)]
+    pub dump_pct: f64,
+    #[serde(default)]
+    pub opportunity_sig: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +84,9 @@ pub struct ClosedReport {
     /// Location whose tx landed the sell. `u8::MAX` if missing.
     #[serde(default = "unknown_location")]
     pub landed_location_idx: u8,
+    /// 0=GEYSER, 1=SHREDS, 2=DASHBOARD. Legacy lines default to GEYSER.
+    #[serde(default)]
+    pub landed_path: u8,
 }
 
 fn unknown_location() -> u8 { u8::MAX }
@@ -72,6 +102,16 @@ enum LogEvent {
         buy_price_sol: f64,
         landed_location_idx: u8,
         sig: String,
+        #[serde(default)]
+        landed_path: u8,
+        #[serde(default)]
+        token_name: Option<String>,
+        #[serde(default)]
+        token_symbol: Option<String>,
+        #[serde(default)]
+        dump_pct: f64,
+        #[serde(default)]
+        opportunity_sig: String,
     },
     Closed {
         ts_ms: u64,
@@ -83,6 +123,8 @@ enum LogEvent {
         tokens_sold: u64,
         #[serde(default = "unknown_location")]
         landed_location_idx: u8,
+        #[serde(default)]
+        landed_path: u8,
     },
 }
 
@@ -134,6 +176,11 @@ impl Positions {
             landed_location_idx: r.landed_location_idx,
             ts_ms: r.ts_ms,
             sig: r.sig.clone(),
+            landed_path: r.landed_path,
+            token_name: r.token_name.clone(),
+            token_symbol: r.token_symbol.clone(),
+            dump_pct: r.dump_pct,
+            opportunity_sig: r.opportunity_sig.clone(),
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -144,6 +191,11 @@ impl Positions {
             buy_price_sol: r.buy_price_sol,
             landed_location_idx: r.landed_location_idx,
             sig: r.sig,
+            landed_path: r.landed_path,
+            token_name: r.token_name,
+            token_symbol: r.token_symbol,
+            dump_pct: r.dump_pct,
+            opportunity_sig: r.opportunity_sig,
         });
     }
 
@@ -157,6 +209,7 @@ impl Positions {
             sell_price_sol: r.sell_price_sol,
             tokens_sold: r.tokens_sold,
             landed_location_idx: r.landed_location_idx,
+            landed_path: r.landed_path,
         });
     }
 }
@@ -187,6 +240,11 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 buy_price_sol,
                 landed_location_idx,
                 sig,
+                landed_path,
+                token_name,
+                token_symbol,
+                dump_pct,
+                opportunity_sig,
             } => {
                 out.insert(
                     pool.clone(),
@@ -197,6 +255,11 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         landed_location_idx,
                         ts_ms,
                         sig,
+                        landed_path,
+                        token_name,
+                        token_symbol,
+                        dump_pct,
+                        opportunity_sig,
                     },
                 );
             }
