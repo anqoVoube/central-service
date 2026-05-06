@@ -11,6 +11,7 @@ pub struct Config {
     pub wallet_keypair_b58: String,
     pub positions_log: PathBuf,
     pub alts_db_path: PathBuf,
+    pub bans_db_path: PathBuf,
 }
 
 impl Config {
@@ -44,6 +45,9 @@ impl Config {
         let alts_db_path = std::env::var("ALTS_DB_PATH")
             .unwrap_or_else(|_| "alts.db".into())
             .into();
+        let bans_db_path = std::env::var("BANS_DB_PATH")
+            .unwrap_or_else(|_| "bans.db".into())
+            .into();
         Ok(Self {
             mongo_uri,
             mongo_db,
@@ -54,6 +58,7 @@ impl Config {
             wallet_keypair_b58,
             positions_log,
             alts_db_path,
+            bans_db_path,
         })
     }
 }

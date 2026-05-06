@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 mod alts;
 mod ata;
+mod bans;
 mod config;
 mod discover;
 mod mongo;
@@ -45,6 +46,13 @@ async fn main() -> anyhow::Result<()> {
     )?;
     tracing::info!("alts db opened at {}", cfg.alts_db_path.display());
 
+    let bans = bans::BansStore::open(
+        &cfg.bans_db_path,
+        cfg.rpc_url.clone(),
+        broadcast_tx.clone(),
+    )?;
+    tracing::info!("bans db opened at {}", cfg.bans_db_path.display());
+
     {
         let repo = Arc::clone(&repo);
         let tx = broadcast_tx.clone();
@@ -74,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         broadcast_tx,
         discover_tx,
         alts,
+        bans,
     )
     .await
 }

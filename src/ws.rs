@@ -19,6 +19,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     alts::AltStore,
+    bans::BansStore,
     mongo::Repo,
     pool::{PoolAccounts, PoolDoc},
     positions::{ClosedReport, OpenedReport, Positions},
@@ -71,6 +72,14 @@ pub enum ServerMsg {
         table: String,
         addresses: Vec<String>,
     },
+    /// Broadcast after a fake-dumper wallet is identified (failed opp tx with
+    /// insufficient ATA balance). Locations cache `wallet → banned_until_ms`
+    /// and skip shred-path processing for any tx whose first signer is banned.
+    WalletBanned {
+        wallet: String,
+        banned_until_ms: u64,
+        reason: String,
+    },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
@@ -85,6 +94,17 @@ enum ClientMsg {
     PositionOpened(OpenedReport),
     PositionClosed(ClosedReport),
     AltsUnknown { tables: Vec<String> },
+    /// After the bot dispatches a shred-path buy on an opportunity tx, it
+    /// reports the dumper's tx info. Central waits ~5s, queries
+    /// `getSignatureStatuses(sig)`, and if the tx failed, pulls the dumper's
+    /// ATA balance via `getAccountInfo(dumper_ata)` and bans for 24h when
+    /// `balance < amount_in`.
+    OppCheck {
+        sig: String,
+        dumper_pk: String,
+        dumper_ata: String,
+        amount_in: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -96,6 +116,7 @@ struct AppState {
     discover_tx: UnboundedSender<String>,
     positions_log: Arc<PathBuf>,
     alts: AltStore,
+    bans: BansStore,
 }
 
 pub async fn serve(
@@ -107,6 +128,7 @@ pub async fn serve(
     tx: broadcast::Sender<ServerMsg>,
     discover_tx: UnboundedSender<String>,
     alts: AltStore,
+    bans: BansStore,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -116,11 +138,13 @@ pub async fn serve(
         discover_tx,
         positions_log: Arc::new(positions_log),
         alts,
+        bans,
     };
     let app = Router::new()
         .route("/ws", get(upgrade))
         .route("/positions.jsonl", get(serve_positions_log))
         .route("/alts.bin", get(serve_alts_snapshot))
+        .route("/bans.bin", get(serve_bans_snapshot))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -188,6 +212,29 @@ async fn serve_alts_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build alts body")
+}
+
+/// Wholesale ban-list snapshot for bot startup. Bots fetch once, then receive
+/// incremental `wallet_banned` broadcasts. Same IP whitelist as `/alts.bin`.
+async fn serve_bans_snapshot(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        tracing::warn!("rejecting bans.bin from non-whitelisted ip {}", addr.ip());
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let bytes = match state.bans.snapshot_bincode() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("bans snapshot build failed: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response();
+        }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes))
+        .expect("build bans body")
 }
 
 async fn upgrade(
@@ -285,6 +332,16 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         }
                         if !parsed.is_empty() {
                             state.alts.handle_unknown(parsed);
+                        }
+                    }
+                    Ok(ClientMsg::OppCheck { sig, dumper_pk, dumper_ata, amount_in }) => {
+                        match (dumper_pk.parse::<solana_sdk::pubkey::Pubkey>(),
+                               dumper_ata.parse::<solana_sdk::pubkey::Pubkey>()) {
+                            (Ok(dpk), Ok(dat)) => {
+                                state.bans.handle_opp_check(sig, dpk, dat, amount_in);
+                            }
+                            (Err(e), _) => tracing::warn!("opp_check bad dumper_pk {dumper_pk}: {e}"),
+                            (_, Err(e)) => tracing::warn!("opp_check bad dumper_ata {dumper_ata}: {e}"),
                         }
                     }
                     Ok(ClientMsg::PositionClosed(r)) => {
