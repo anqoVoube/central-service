@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.whitelist_ips.len(),
         wallet_kp.pubkey(),
     );
-    println!("For rebuild");
+    println!("For rebuild...");
 
     let repo = Arc::new(mongo::Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?);
     repo.ensure_indexes().await?;
