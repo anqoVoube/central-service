@@ -62,6 +62,9 @@ pub enum ServerMsg {
         ts_ms: u64,
         sell_price_sol: f64,
         tokens_sold: u64,
+        /// Authoritative SOL received in lamports (wallet WSOL ATA delta).
+        /// 0 for legacy reports.
+        sol_received_lamports: u64,
         landed_location_idx: u8,
         landed_path: u8,
     },
@@ -346,8 +349,8 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     }
                     Ok(ClientMsg::PositionClosed(r)) => {
                         tracing::info!(
-                            "[position_closed] pool={} sig={} sell_price={} tokens_sold={}",
-                            r.pool, r.sig, r.sell_price_sol, r.tokens_sold
+                            "[position_closed] pool={} sig={} sell_price={} tokens_sold={} sol_received_lamports={}",
+                            r.pool, r.sig, r.sell_price_sol, r.tokens_sold, r.sol_received_lamports
                         );
                         let broadcast = ServerMsg::PositionClosed {
                             pool: r.pool.clone(),
@@ -355,6 +358,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             ts_ms: r.ts_ms,
                             sell_price_sol: r.sell_price_sol,
                             tokens_sold: r.tokens_sold,
+                            sol_received_lamports: r.sol_received_lamports,
                             landed_location_idx: r.landed_location_idx,
                             landed_path: r.landed_path,
                         };

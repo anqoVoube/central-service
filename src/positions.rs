@@ -81,6 +81,13 @@ pub struct ClosedReport {
     /// missing.
     #[serde(default)]
     pub tokens_sold: u64,
+    /// Authoritative SOL we actually received (lamports), read from the
+    /// wallet's WSOL ATA pre→post delta on the sell tx. `tokens_sold ×
+    /// sell_price_sol` overstates this by AMM fees + CP curvature; this
+    /// field is the truth. 0 if older bot didn't report it (dashboard then
+    /// falls back to the spot-based estimate).
+    #[serde(default)]
+    pub sol_received_lamports: u64,
     /// Location whose tx landed the sell. `u8::MAX` if missing.
     #[serde(default = "unknown_location")]
     pub landed_location_idx: u8,
@@ -121,6 +128,10 @@ enum LogEvent {
         sell_price_sol: f64,
         #[serde(default)]
         tokens_sold: u64,
+        /// Wallet WSOL ATA delta in lamports — authoritative SOL received.
+        /// 0 for legacy lines that didn't carry it.
+        #[serde(default)]
+        sol_received_lamports: u64,
         #[serde(default = "unknown_location")]
         landed_location_idx: u8,
         #[serde(default)]
@@ -208,6 +219,7 @@ impl Positions {
             sig: r.sig,
             sell_price_sol: r.sell_price_sol,
             tokens_sold: r.tokens_sold,
+            sol_received_lamports: r.sol_received_lamports,
             landed_location_idx: r.landed_location_idx,
             landed_path: r.landed_path,
         });
