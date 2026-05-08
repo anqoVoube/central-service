@@ -46,6 +46,10 @@ pub struct OpenPosition {
     /// Empty for legacy / manual.
     #[serde(default)]
     pub opportunity_sig: String,
+    /// Microseconds from message arrival to `Dispatcher::fire` entry on the
+    /// buy. 0 for legacy lines or unmeasured fires.
+    #[serde(default)]
+    pub process_us: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +70,8 @@ pub struct OpenedReport {
     pub dump_pct: f64,
     #[serde(default)]
     pub opportunity_sig: String,
+    #[serde(default)]
+    pub process_us: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +125,8 @@ enum LogEvent {
         dump_pct: f64,
         #[serde(default)]
         opportunity_sig: String,
+        #[serde(default)]
+        process_us: u32,
     },
     Closed {
         ts_ms: u64,
@@ -192,6 +200,7 @@ impl Positions {
             token_symbol: r.token_symbol.clone(),
             dump_pct: r.dump_pct,
             opportunity_sig: r.opportunity_sig.clone(),
+            process_us: r.process_us,
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -207,6 +216,7 @@ impl Positions {
             token_symbol: r.token_symbol,
             dump_pct: r.dump_pct,
             opportunity_sig: r.opportunity_sig,
+            process_us: r.process_us,
         });
     }
 
@@ -257,6 +267,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 token_symbol,
                 dump_pct,
                 opportunity_sig,
+                process_us,
             } => {
                 out.insert(
                     pool.clone(),
@@ -272,6 +283,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         token_symbol,
                         dump_pct,
                         opportunity_sig,
+                        process_us,
                     },
                 );
             }

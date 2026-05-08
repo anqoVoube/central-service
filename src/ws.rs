@@ -52,6 +52,7 @@ pub enum ServerMsg {
         token_symbol: Option<String>,
         dump_pct: f64,
         opportunity_sig: String,
+        process_us: u32,
     },
     /// Forwarded to all locations after the lander reports it. Each location
     /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
@@ -321,6 +322,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             token_symbol: r.token_symbol.clone(),
                             dump_pct: r.dump_pct,
                             opportunity_sig: r.opportunity_sig.clone(),
+                            process_us: r.process_us,
                         };
                         state.positions.record_open(r);
                         let _ = state.tx.send(broadcast);
