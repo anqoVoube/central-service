@@ -4,12 +4,12 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, State,
+        ConnectInfo, Path, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -149,6 +149,7 @@ pub async fn serve(
         .route("/positions.jsonl", get(serve_positions_log))
         .route("/alts.bin", get(serve_alts_snapshot))
         .route("/bans.bin", get(serve_bans_snapshot))
+        .route("/bans/:wallet", get(serve_ban_lookup))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -239,6 +240,56 @@ async fn serve_bans_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build bans body")
+}
+
+/// Single-wallet ban lookup. Returns 200 + JSON if banned, 404 if not.
+/// IP-whitelisted for parity with the snapshot endpoints.
+///   GET /bans/<wallet_pubkey>
+///   200 → {"wallet":..., "banned_until_ms":..., "remaining_secs":..., "reason":...}
+///   404 → "not banned"
+async fn serve_ban_lookup(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Path(wallet): Path<String>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        tracing::warn!("rejecting bans/<wallet> from non-whitelisted ip {}", addr.ip());
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let wallet_pk: solana_sdk::pubkey::Pubkey = match wallet.parse() {
+        Ok(pk) => pk,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid pubkey: {e}"),
+            )
+                .into_response()
+        }
+    };
+    let entry = match state.bans.lookup(&wallet_pk) {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::error!("ban lookup failed for {wallet_pk}: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response();
+        }
+    };
+    match entry {
+        Some(e) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let remaining_secs = e.banned_until_ms.saturating_sub(now_ms) / 1000;
+            Json(json!({
+                "wallet": wallet,
+                "banned_until_ms": e.banned_until_ms,
+                "remaining_secs": remaining_secs,
+                "reason": e.reason,
+            }))
+            .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not banned").into_response(),
+    }
 }
 
 async fn upgrade(

@@ -63,6 +63,20 @@ impl BansStore {
         })
     }
 
+    /// Look up a single wallet. Returns `None` if not banned (no entry, or
+    /// entry expired). Used by the `GET /bans/:wallet` debug endpoint —
+    /// not on the hot path.
+    pub fn lookup(&self, wallet: &Pubkey) -> anyhow::Result<Option<BanEntry>> {
+        let now_ms = chrono_now_ms();
+        let v = self.inner.db.get(wallet.as_ref()).context("sled get")?;
+        let Some(bytes) = v else { return Ok(None) };
+        let entry: BanEntry = bincode::deserialize(&bytes).context("decode ban entry")?;
+        if entry.banned_until_ms <= now_ms {
+            return Ok(None);
+        }
+        Ok(Some(entry))
+    }
+
     /// Bincode `Vec<(Pubkey, BanEntry)>` for `GET /bans.bin`. Skips entries
     /// whose `banned_until_ms` has already passed (lazy eviction at snapshot
     /// time so the bot doesn't load expired bans).
