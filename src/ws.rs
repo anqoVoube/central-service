@@ -243,19 +243,18 @@ async fn serve_bans_snapshot(
 }
 
 /// Single-wallet ban lookup. Returns 200 + JSON if banned, 404 if not.
-/// IP-whitelisted for parity with the snapshot endpoints.
+/// **Open to any IP** by design — wallet addresses and ban reasons are
+/// public information (the reason cites an on-chain sig), and the endpoint
+/// is intended as a debug helper reachable from anywhere. The other ban
+/// endpoints (`/bans.bin` snapshot, `/ws` upgrade) remain whitelisted
+/// because they're bot-init paths, not public diagnostics.
 ///   GET /bans/<wallet_pubkey>
 ///   200 → {"wallet":..., "banned_until_ms":..., "remaining_secs":..., "reason":...}
 ///   404 → "not banned"
 async fn serve_ban_lookup(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Path(wallet): Path<String>,
 ) -> Response {
-    if !state.whitelist.contains(&addr.ip()) {
-        tracing::warn!("rejecting bans/<wallet> from non-whitelisted ip {}", addr.ip());
-        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
-    }
     let wallet_pk: solana_sdk::pubkey::Pubkey = match wallet.parse() {
         Ok(pk) => pk,
         Err(e) => {
