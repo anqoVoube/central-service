@@ -162,6 +162,10 @@
         max="300"
         style="flex: 0 0 100px;"
       />
+      <label style="display: flex; align-items: center; gap: 6px; color: #aaa; font-size: 12px; padding: 0 8px;">
+        <input type="checkbox" id="time-all" />
+        all (not just triggers)
+      </label>
       <button id="go-time">by time</button>
     </div>
     <div class="toolbar">
@@ -185,15 +189,23 @@
     }
 
     function classify(line) {
-      // Returns { tag, cls, body, ts }
-      const m = line.match(/^\[([\w\- ]+?)\]\s*(.*)$/);
-      if (!m) return { tag: '', cls: 't-other', body: line, ts: null };
+      // Returns { tag, cls, body, ts }.
+      // Lines now start with `ts_ms=<digits> ` (writer-prepended). Strip that
+      // first, parse the ms timestamp, then classify on the remaining body.
+      let ts = null;
+      let rest = line;
+      const tsm = line.match(/^ts_ms=(\d+)\s+(.*)$/);
+      if (tsm) {
+        ts = new Date(parseInt(tsm[1], 10));
+        rest = tsm[2];
+      }
+      const m = rest.match(/^\[([\w\- ]+?)\]\s*(.*)$/);
+      if (!m) return { tag: '', cls: 't-other', body: rest, ts };
       const prefix = m[1].trim();
       const body = m[2];
-      const tsm = body.match(/ts_ms=(\d+)/);
-      const ts = tsm ? new Date(parseInt(tsm[1], 10)) : null;
       let cls = 't-other';
       if (prefix === 'sig-recv')                      cls = 't-sig-recv';
+      else if (prefix === 'sig-skip')                 cls = 't-skip';
       else if (prefix === 'shred-skip')               cls = 't-shred-skip';
       else if (prefix === 'shred')                    cls = 't-shred-skip';
       else if (prefix === 'shred-buy-trigger')        cls = 't-buy-trig';
@@ -201,6 +213,7 @@
       else if (prefix === 'buy-trigger')              cls = 't-buy-trig';
       else if (prefix === 'buy-fired')                cls = 't-buy-fired';
       else if (prefix === 'sell-trigger')             cls = 't-sell-trig';
+      else if (prefix === 'time-sell-trigger')        cls = 't-sell-trig';
       else if (prefix === 'opened')                   cls = 't-opened';
       else if (prefix === 'closed')                   cls = 't-closed';
       else if (prefix === 'tx')                       cls = 't-tx';
@@ -211,12 +224,12 @@
     }
 
     function fmtTs(d) {
-      // HH:MM:SS.mmm
+      // HH:MM:SS (UTC). Millis dropped — the bot's writer batches up to 5 s
+      // per flush, so sub-second precision is meaningless anyway.
       const h = String(d.getUTCHours()).padStart(2, '0');
       const mn = String(d.getUTCMinutes()).padStart(2, '0');
       const s = String(d.getUTCSeconds()).padStart(2, '0');
-      const ms = String(d.getUTCMilliseconds()).padStart(3, '0');
-      return `${h}:${mn}:${s}.${ms}`;
+      return `${h}:${mn}:${s}`;
     }
 
     function render() {
@@ -320,7 +333,9 @@
       $('lines').innerHTML = '<div class="empty">searching…</div>';
       $('go-time').disabled = true;
       try {
-        const r = await fetch('/time/' + encodeURIComponent(t) + '?window=' + w);
+        const showAll = $('time-all').checked;
+        const filter = showAll ? '&filter=all' : '';
+        const r = await fetch('/time/' + encodeURIComponent(t) + '?window=' + w + filter);
         if (r.status === 404) {
           $('status').textContent = 'no lines in that window';
           $('status').className = 'status';

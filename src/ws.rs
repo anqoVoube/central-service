@@ -396,6 +396,13 @@ struct TimeQuery {
     /// Default 6 (so a 12 s search) — covers the bot's worst-case batch
     /// drift (5 s) with a 1 s margin on each side. Capped at 300 (5 min).
     window: Option<u64>,
+    /// Optional output filter:
+    ///   - `triggers` (default) → only lines containing `trigger` (covers
+    ///     `[buy-trigger]`, `[shred-buy-trigger]`, `[sell-trigger]`,
+    ///     `[time-sell-trigger]`).
+    ///   - `all`              → no filter (raw firehose for the window).
+    /// Most ad-hoc queries want triggers; the firehose is huge.
+    filter: Option<String>,
 }
 
 /// `GET /time/<HH:MM:SS>?window=<seconds>` — return all trace lines whose
@@ -443,6 +450,12 @@ async fn serve_time_search(
     let lo = target_ms.saturating_sub(window_secs * 1000);
     let hi = target_ms.saturating_add(window_secs * 1000);
 
+    // Default filter: triggers only. `?filter=all` to disable.
+    let triggers_only = match q.filter.as_deref() {
+        Some("all") => false,
+        _ => true, // default + "triggers" + anything else → triggers
+    };
+
     let dir = std::env::var("SIG_TRACE_DIR").unwrap_or_else(|_| "/home/ubuntu/sig_trace".to_owned());
     let dir = std::path::PathBuf::from(dir);
     if !dir.exists() {
@@ -478,6 +491,9 @@ async fn serve_time_search(
                 let Some(sp) = rest.find(' ') else { continue };
                 let Ok(ts) = rest[..sp].parse::<u64>() else { continue };
                 if ts >= lo && ts <= hi {
+                    if triggers_only && !line.contains("trigger") {
+                        continue;
+                    }
                     out.push_str(&line);
                     out.push('\n');
                     if out.len() >= MAX_BODY_BYTES {
