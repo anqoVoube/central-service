@@ -145,11 +145,13 @@ pub async fn serve(
         bans,
     };
     let app = Router::new()
+        .route("/", get(serve_sig_ui))
         .route("/ws", get(upgrade))
         .route("/positions.jsonl", get(serve_positions_log))
         .route("/alts.bin", get(serve_alts_snapshot))
         .route("/bans.bin", get(serve_bans_snapshot))
         .route("/bans/:wallet", get(serve_ban_lookup))
+        .route("/sig/:sig", get(serve_sig_search))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -288,6 +290,102 @@ async fn serve_ban_lookup(
             .into_response()
         }
         None => (StatusCode::NOT_FOUND, "not banned").into_response(),
+    }
+}
+
+/// `GET /` — serve the embedded HTML UI for sig-trace search. Open to any IP
+/// (matches the search endpoint). Single-page app: search bar + filters,
+/// fetches `/sig/:sig` over fetch() to render results client-side.
+async fn serve_sig_ui() -> Response {
+    const SIG_UI_HTML: &str = include_str!("sig_ui.html");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(SIG_UI_HTML))
+        .expect("build sig_ui body")
+}
+
+/// `GET /sig/<sig>` — grep the FR bot's sig-trace files for any line that
+/// contains `<sig>` as a substring, return matches as `text/plain` (one line
+/// per match, oldest file first, then within-file order).
+///
+/// Open to any IP (matches the `/bans/<wallet>` debug-endpoint pattern).
+/// The trace file is local to this central host — `SIG_TRACE_DIR` env
+/// (default `./sig_trace`) must point at the bot's writer directory.
+///
+/// Search order: rolled files newest→oldest (`sig_trace.1.jsonl` is the
+/// most recent rolled, `sig_trace.{MAX_FILES-1}.jsonl` the oldest), then the
+/// active `sig_trace.jsonl`. We return events oldest-first by reading rolled
+/// files in DESCENDING numeric order, then the active file last.
+async fn serve_sig_search(Path(sig): Path<String>) -> Response {
+    if sig.len() < 8 {
+        return (StatusCode::BAD_REQUEST, "sig must be at least 8 chars").into_response();
+    }
+    let dir = std::env::var("SIG_TRACE_DIR").unwrap_or_else(|_| "/home/ubuntu/sig_trace".to_owned());
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.exists() {
+        return (StatusCode::NOT_FOUND, "sig_trace dir not found").into_response();
+    }
+
+    // Collect files in oldest-first order: .9, .8, ..., .1, then active.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for i in (1..10).rev() {
+        let p = dir.join(format!("sig_trace.{}.jsonl", i));
+        if p.exists() {
+            files.push(p);
+        }
+    }
+    let active = dir.join("sig_trace.jsonl");
+    if active.exists() {
+        files.push(active);
+    }
+    if files.is_empty() {
+        return (StatusCode::NOT_FOUND, "no trace files yet").into_response();
+    }
+
+    // Stream matches into a string. For multi-GB files this could be slow;
+    // we cap output at 10 MB to keep the response sane.
+    const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+    let needle = sig.clone();
+    let body_result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::io::{BufRead, BufReader};
+        let mut out = String::new();
+        for path in files {
+            let f = std::fs::File::open(&path)?;
+            let reader = BufReader::new(f);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.contains(&needle) {
+                    out.push_str(&line);
+                    out.push('\n');
+                    if out.len() >= MAX_BODY_BYTES {
+                        out.push_str("...[truncated at 10 MB]\n");
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    })
+    .await;
+
+    match body_result {
+        Ok(Ok(body)) => {
+            if body.is_empty() {
+                (StatusCode::NOT_FOUND, format!("no matches for sig={sig}")).into_response()
+            } else {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Body::from(body))
+                    .expect("build sig response")
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::error!("sig search io error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("io: {e}")).into_response()
+        }
+        Err(e) => {
+            tracing::error!("sig search join error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "join failed").into_response()
+        }
     }
 }
 

@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sig trace</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: #0a0a0a;
+      color: #e6e6e6;
+      margin: 0;
+      padding: 24px;
+      min-height: 100vh;
+    }
+    .container { max-width: 1400px; margin: 0 auto; }
+    .header {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid #1f1f1f;
+      padding-bottom: 14px;
+    }
+    h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+    .subtitle { color: #888; font-size: 13px; }
+    .search { display: flex; gap: 10px; margin-bottom: 14px; }
+    input[type=text] {
+      flex: 1;
+      padding: 11px 14px;
+      background: #161616;
+      border: 1px solid #2a2a2a;
+      color: #e6e6e6;
+      border-radius: 6px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+      transition: border-color 0.1s ease;
+    }
+    input[type=text]:focus {
+      outline: none;
+      border-color: #4a6ea0;
+    }
+    button {
+      padding: 11px 22px;
+      background: #2a4a8a;
+      border: 0;
+      color: #fff;
+      cursor: pointer;
+      border-radius: 6px;
+      font-weight: 500;
+      font-size: 13px;
+      transition: background 0.1s ease;
+    }
+    button:hover { background: #355aa6; }
+    button:active { background: #1f3870; }
+    button:disabled { background: #333; cursor: not-allowed; }
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    .toolbar label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #aaa;
+      cursor: pointer;
+      user-select: none;
+    }
+    .status {
+      color: #888;
+      font-size: 13px;
+      margin-bottom: 12px;
+      min-height: 18px;
+    }
+    .status.error { color: #ff7373; }
+    .status.success { color: #5cb85c; }
+    .lines {
+      font-family: ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      background: #0f0f0f;
+      border: 1px solid #1f1f1f;
+      border-radius: 6px;
+      padding: 14px;
+      overflow-x: auto;
+      max-height: 75vh;
+      overflow-y: auto;
+    }
+    .line {
+      padding: 1px 0;
+      white-space: pre;
+      border-left: 2px solid transparent;
+      padding-left: 8px;
+      margin-left: -8px;
+    }
+    .line:hover { background: #161616; }
+    .ts { color: #555; margin-right: 12px; }
+    .tag {
+      display: inline-block;
+      padding: 1px 7px;
+      margin-right: 8px;
+      border-radius: 3px;
+      font-weight: 600;
+      font-size: 11px;
+      letter-spacing: 0.02em;
+    }
+    /* Tag colors per event type */
+    .t-sig-recv  { background: #1f2733; color: #7da3c4; }
+    .t-skip      { background: #322412; color: #d4a040; }
+    .t-shred-skip{ background: #322412; color: #d4a040; }
+    .t-buy-trig  { background: #142913; color: #67d167; }
+    .t-buy-fired { background: #1c3a1c; color: #87e687; }
+    .t-sell-trig { background: #2e2310; color: #ffae5c; }
+    .t-opened    { background: #112839; color: #6cc1e8; }
+    .t-closed    { background: #2a1632; color: #c887e8; }
+    .t-tx        { background: #15252b; color: #5fb0c4; }
+    .t-tx-err    { background: #321414; color: #ee5a5a; }
+    .t-other     { background: #1f1f1f; color: #aaa; }
+    .body { color: #d8d8d8; }
+    .empty { color: #666; padding: 30px; text-align: center; font-style: italic; }
+    .examples { color: #555; font-size: 11px; margin-top: 6px; font-family: ui-monospace, monospace; }
+    /* highlight the searched signature */
+    mark { background: #b58900; color: #0a0a0a; padding: 0 2px; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>sig trace</h1>
+      <span class="subtitle">paste a tx signature to see every line the bot wrote about it</span>
+    </div>
+    <div class="search">
+      <input
+        type="text"
+        id="sig"
+        placeholder="paste a base58 signature (or just first 8+ chars)"
+        autofocus
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button id="go">lookup</button>
+    </div>
+    <div class="toolbar">
+      <label><input type="checkbox" id="hide-recv" /> hide [sig-recv]</label>
+      <label><input type="checkbox" id="hide-skip" /> hide [shred-skip] / [skip]</label>
+      <label><input type="checkbox" id="hide-tx" /> hide [tx]</label>
+      <label><input type="checkbox" id="auto-ts" checked /> show timestamps</label>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="lines" id="lines">
+      <div class="empty">enter a signature above and press enter</div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let lastResults = [];
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function classify(line) {
+      // Returns { tag, cls, body, ts }
+      const m = line.match(/^\[([\w\- ]+?)\]\s*(.*)$/);
+      if (!m) return { tag: '', cls: 't-other', body: line, ts: null };
+      const prefix = m[1].trim();
+      const body = m[2];
+      const tsm = body.match(/ts_ms=(\d+)/);
+      const ts = tsm ? new Date(parseInt(tsm[1], 10)) : null;
+      let cls = 't-other';
+      if (prefix === 'sig-recv')                      cls = 't-sig-recv';
+      else if (prefix === 'shred-skip')               cls = 't-shred-skip';
+      else if (prefix === 'shred')                    cls = 't-shred-skip';
+      else if (prefix === 'shred-buy-trigger')        cls = 't-buy-trig';
+      else if (prefix === 'shred-buy-fired')          cls = 't-buy-fired';
+      else if (prefix === 'buy-trigger')              cls = 't-buy-trig';
+      else if (prefix === 'buy-fired')                cls = 't-buy-fired';
+      else if (prefix === 'sell-trigger')             cls = 't-sell-trig';
+      else if (prefix === 'opened')                   cls = 't-opened';
+      else if (prefix === 'closed')                   cls = 't-closed';
+      else if (prefix === 'tx')                       cls = 't-tx';
+      else if (prefix === 'tx-err')                   cls = 't-tx-err';
+      else if (prefix === 'skip')                     cls = 't-skip';
+      else if (prefix === 'ws')                       cls = 't-other';
+      return { tag: prefix, cls, body, ts };
+    }
+
+    function fmtTs(d) {
+      // HH:MM:SS.mmm
+      const h = String(d.getUTCHours()).padStart(2, '0');
+      const mn = String(d.getUTCMinutes()).padStart(2, '0');
+      const s = String(d.getUTCSeconds()).padStart(2, '0');
+      const ms = String(d.getUTCMilliseconds()).padStart(3, '0');
+      return `${h}:${mn}:${s}.${ms}`;
+    }
+
+    function render() {
+      const showTs = $('auto-ts').checked;
+      const hideRecv = $('hide-recv').checked;
+      const hideSkip = $('hide-skip').checked;
+      const hideTx = $('hide-tx').checked;
+      const sigQuery = $('sig').value.trim();
+      const lines = lastResults;
+      const tgt = $('lines');
+      if (lines.length === 0) {
+        tgt.innerHTML = '<div class="empty">no matches</div>';
+        return;
+      }
+
+      const filtered = lines.filter(l => {
+        if (hideRecv && l.cls === 't-sig-recv') return false;
+        if (hideSkip && (l.cls === 't-skip' || l.cls === 't-shred-skip')) return false;
+        if (hideTx && l.cls === 't-tx') return false;
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        tgt.innerHTML = '<div class="empty">all matches hidden by filters</div>';
+        return;
+      }
+
+      const html = filtered.map(l => {
+        const tsHtml = (showTs && l.ts)
+          ? `<span class="ts">${fmtTs(l.ts)}</span>`
+          : '';
+        const tagHtml = l.tag ? `<span class="tag ${l.cls}">${escapeHtml(l.tag)}</span>` : '';
+        let body = escapeHtml(l.body);
+        if (sigQuery && sigQuery.length >= 8) {
+          // highlight occurrences of the searched substring
+          const safeQ = sigQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          body = body.replace(new RegExp(safeQ, 'g'), m => `<mark>${escapeHtml(m)}</mark>`);
+        }
+        return `<div class="line">${tsHtml}${tagHtml}<span class="body">${body}</span></div>`;
+      }).join('');
+      tgt.innerHTML = html;
+    }
+
+    async function search() {
+      const sig = $('sig').value.trim();
+      if (!sig) return;
+      if (sig.length < 8) {
+        $('status').textContent = 'sig must be at least 8 chars';
+        $('status').className = 'status error';
+        return;
+      }
+      $('status').textContent = 'searching…';
+      $('status').className = 'status';
+      $('lines').innerHTML = '<div class="empty">searching…</div>';
+      $('go').disabled = true;
+      try {
+        const r = await fetch('/sig/' + encodeURIComponent(sig));
+        if (r.status === 404) {
+          $('status').textContent = 'no matches';
+          $('status').className = 'status';
+          $('lines').innerHTML = '<div class="empty">no matches for ' + escapeHtml(sig) + '</div>';
+          lastResults = [];
+          return;
+        }
+        if (!r.ok) {
+          const txt = await r.text();
+          $('status').textContent = 'HTTP ' + r.status + ': ' + txt;
+          $('status').className = 'status error';
+          return;
+        }
+        const text = await r.text();
+        const rawLines = text.split('\n').filter(x => x.length > 0);
+        lastResults = rawLines.map(classify);
+        const truncated = lastResults.some(l => l.body.includes('[truncated at 10 MB]'));
+        $('status').textContent = lastResults.length + ' line' + (lastResults.length === 1 ? '' : 's')
+          + (truncated ? ' (truncated)' : '');
+        $('status').className = 'status success';
+        render();
+        // Update URL so the search is shareable.
+        const u = new URL(window.location);
+        u.searchParams.set('sig', sig);
+        window.history.replaceState({}, '', u);
+      } catch (e) {
+        $('status').textContent = 'error: ' + e.message;
+        $('status').className = 'status error';
+      } finally {
+        $('go').disabled = false;
+      }
+    }
+
+    $('go').addEventListener('click', search);
+    $('sig').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') search();
+    });
+    ['hide-recv', 'hide-skip', 'hide-tx', 'auto-ts'].forEach(id => {
+      $(id).addEventListener('change', render);
+    });
+
+    // Pre-fill from query string for shareable links.
+    const urlSig = new URLSearchParams(location.search).get('sig');
+    if (urlSig) {
+      $('sig').value = urlSig;
+      search();
+    }
+  </script>
+</body>
+</html>
