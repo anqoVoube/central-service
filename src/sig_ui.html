@@ -131,18 +131,38 @@
   <div class="container">
     <div class="header">
       <h1>sig trace</h1>
-      <span class="subtitle">paste a tx signature to see every line the bot wrote about it</span>
+      <span class="subtitle">search by signature, or by time window to find the opportunity that triggered a missing tx</span>
     </div>
     <div class="search">
       <input
         type="text"
         id="sig"
-        placeholder="paste a base58 signature (or just first 8+ chars)"
+        placeholder="signature (base58, 8+ chars)"
         autofocus
         autocomplete="off"
         spellcheck="false"
       />
-      <button id="go">lookup</button>
+      <button id="go">by sig</button>
+    </div>
+    <div class="search" style="margin-top: 6px;">
+      <input
+        type="text"
+        id="time"
+        placeholder="UTC time (HH:MM:SS) — today only"
+        autocomplete="off"
+        spellcheck="false"
+        style="flex: 0 0 50%;"
+      />
+      <input
+        type="number"
+        id="window"
+        placeholder="± seconds"
+        value="6"
+        min="1"
+        max="300"
+        style="flex: 0 0 100px;"
+      />
+      <button id="go-time">by time</button>
     </div>
     <div class="toolbar">
       <label><input type="checkbox" id="hide-recv" /> hide [sig-recv]</label>
@@ -287,19 +307,81 @@
       }
     }
 
+    async function searchTime() {
+      const t = $('time').value.trim();
+      const w = parseInt($('window').value, 10) || 6;
+      if (!/^\d{1,2}:\d{2}(:\d{2})?$/.test(t)) {
+        $('status').textContent = 'time must be HH:MM or HH:MM:SS (UTC, today)';
+        $('status').className = 'status error';
+        return;
+      }
+      $('status').textContent = `searching ${t} ±${w}s…`;
+      $('status').className = 'status';
+      $('lines').innerHTML = '<div class="empty">searching…</div>';
+      $('go-time').disabled = true;
+      try {
+        const r = await fetch('/time/' + encodeURIComponent(t) + '?window=' + w);
+        if (r.status === 404) {
+          $('status').textContent = 'no lines in that window';
+          $('status').className = 'status';
+          $('lines').innerHTML = `<div class="empty">no lines in [${escapeHtml(t)} ± ${w}s]</div>`;
+          lastResults = [];
+          return;
+        }
+        if (!r.ok) {
+          const txt = await r.text();
+          $('status').textContent = 'HTTP ' + r.status + ': ' + txt;
+          $('status').className = 'status error';
+          return;
+        }
+        const text = await r.text();
+        const rawLines = text.split('\n').filter(x => x.length > 0);
+        lastResults = rawLines.map(classify);
+        const truncated = lastResults.some(l => l.body.includes('[truncated at 10 MB]'));
+        $('status').textContent = lastResults.length + ' line' + (lastResults.length === 1 ? '' : 's')
+          + ` in [${t} ±${w}s]` + (truncated ? ' (truncated)' : '');
+        $('status').className = 'status success';
+        render();
+        // URL-share: ?time=HH:MM:SS&window=N
+        const u = new URL(window.location);
+        u.searchParams.delete('sig');
+        u.searchParams.set('time', t);
+        u.searchParams.set('window', String(w));
+        window.history.replaceState({}, '', u);
+      } catch (e) {
+        $('status').textContent = 'error: ' + e.message;
+        $('status').className = 'status error';
+      } finally {
+        $('go-time').disabled = false;
+      }
+    }
+
     $('go').addEventListener('click', search);
     $('sig').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') search();
+    });
+    $('go-time').addEventListener('click', searchTime);
+    ['time', 'window'].forEach(id => {
+      $(id).addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') searchTime();
+      });
     });
     ['hide-recv', 'hide-skip', 'hide-tx', 'auto-ts'].forEach(id => {
       $(id).addEventListener('change', render);
     });
 
     // Pre-fill from query string for shareable links.
-    const urlSig = new URLSearchParams(location.search).get('sig');
+    const params = new URLSearchParams(location.search);
+    const urlSig = params.get('sig');
+    const urlTime = params.get('time');
     if (urlSig) {
       $('sig').value = urlSig;
       search();
+    } else if (urlTime) {
+      $('time').value = urlTime;
+      const w = params.get('window');
+      if (w) $('window').value = w;
+      searchTime();
     }
   </script>
 </body>

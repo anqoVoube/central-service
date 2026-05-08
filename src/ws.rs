@@ -4,7 +4,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Path, State,
+        ConnectInfo, Path, Query, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -152,6 +152,7 @@ pub async fn serve(
         .route("/bans.bin", get(serve_bans_snapshot))
         .route("/bans/:wallet", get(serve_ban_lookup))
         .route("/sig/:sig", get(serve_sig_search))
+        .route("/time/:time", get(serve_time_search))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -384,6 +385,136 @@ async fn serve_sig_search(Path(sig): Path<String>) -> Response {
         }
         Err(e) => {
             tracing::error!("sig search join error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "join failed").into_response()
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct TimeQuery {
+    /// Half-window in seconds. Total searched range is `[t - window, t + window]`.
+    /// Default 6 (so a 12 s search) — covers the bot's worst-case batch
+    /// drift (5 s) with a 1 s margin on each side. Capped at 300 (5 min).
+    window: Option<u64>,
+}
+
+/// `GET /time/<HH:MM:SS>?window=<seconds>` — return all trace lines whose
+/// `ts_ms=` prefix falls within `[t - window, t + window]` (UTC, today).
+/// Default window = 5 s. Open to any IP.
+///
+/// Useful for finding the opportunity tx that *triggered* a buy when the
+/// buy itself failed and didn't make it into journalctl. Drop in the
+/// approximate UTC time of the failure and grep the file for any
+/// `[buy-trigger]` / `[shred-buy-trigger]` events nearby.
+async fn serve_time_search(
+    Path(time_str): Path<String>,
+    Query(q): Query<TimeQuery>,
+) -> Response {
+    // Parse `HH:MM:SS` (UTC, today). Allow `HH:MM` too — assume 00 seconds.
+    let parts: Vec<&str> = time_str.split(':').collect();
+    let (h, m, s) = match parts.as_slice() {
+        [h, m] => match (h.parse::<u32>(), m.parse::<u32>()) {
+            (Ok(h), Ok(m)) => (h, m, 0u32),
+            _ => return (StatusCode::BAD_REQUEST, "expect HH:MM or HH:MM:SS").into_response(),
+        },
+        [h, m, s] => match (h.parse::<u32>(), m.parse::<u32>(), s.parse::<u32>()) {
+            (Ok(h), Ok(m), Ok(s)) => (h, m, s),
+            _ => return (StatusCode::BAD_REQUEST, "expect HH:MM or HH:MM:SS").into_response(),
+        },
+        _ => return (StatusCode::BAD_REQUEST, "expect HH:MM or HH:MM:SS").into_response(),
+    };
+    if h >= 24 || m >= 60 || s >= 60 {
+        return (StatusCode::BAD_REQUEST, "out of range").into_response();
+    }
+
+    // Today's UTC midnight + (h, m, s) → epoch ms.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let day_ms = 86_400_000u64;
+    let today_midnight_ms = (now_ms / day_ms) * day_ms;
+    let target_ms = today_midnight_ms
+        + (h as u64 * 3_600_000)
+        + (m as u64 * 60_000)
+        + (s as u64 * 1_000);
+
+    let window_secs = q.window.unwrap_or(6).min(300);
+    let lo = target_ms.saturating_sub(window_secs * 1000);
+    let hi = target_ms.saturating_add(window_secs * 1000);
+
+    let dir = std::env::var("SIG_TRACE_DIR").unwrap_or_else(|_| "/home/ubuntu/sig_trace".to_owned());
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.exists() {
+        return (StatusCode::NOT_FOUND, "sig_trace dir not found").into_response();
+    }
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for i in (1..10).rev() {
+        let p = dir.join(format!("sig_trace.{}.jsonl", i));
+        if p.exists() {
+            files.push(p);
+        }
+    }
+    let active = dir.join("sig_trace.jsonl");
+    if active.exists() {
+        files.push(active);
+    }
+    if files.is_empty() {
+        return (StatusCode::NOT_FOUND, "no trace files yet").into_response();
+    }
+
+    const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+    let body_result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        use std::io::{BufRead, BufReader};
+        let mut out = String::new();
+        for path in files {
+            let f = std::fs::File::open(&path)?;
+            let reader = BufReader::new(f);
+            for line in reader.lines().map_while(Result::ok) {
+                // Lines start with `ts_ms=<digits> ` (writer-prepended).
+                // Strip `ts_ms=`, take digits up to next space, parse u64.
+                let Some(rest) = line.strip_prefix("ts_ms=") else { continue };
+                let Some(sp) = rest.find(' ') else { continue };
+                let Ok(ts) = rest[..sp].parse::<u64>() else { continue };
+                if ts >= lo && ts <= hi {
+                    out.push_str(&line);
+                    out.push('\n');
+                    if out.len() >= MAX_BODY_BYTES {
+                        out.push_str("...[truncated at 10 MB]\n");
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    })
+    .await;
+
+    match body_result {
+        Ok(Ok(body)) => {
+            if body.is_empty() {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "no lines in [{} \u{00b1} {}s] (target_ms={target_ms})",
+                        time_str, window_secs
+                    ),
+                )
+                    .into_response()
+            } else {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(Body::from(body))
+                    .expect("build time response")
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::error!("time search io error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("io: {e}")).into_response()
+        }
+        Err(e) => {
+            tracing::error!("time search join error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "join failed").into_response()
         }
     }
