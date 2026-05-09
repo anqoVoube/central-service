@@ -125,6 +125,13 @@
     .examples { color: #555; font-size: 11px; margin-top: 6px; font-family: ui-monospace, monospace; }
     /* highlight the searched signature */
     mark { background: #b58900; color: #0a0a0a; padding: 0 2px; border-radius: 2px; }
+    /* compact opportunity-sig link inside trigger lines */
+    a.opp-link {
+      color: #87e687;
+      text-decoration: none;
+      border-bottom: 1px dotted #4a8a4a;
+    }
+    a.opp-link:hover { color: #b9f5b9; border-bottom-color: #87e687; }
   </style>
 </head>
 <body>
@@ -257,18 +264,54 @@
         return;
       }
 
+      // Trigger / fired lines are very long and noisy. We only really care
+      // about the opportunity sig (clickable to solscan). For those tags,
+      // render a compact body of just `opp=<short_sig>` linked to solscan.
+      // The full line stays intact in the file — this is purely cosmetic.
+      const COMPACT_TAGS = new Set([
+        'buy-trigger',
+        'shred-buy-trigger',
+        'buy-fired',
+        'shred-buy-fired',
+        'sell-trigger',
+        'time-sell-trigger',
+      ]);
+
+      function shortSig(s) {
+        if (!s) return s;
+        if (s.length < 12) return s;
+        return s.slice(0, 6) + '…' + s.slice(-6);
+      }
+
       const html = filtered.map(l => {
         const tsHtml = (showTs && l.ts)
           ? `<span class="ts">${fmtTs(l.ts)}</span>`
           : '';
         const tagHtml = l.tag ? `<span class="tag ${l.cls}">${escapeHtml(l.tag)}</span>` : '';
-        let body = escapeHtml(l.body);
-        if (sigQuery && sigQuery.length >= 8) {
-          // highlight occurrences of the searched substring
-          const safeQ = sigQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          body = body.replace(new RegExp(safeQ, 'g'), m => `<mark>${escapeHtml(m)}</mark>`);
+
+        let bodyHtml;
+        if (COMPACT_TAGS.has(l.tag)) {
+          // Pull `opp=<sig>` (the dump's signature) from the body. For
+          // `*-fired` lines the field is also present (set when firing).
+          // Fall back to `sigs=[…]` for fired lines if no opp.
+          const oppMatch = l.body.match(/\bopp=([1-9A-HJ-NP-Za-km-z]+)/);
+          const opp = oppMatch ? oppMatch[1] : null;
+          if (opp) {
+            const url = `https://solscan.io/tx/${encodeURIComponent(opp)}`;
+            bodyHtml = `<span class="body">opp=<a href="${url}" target="_blank" rel="noopener" class="opp-link" title="${escapeHtml(opp)}">${escapeHtml(shortSig(opp))}</a></span>`;
+          } else {
+            // No opp captured — show the tag only.
+            bodyHtml = '';
+          }
+        } else {
+          let body = escapeHtml(l.body);
+          if (sigQuery && sigQuery.length >= 8) {
+            const safeQ = sigQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            body = body.replace(new RegExp(safeQ, 'g'), m => `<mark>${escapeHtml(m)}</mark>`);
+          }
+          bodyHtml = `<span class="body">${body}</span>`;
         }
-        return `<div class="line">${tsHtml}${tagHtml}<span class="body">${body}</span></div>`;
+        return `<div class="line">${tsHtml}${tagHtml}${bodyHtml}</div>`;
       }).join('');
       tgt.innerHTML = html;
     }
