@@ -97,6 +97,8 @@ pub enum ServerMsg {
         opportunity_sig: String,
         token_name: Option<String>,
         token_symbol: Option<String>,
+        buy_size_lamports: u64,
+        expected_cost_lamports: u64,
     },
 }
 
@@ -692,6 +694,8 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             opportunity_sig: r.opportunity_sig.clone(),
                             token_name: r.token_name.clone(),
                             token_symbol: r.token_symbol.clone(),
+                            buy_size_lamports: r.buy_size_lamports,
+                            expected_cost_lamports: r.expected_cost_lamports,
                         };
                         state.positions.record_failed(r);
                         let _ = state.tx.send(broadcast);

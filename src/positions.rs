@@ -96,6 +96,16 @@ pub struct FailedReport {
     pub token_name: Option<String>,
     #[serde(default)]
     pub token_symbol: Option<String>,
+    /// WSOL lamports the buy ix would have spent if it had succeeded. 0
+    /// for legacy / pre-snapshot reports.
+    #[serde(default)]
+    pub buy_size_lamports: u64,
+    /// Approximate fee+tip lamports paid for the landed-and-reverted tx
+    /// (whichever of the 3 fan-out variants won the nonce race). Computed
+    /// bot-side from `buy_size_lamports` via the bucket-rate table. 0 if
+    /// the bot couldn't compute it.
+    #[serde(default)]
+    pub expected_cost_lamports: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +198,10 @@ enum LogEvent {
         token_name: Option<String>,
         #[serde(default)]
         token_symbol: Option<String>,
+        #[serde(default)]
+        buy_size_lamports: u64,
+        #[serde(default)]
+        expected_cost_lamports: u64,
     },
 }
 
@@ -292,6 +306,8 @@ impl Positions {
             opportunity_sig: r.opportunity_sig,
             token_name: r.token_name,
             token_symbol: r.token_symbol,
+            buy_size_lamports: r.buy_size_lamports,
+            expected_cost_lamports: r.expected_cost_lamports,
         });
     }
 }
