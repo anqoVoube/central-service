@@ -52,6 +52,20 @@ impl Repo {
             .await?)
     }
 
+    /// Pool pubkeys for every row still stuck in `ata_status: pending`.
+    /// Used at central startup to re-feed these into the discovery pipeline
+    /// so the ATA creator gets another shot (subject to a fresh 3-attempt
+    /// budget after the seed binary resets `ata_attempts`).
+    pub async fn load_pending_pubkeys(&self) -> anyhow::Result<Vec<String>> {
+        let docs: Vec<PoolDoc> = self
+            .pools
+            .find(doc! { "ata_status": "pending" })
+            .await?
+            .try_collect()
+            .await?;
+        Ok(docs.into_iter().map(|d| d.pool).collect())
+    }
+
     pub async fn exists(&self, pool: &str) -> anyhow::Result<bool> {
         Ok(self
             .pools

@@ -74,6 +74,26 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(discover::run(discover_rx, rpc_url, kp, repo, tx));
     }
 
+    // Replay pending pools through the discovery pipeline so the ATA
+    // creator gets another shot at each. New rows reset their attempts
+    // counter via the seed binary's `--retry-pending` flag before central
+    // is restarted; the actual retry happens here. Rows whose
+    // `ata_attempts` still equals 3 will fail again immediately and stay
+    // pending — which is the same end state as not running this at all.
+    match repo.load_pending_pubkeys().await {
+        Ok(pending) if !pending.is_empty() => {
+            tracing::info!(
+                "discover: replaying {} pending pool(s) into the ATA creator",
+                pending.len()
+            );
+            for pool in pending {
+                let _ = discover_tx.send(pool);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("load_pending_pubkeys failed: {e:#}"),
+    }
+
     ws::serve(
         cfg.ws_bind,
         cfg.whitelist_ips,
