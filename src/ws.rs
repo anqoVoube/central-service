@@ -22,7 +22,7 @@ use crate::{
     bans::BansStore,
     mongo::Repo,
     pool::{PoolAccounts, PoolDoc},
-    positions::{ClosedReport, OpenedReport, Positions},
+    positions::{ClosedReport, FailedReport, OpenedReport, Positions},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +84,20 @@ pub enum ServerMsg {
         banned_until_ms: u64,
         reason: String,
     },
+    /// Broadcast after a buy attempt landed on chain but reverted. Pure
+    /// dashboard feed — locations don't act on this; their own balance-delta
+    /// detection already keeps `Holding` in sync.
+    PositionFailed {
+        pool: String,
+        sig: String,
+        ts_ms: u64,
+        landed_location_idx: u8,
+        landed_path: u8,
+        dump_pct: f64,
+        opportunity_sig: String,
+        token_name: Option<String>,
+        token_symbol: Option<String>,
+    },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
@@ -97,6 +111,7 @@ enum ClientMsg {
     DiscoveredPool { pool: String },
     PositionOpened(OpenedReport),
     PositionClosed(ClosedReport),
+    PositionFailed(FailedReport),
     AltsUnknown { tables: Vec<String> },
     /// After the bot dispatches a shred-path buy on an opportunity tx, it
     /// reports the dumper's tx info. Central waits ~5s, queries
@@ -660,6 +675,25 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             landed_path: r.landed_path,
                         };
                         state.positions.record_close(r);
+                        let _ = state.tx.send(broadcast);
+                    }
+                    Ok(ClientMsg::PositionFailed(r)) => {
+                        tracing::info!(
+                            "[position_failed] pool={} sig={} loc={} dump_pct={:.3} opp={}",
+                            r.pool, r.sig, r.landed_location_idx, r.dump_pct, r.opportunity_sig
+                        );
+                        let broadcast = ServerMsg::PositionFailed {
+                            pool: r.pool.clone(),
+                            sig: r.sig.clone(),
+                            ts_ms: r.ts_ms,
+                            landed_location_idx: r.landed_location_idx,
+                            landed_path: r.landed_path,
+                            dump_pct: r.dump_pct,
+                            opportunity_sig: r.opportunity_sig.clone(),
+                            token_name: r.token_name.clone(),
+                            token_symbol: r.token_symbol.clone(),
+                        };
+                        state.positions.record_failed(r);
                         let _ = state.tx.send(broadcast);
                     }
                     Err(e) => {

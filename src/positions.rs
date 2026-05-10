@@ -74,6 +74,30 @@ pub struct OpenedReport {
     pub process_us: u32,
 }
 
+/// A buy attempt that landed on chain but reverted — the wallet paid the
+/// priority fee + tip but no position was opened. Reported by the location
+/// that owned the matching `Holding::BuyPending` at the moment of failure.
+/// Informational only: dashboard renders these in history alongside
+/// succeeded trades for visibility, not for trading-state decisions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailedReport {
+    pub pool: String,
+    pub sig: String,
+    pub ts_ms: u64,
+    #[serde(default = "unknown_location")]
+    pub landed_location_idx: u8,
+    #[serde(default)]
+    pub landed_path: u8,
+    #[serde(default)]
+    pub dump_pct: f64,
+    #[serde(default)]
+    pub opportunity_sig: String,
+    #[serde(default)]
+    pub token_name: Option<String>,
+    #[serde(default)]
+    pub token_symbol: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClosedReport {
     pub pool: String,
@@ -144,6 +168,26 @@ enum LogEvent {
         landed_location_idx: u8,
         #[serde(default)]
         landed_path: u8,
+    },
+    /// A buy that landed on chain but reverted (paid fee+tip, no tokens).
+    /// Replay treats this as a no-op for the open-position map; rendered
+    /// in dashboard history alongside succeeded trades.
+    Failed {
+        ts_ms: u64,
+        pool: String,
+        sig: String,
+        #[serde(default = "unknown_location")]
+        landed_location_idx: u8,
+        #[serde(default)]
+        landed_path: u8,
+        #[serde(default)]
+        dump_pct: f64,
+        #[serde(default)]
+        opportunity_sig: String,
+        #[serde(default)]
+        token_name: Option<String>,
+        #[serde(default)]
+        token_symbol: Option<String>,
     },
 }
 
@@ -234,6 +278,22 @@ impl Positions {
             landed_path: r.landed_path,
         });
     }
+
+    /// Append a failed-buy event. Doesn't touch the open-position map —
+    /// failed buys never opened a position, so there's nothing to track.
+    pub fn record_failed(&self, r: FailedReport) {
+        let _ = self.inner.writer.send(LogEvent::Failed {
+            ts_ms: r.ts_ms,
+            pool: r.pool,
+            sig: r.sig,
+            landed_location_idx: r.landed_location_idx,
+            landed_path: r.landed_path,
+            dump_pct: r.dump_pct,
+            opportunity_sig: r.opportunity_sig,
+            token_name: r.token_name,
+            token_symbol: r.token_symbol,
+        });
+    }
 }
 
 fn replay(path: &Path) -> HashMap<String, OpenPosition> {
@@ -289,6 +349,10 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
             }
             LogEvent::Closed { pool, .. } => {
                 out.remove(&pool);
+            }
+            LogEvent::Failed { .. } => {
+                // Failed buys don't open positions — nothing to replay
+                // into the in-memory open-position map.
             }
         }
     }
