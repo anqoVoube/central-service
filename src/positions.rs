@@ -229,6 +229,16 @@ enum LogEvent {
         #[serde(default)]
         leader: Option<LeaderInfo>,
     },
+    /// Late-arriving leader info, emitted after central's async resolve
+    /// completes. Keyed by `opportunity_sig`. The dashboard merges this
+    /// into the matching `Opened` row at parse time. Decoupled from
+    /// `Opened` writes so a fast TP that closes before the leader RPC
+    /// returns doesn't strand the open as an orphan in the file.
+    LeaderResolved {
+        ts_ms: u64,
+        opportunity_sig: String,
+        leader: LeaderInfo,
+    },
 }
 
 /// Owns the in-memory map of open positions and the writer task channel.
@@ -321,6 +331,20 @@ impl Positions {
         });
     }
 
+    /// Append a `leader_resolved` event. Decoupled from `record_open` so
+    /// the open row hits the jsonl before any close that may follow.
+    pub fn record_leader_resolved(&self, opportunity_sig: String, leader: LeaderInfo) {
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let _ = self.inner.writer.send(LogEvent::LeaderResolved {
+            ts_ms,
+            opportunity_sig,
+            leader,
+        });
+    }
+
     /// Append a failed-buy event. Doesn't touch the open-position map —
     /// failed buys never opened a position, so there's nothing to track.
     pub fn record_failed(&self, r: FailedReport, leader: Option<LeaderInfo>) {
@@ -401,6 +425,10 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
             LogEvent::Failed { .. } => {
                 // Failed buys don't open positions — nothing to replay
                 // into the in-memory open-position map.
+            }
+            LogEvent::LeaderResolved { .. } => {
+                // Pure dashboard hint; not relevant to the in-memory open
+                // map. Dashboard re-parses the file and merges separately.
             }
         }
     }

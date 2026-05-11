@@ -658,32 +658,41 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             "[position_opened] pool={} amt={} buy_price={} loc={} sig={} opp={}",
                             r.pool, r.token_amount, r.buy_price_sol, r.landed_location_idx, r.sig, r.opportunity_sig
                         );
-                        // Resolve the slot leader of the opportunity tx
-                        // (`r.opportunity_sig`) before persist + broadcast.
-                        // Adds ~5s to dashboard latency but trading state
-                        // is on-chain driven everywhere, so bots are
-                        // unaffected by the delay.
+                        // Persist the Open row to JSONL IMMEDIATELY so the
+                        // history file always sees `opened` before any
+                        // following `closed` for the same pool. The leader
+                        // RPC takes ~5s; deferring the open write would
+                        // strand fast TPs as orphan closes in the file.
+                        // The broadcast (live page) still goes out after
+                        // leader resolves so the central_positions entry
+                        // includes leader on first appearance.
+                        state.positions.record_open(r.clone(), None);
                         let leaders = state.leaders.clone();
                         let positions = state.positions.clone();
                         let bcast = state.tx.clone();
                         tokio::spawn(async move {
                             let leader = resolve_leader(&leaders, &r.opportunity_sig).await;
+                            if let Some(ref l) = leader {
+                                positions.record_leader_resolved(
+                                    r.opportunity_sig.clone(),
+                                    l.clone(),
+                                );
+                            }
                             let broadcast = ServerMsg::PositionOpened {
-                                pool: r.pool.clone(),
+                                pool: r.pool,
                                 token_amount: r.token_amount,
                                 buy_price_sol: r.buy_price_sol,
                                 landed_location_idx: r.landed_location_idx,
-                                sig: r.sig.clone(),
+                                sig: r.sig,
                                 ts_ms: r.ts_ms,
                                 landed_path: r.landed_path,
-                                token_name: r.token_name.clone(),
-                                token_symbol: r.token_symbol.clone(),
+                                token_name: r.token_name,
+                                token_symbol: r.token_symbol,
                                 dump_pct: r.dump_pct,
-                                opportunity_sig: r.opportunity_sig.clone(),
+                                opportunity_sig: r.opportunity_sig,
                                 process_us: r.process_us,
-                                leader: leader.clone(),
+                                leader,
                             };
-                            positions.record_open(r, leader);
                             let _ = bcast.send(broadcast);
                         });
                     }
