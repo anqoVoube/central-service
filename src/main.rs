@@ -33,6 +33,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.whitelist_ips.len(),
         wallet_kp.pubkey(),
     );
+    {
+        // Echo the parsed whitelist on startup so it's clear which IPs were
+        // actually loaded from `WHITELIST_IPS` — a refused connection then
+        // means the source IP isn't in this list (NAT / wrong NIC / typo).
+        let mut ips: Vec<String> = cfg.whitelist_ips.iter().map(|ip| ip.to_string()).collect();
+        ips.sort();
+        println!("[whitelist] {} ip(s) loaded: {}", ips.len(), ips.join(", "));
+    }
     println!("For rebuild!!!");
 
     let repo = Arc::new(mongo::Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?);
