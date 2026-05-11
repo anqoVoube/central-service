@@ -9,10 +9,12 @@ mod bans;
 mod config;
 mod discover;
 mod lanes;
+mod leaders;
 mod mongo;
 mod poll;
 mod pool;
 mod positions;
+mod validators;
 mod ws;
 
 #[tokio::main]
@@ -57,6 +59,14 @@ async fn main() -> anyhow::Result<()> {
 
     let lanes = lanes::LaneStore::open(&cfg.lanes_db_path, cfg.rpc_url.clone())?;
     tracing::info!("lanes db opened at {}", cfg.lanes_db_path.display());
+
+    let validators = Arc::new(validators::ValidatorMap::fetch(&cfg.validators_csv_url).await);
+    let leaders = leaders::LeaderStore::open(
+        &cfg.leaders_db_path,
+        cfg.rpc_url.clone(),
+        Arc::clone(&validators),
+    )?;
+    tracing::info!("leaders db opened at {}", cfg.leaders_db_path.display());
 
     {
         let repo = Arc::clone(&repo);
@@ -109,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         alts,
         bans,
         lanes,
+        leaders,
     )
     .await
 }

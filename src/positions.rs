@@ -18,6 +18,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::validators::LeaderInfo;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenPosition {
     pub pool: String,
@@ -29,7 +31,8 @@ pub struct OpenPosition {
     /// where the field wasn't recorded.
     #[serde(default)]
     pub sig: String,
-    /// 0=GEYSER, 1=SHREDS, 2=DASHBOARD. Legacy lines default to GEYSER.
+    /// 0=SHREDS, 1=GEYSER, 2=DASHBOARD. Tens digit of the on-chain CU
+    /// price lane (`globals::decode_lane`). Legacy lines default to SHREDS.
     #[serde(default)]
     pub landed_path: u8,
     /// Display name from Dexscreener. Empty for legacy / no-data pools.
@@ -50,6 +53,11 @@ pub struct OpenPosition {
     /// buy. 0 for legacy lines or unmeasured fires.
     #[serde(default)]
     pub process_us: u32,
+    /// Resolved leader of the opportunity tx's slot (the dumper's
+    /// signature). `None` when the RPC resolve failed, the opp sig never
+    /// confirmed, or the leader pubkey isn't in the validators CSV.
+    #[serde(default)]
+    pub leader: Option<LeaderInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,10 +110,16 @@ pub struct FailedReport {
     pub buy_size_lamports: u64,
     /// Approximate fee+tip lamports paid for the landed-and-reverted tx
     /// (whichever of the 3 fan-out variants won the nonce race). Computed
-    /// bot-side from `buy_size_lamports` via the bucket-rate table. 0 if
-    /// the bot couldn't compute it.
+    /// bot-side from `buy_size_lamports` via the bucket-rate table —
+    /// **overstates** the real cost on failed buys (the tip ix reverts with
+    /// the tx). Kept as a fallback; prefer `actual_fee_lamports`.
     #[serde(default)]
     pub expected_cost_lamports: u64,
+    /// On-chain `meta.fee` from `getTransaction` (sig + priority fee only,
+    /// no tip). Set by central during the post-fire RPC resolve. 0 when
+    /// resolve failed.
+    #[serde(default)]
+    pub actual_fee_lamports: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,7 +145,8 @@ pub struct ClosedReport {
     /// Location whose tx landed the sell. `u8::MAX` if missing.
     #[serde(default = "unknown_location")]
     pub landed_location_idx: u8,
-    /// 0=GEYSER, 1=SHREDS, 2=DASHBOARD. Legacy lines default to GEYSER.
+    /// 0=SHREDS, 1=GEYSER, 2=DASHBOARD. Tens digit of the on-chain CU
+    /// price lane (`globals::decode_lane`). Legacy lines default to SHREDS.
     #[serde(default)]
     pub landed_path: u8,
 }
@@ -161,6 +176,11 @@ enum LogEvent {
         opportunity_sig: String,
         #[serde(default)]
         process_us: u32,
+        /// Leader of the opportunity tx's slot, joined against the
+        /// validators CSV by central. `None` when unresolved or the
+        /// validator isn't in the CSV.
+        #[serde(default)]
+        leader: Option<LeaderInfo>,
     },
     Closed {
         ts_ms: u64,
@@ -202,6 +222,12 @@ enum LogEvent {
         buy_size_lamports: u64,
         #[serde(default)]
         expected_cost_lamports: u64,
+        /// `meta.fee` from `getTransaction` — sig + priority fee, no tip.
+        /// 0 for legacy lines or unresolved sigs.
+        #[serde(default)]
+        actual_fee_lamports: u64,
+        #[serde(default)]
+        leader: Option<LeaderInfo>,
     },
 }
 
@@ -245,7 +271,7 @@ impl Positions {
             .values().cloned().collect()
     }
 
-    pub fn record_open(&self, r: OpenedReport) {
+    pub fn record_open(&self, r: OpenedReport, leader: Option<LeaderInfo>) {
         let pos = OpenPosition {
             pool: r.pool.clone(),
             token_amount: r.token_amount,
@@ -259,6 +285,7 @@ impl Positions {
             dump_pct: r.dump_pct,
             opportunity_sig: r.opportunity_sig.clone(),
             process_us: r.process_us,
+            leader: leader.clone(),
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -275,6 +302,7 @@ impl Positions {
             dump_pct: r.dump_pct,
             opportunity_sig: r.opportunity_sig,
             process_us: r.process_us,
+            leader,
         });
     }
 
@@ -295,7 +323,7 @@ impl Positions {
 
     /// Append a failed-buy event. Doesn't touch the open-position map —
     /// failed buys never opened a position, so there's nothing to track.
-    pub fn record_failed(&self, r: FailedReport) {
+    pub fn record_failed(&self, r: FailedReport, leader: Option<LeaderInfo>) {
         let _ = self.inner.writer.send(LogEvent::Failed {
             ts_ms: r.ts_ms,
             pool: r.pool,
@@ -308,6 +336,8 @@ impl Positions {
             token_symbol: r.token_symbol,
             buy_size_lamports: r.buy_size_lamports,
             expected_cost_lamports: r.expected_cost_lamports,
+            actual_fee_lamports: r.actual_fee_lamports,
+            leader,
         });
     }
 }
@@ -344,6 +374,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 dump_pct,
                 opportunity_sig,
                 process_us,
+                leader,
             } => {
                 out.insert(
                     pool.clone(),
@@ -360,6 +391,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         dump_pct,
                         opportunity_sig,
                         process_us,
+                        leader,
                     },
                 );
             }

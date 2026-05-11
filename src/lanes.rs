@@ -58,32 +58,40 @@ const LANE_RESOLVE_WAIT_POLLS: usize = 60;
 
 /// Result of decoding a sig → lane.
 ///
-/// `Resolved(lane)` carries the raw lane index (0..=8 in the current
-/// encoding; any value ≥0 from the on-chain price modulo 10). Caller
-/// converts this to `(path, location)` via [`decode_lane`].
+/// `Resolved` carries the raw lane index (split into path/location via
+/// [`decode_lane`]) plus the on-chain `meta.fee` (sig fee + priority fee
+/// in lamports). The fee is the authoritative cost of a failed buy: the
+/// tip ix reverts with the rest of the tx, so anything the bot estimated
+/// pre-fire (which included the tip) overstates by the tip amount.
 ///
 /// `Unknown` is returned when the tx has no `SetComputeUnitPrice` ix, the
 /// RPC call failed, or the data is malformed. Caller writes `u8::MAX`
-/// into `landed_location_idx` / `landed_path` so the dashboard renders
-/// the row as `—` rather than mis-attributing to FR.
+/// into `landed_location_idx` / `landed_path` and leaves the fee at 0.
 #[derive(Debug, Clone, Copy)]
 pub enum LaneResolution {
-    Resolved(u8),
+    Resolved {
+        lane: u8,
+        actual_fee_lamports: u64,
+    },
     Unknown,
 }
 
 /// Decode an on-chain lane index into `(path, location)`.
 ///
-/// Mirrors the bot's `globals::decode_lane`:
-/// - 0..=3  → path=GEYSER (0), location=lane
-/// - 4..=7  → path=SHREDS (1), location=lane-4
-/// - 8      → path=DASHBOARD (2), location=0 (FR — dashboard is FR-only)
-/// - else   → (u8::MAX, u8::MAX)  (unknown / future encoding)
+/// Mirrors the bot's `globals::decode_lane`. Lane is a two-digit decimal:
+/// tens digit = path, ones digit = location.
+///
+/// - path 0 = SHREDS, 1 = GEYSER, 2 = DASHBOARD
+/// - loc  0 = FR, 1 = AMS, 2 = NY, 3 = TYO, 4 = FR2, 5..=9 reserved
+///
+/// Out-of-range path → `(u8::MAX, u8::MAX)`. Reserved location slots
+/// (5..=9) are returned as-is and rendered as `—` by the dashboard.
 pub fn decode_lane(lane: u8) -> (u8, u8) {
-    match lane {
-        0..=3 => (0, lane),
-        4..=7 => (1, lane - 4),
-        8 => (2, 0),
+    let path = lane / 10;
+    let loc = lane % 10;
+    match path {
+        0 | 1 => (path, loc),
+        2 => (2, loc),
         _ => (u8::MAX, u8::MAX),
     }
 }
@@ -129,8 +137,11 @@ impl LaneStore {
     /// than firing a second RPC.
     pub async fn resolve(&self, sig_str: &str) -> LaneResolution {
         // Cache hit fast path.
-        if let Some(lane) = self.cache_get(sig_str) {
-            return LaneResolution::Resolved(lane);
+        if let Some((lane, fee)) = self.cache_get(sig_str) {
+            return LaneResolution::Resolved {
+                lane,
+                actual_fee_lamports: fee,
+            };
         }
 
         // In-flight dedup: if another task is already resolving this sig,
@@ -144,8 +155,11 @@ impl LaneStore {
         if already_in_flight {
             for _ in 0..LANE_RESOLVE_WAIT_POLLS {
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                if let Some(lane) = self.cache_get(sig_str) {
-                    return LaneResolution::Resolved(lane);
+                if let Some((lane, fee)) = self.cache_get(sig_str) {
+                    return LaneResolution::Resolved {
+                        lane,
+                        actual_fee_lamports: fee,
+                    };
                 }
             }
             return LaneResolution::Unknown;
@@ -170,11 +184,14 @@ impl LaneStore {
         self.inner.in_flight.lock().unwrap().remove(sig_str);
 
         match result {
-            Ok(Some(lane)) => {
-                if let Err(e) = self.cache_put(sig_str, lane) {
+            Ok(Some((lane, fee))) => {
+                if let Err(e) = self.cache_put(sig_str, lane, fee) {
                     tracing::warn!("[lanes] sled write failed sig={sig_str}: {e:#}");
                 }
-                LaneResolution::Resolved(lane)
+                LaneResolution::Resolved {
+                    lane,
+                    actual_fee_lamports: fee,
+                }
             }
             Ok(None) => {
                 tracing::warn!(
@@ -189,24 +206,37 @@ impl LaneStore {
         }
     }
 
-    fn cache_get(&self, sig_str: &str) -> Option<u8> {
+    /// Cached payload layout: `[lane_u8, fee_u64_le]` = 9 bytes. Older
+    /// entries written before the fee was tracked are 1-byte and decoded
+    /// as `(lane, 0)`; the dashboard then falls back to the bot-reported
+    /// `expected_cost_lamports`.
+    fn cache_get(&self, sig_str: &str) -> Option<(u8, u64)> {
         let parsed: Signature = sig_str.parse().ok()?;
         let v = self.inner.db.get(parsed.as_ref()).ok()??;
-        v.first().copied()
+        let lane = *v.first()?;
+        let fee = if v.len() >= 9 {
+            u64::from_le_bytes(v[1..9].try_into().ok()?)
+        } else {
+            0
+        };
+        Some((lane, fee))
     }
 
-    fn cache_put(&self, sig_str: &str, lane: u8) -> anyhow::Result<()> {
+    fn cache_put(&self, sig_str: &str, lane: u8, actual_fee_lamports: u64) -> anyhow::Result<()> {
         let parsed: Signature = sig_str.parse().context("invalid signature")?;
+        let mut buf = [0u8; 9];
+        buf[0] = lane;
+        buf[1..9].copy_from_slice(&actual_fee_lamports.to_le_bytes());
         self.inner
             .db
-            .insert(parsed.as_ref(), &[lane])
+            .insert(parsed.as_ref(), &buf)
             .context("sled insert lane")?;
         self.inner.db.flush().context("sled flush lanes")?;
         Ok(())
     }
 }
 
-async fn fetch_and_decode(rpc_url: &str, sig_str: &str) -> anyhow::Result<Option<u8>> {
+async fn fetch_and_decode(rpc_url: &str, sig_str: &str) -> anyhow::Result<Option<(u8, u64)>> {
     let rpc = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
     let parsed: Signature = sig_str.parse().context("invalid signature")?;
     let cfg = RpcTransactionConfig {
@@ -218,17 +248,27 @@ async fn fetch_and_decode(rpc_url: &str, sig_str: &str) -> anyhow::Result<Option
         .get_transaction_with_config(&parsed, cfg)
         .await
         .context("getTransaction")?;
+    // `meta.fee` is the validator's authoritative sig+priority lamports —
+    // the tip ix reverts with the rest of a failed tx, so this is what was
+    // actually deducted from the wallet.
+    let actual_fee_lamports = resp
+        .transaction
+        .meta
+        .as_ref()
+        .map(|m| m.fee)
+        .unwrap_or(0);
     let vtx = resp
         .transaction
         .transaction
         .decode()
         .context("decode encoded transaction (non-binary encoding?)")?;
-    Ok(decode_lane_from_message(&vtx.message))
+    Ok(decode_lane_from_message(&vtx.message).map(|lane| (lane, actual_fee_lamports)))
 }
 
 /// Walk a `VersionedMessage`'s instructions, find the
-/// `ComputeBudget::SetComputeUnitPrice` ix, return `price % 10`.
-/// Returns `None` if there's no such ix or its data is malformed.
+/// `ComputeBudget::SetComputeUnitPrice` ix, return `price % 100` (the
+/// two-digit lane index — see [`decode_lane`]). Returns `None` if there's
+/// no such ix or its data is malformed.
 fn decode_lane_from_message(msg: &VersionedMessage) -> Option<u8> {
     let keys = msg.static_account_keys();
     for ix in msg.instructions() {
@@ -240,7 +280,7 @@ fn decode_lane_from_message(msg: &VersionedMessage) -> Option<u8> {
             continue;
         }
         let price = u64::from_le_bytes(ix.data[1..9].try_into().ok()?);
-        return Some((price % 10) as u8);
+        return Some((price % 100) as u8);
     }
     None
 }
@@ -251,17 +291,24 @@ mod tests {
 
     #[test]
     fn decode_lane_table() {
-        // Spot-check every known lane and one unknown.
-        assert_eq!(decode_lane(0), (0, 0));   // GEYSER × FR
-        assert_eq!(decode_lane(1), (0, 1));   // GEYSER × AMS
-        assert_eq!(decode_lane(2), (0, 2));   // GEYSER × NY
-        assert_eq!(decode_lane(3), (0, 3));   // GEYSER × TYO
-        assert_eq!(decode_lane(4), (1, 0));   // SHREDS × FR
-        assert_eq!(decode_lane(5), (1, 1));   // SHREDS × AMS
-        assert_eq!(decode_lane(6), (1, 2));   // SHREDS × NY
-        assert_eq!(decode_lane(7), (1, 3));   // SHREDS × TYO
-        assert_eq!(decode_lane(8), (2, 0));   // DASHBOARD (FR-only)
-        assert_eq!(decode_lane(9), (u8::MAX, u8::MAX));
-        assert_eq!(decode_lane(42), (u8::MAX, u8::MAX));
+        // Two-digit encoding: tens = path (0=SHREDS, 1=GEYSER, 2=DASHBOARD),
+        // ones = location (0=FR, 1=AMS, 2=NY, 3=TYO, 4=FR2, 5..=9 reserved).
+        assert_eq!(decode_lane(0),  (0, 0));         // SHREDS × FR
+        assert_eq!(decode_lane(1),  (0, 1));         // SHREDS × AMS
+        assert_eq!(decode_lane(2),  (0, 2));         // SHREDS × NY
+        assert_eq!(decode_lane(3),  (0, 3));         // SHREDS × TYO
+        assert_eq!(decode_lane(4),  (0, 4));         // SHREDS × FR2
+        assert_eq!(decode_lane(10), (1, 0));         // GEYSER × FR
+        assert_eq!(decode_lane(11), (1, 1));         // GEYSER × AMS
+        assert_eq!(decode_lane(12), (1, 2));         // GEYSER × NY
+        assert_eq!(decode_lane(13), (1, 3));         // GEYSER × TYO
+        assert_eq!(decode_lane(14), (1, 4));         // GEYSER × FR2
+        assert_eq!(decode_lane(20), (2, 0));         // DASHBOARD × FR
+        // Reserved location slots still resolve — path is valid.
+        assert_eq!(decode_lane(5),  (0, 5));         // SHREDS × reserved-5
+        assert_eq!(decode_lane(19), (1, 9));         // GEYSER × reserved-9
+        // Path 3..=9 is unknown.
+        assert_eq!(decode_lane(30), (u8::MAX, u8::MAX));
+        assert_eq!(decode_lane(99), (u8::MAX, u8::MAX));
     }
 }

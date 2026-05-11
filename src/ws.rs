@@ -21,9 +21,11 @@ use crate::{
     alts::AltStore,
     bans::BansStore,
     lanes::{decode_lane, LaneResolution, LaneStore},
+    leaders::{LeaderResolution, LeaderStore},
     mongo::Repo,
     pool::{PoolAccounts, PoolDoc},
     positions::{ClosedReport, FailedReport, OpenedReport, Positions},
+    validators::LeaderInfo,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,10 @@ pub enum ServerMsg {
         dump_pct: f64,
         opportunity_sig: String,
         process_us: u32,
+        /// Resolved by central from `opportunity_sig` → slot → leader.
+        /// `None` when unresolved or the validator isn't in the CSV.
+        #[serde(default)]
+        leader: Option<LeaderInfo>,
     },
     /// Forwarded to all locations after the lander reports it. Each location
     /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
@@ -99,7 +105,17 @@ pub enum ServerMsg {
         token_name: Option<String>,
         token_symbol: Option<String>,
         buy_size_lamports: u64,
+        /// Bot's pre-fire budget estimate (fee + tip). Overstates by the
+        /// tip amount for landed-and-reverted txs since the tip ix reverts
+        /// with the tx. Kept for legacy compatibility; prefer
+        /// `actual_fee_lamports` when present.
         expected_cost_lamports: u64,
+        /// Authoritative `meta.fee` from `getTransaction` — sig fee +
+        /// priority fee, no tip. 0 when central couldn't resolve the tx.
+        #[serde(default)]
+        actual_fee_lamports: u64,
+        #[serde(default)]
+        leader: Option<LeaderInfo>,
     },
 }
 
@@ -140,6 +156,7 @@ struct AppState {
     alts: AltStore,
     bans: BansStore,
     lanes: LaneStore,
+    leaders: LeaderStore,
 }
 
 pub async fn serve(
@@ -153,6 +170,7 @@ pub async fn serve(
     alts: AltStore,
     bans: BansStore,
     lanes: LaneStore,
+    leaders: LeaderStore,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -164,6 +182,7 @@ pub async fn serve(
         alts,
         bans,
         lanes,
+        leaders,
     };
     let app = Router::new()
         .route("/", get(serve_sig_ui))
@@ -183,6 +202,19 @@ pub async fn serve(
     )
     .await?;
     Ok(())
+}
+
+/// Wrap [`LeaderStore::resolve`] so an empty / missing opp sig short-circuits
+/// to `None` without hitting RPC. Sells (`position_closed`) have no
+/// opp_sig — only buys feed this path.
+async fn resolve_leader(store: &LeaderStore, opp_sig: &str) -> Option<LeaderInfo> {
+    if opp_sig.is_empty() {
+        return None;
+    }
+    match store.resolve(opp_sig).await {
+        LeaderResolution::Resolved(info) => Some(info),
+        LeaderResolution::Unknown => None,
+    }
 }
 
 /// IP-whitelisted file download. Streams `positions.jsonl` from disk so
@@ -623,25 +655,37 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     }
                     Ok(ClientMsg::PositionOpened(r)) => {
                         tracing::info!(
-                            "[position_opened] pool={} amt={} buy_price={} loc={} sig={}",
-                            r.pool, r.token_amount, r.buy_price_sol, r.landed_location_idx, r.sig
+                            "[position_opened] pool={} amt={} buy_price={} loc={} sig={} opp={}",
+                            r.pool, r.token_amount, r.buy_price_sol, r.landed_location_idx, r.sig, r.opportunity_sig
                         );
-                        let broadcast = ServerMsg::PositionOpened {
-                            pool: r.pool.clone(),
-                            token_amount: r.token_amount,
-                            buy_price_sol: r.buy_price_sol,
-                            landed_location_idx: r.landed_location_idx,
-                            sig: r.sig.clone(),
-                            ts_ms: r.ts_ms,
-                            landed_path: r.landed_path,
-                            token_name: r.token_name.clone(),
-                            token_symbol: r.token_symbol.clone(),
-                            dump_pct: r.dump_pct,
-                            opportunity_sig: r.opportunity_sig.clone(),
-                            process_us: r.process_us,
-                        };
-                        state.positions.record_open(r);
-                        let _ = state.tx.send(broadcast);
+                        // Resolve the slot leader of the opportunity tx
+                        // (`r.opportunity_sig`) before persist + broadcast.
+                        // Adds ~5s to dashboard latency but trading state
+                        // is on-chain driven everywhere, so bots are
+                        // unaffected by the delay.
+                        let leaders = state.leaders.clone();
+                        let positions = state.positions.clone();
+                        let bcast = state.tx.clone();
+                        tokio::spawn(async move {
+                            let leader = resolve_leader(&leaders, &r.opportunity_sig).await;
+                            let broadcast = ServerMsg::PositionOpened {
+                                pool: r.pool.clone(),
+                                token_amount: r.token_amount,
+                                buy_price_sol: r.buy_price_sol,
+                                landed_location_idx: r.landed_location_idx,
+                                sig: r.sig.clone(),
+                                ts_ms: r.ts_ms,
+                                landed_path: r.landed_path,
+                                token_name: r.token_name.clone(),
+                                token_symbol: r.token_symbol.clone(),
+                                dump_pct: r.dump_pct,
+                                opportunity_sig: r.opportunity_sig.clone(),
+                                process_us: r.process_us,
+                                leader: leader.clone(),
+                            };
+                            positions.record_open(r, leader);
+                            let _ = bcast.send(broadcast);
+                        });
                     }
                     Ok(ClientMsg::AltsUnknown { tables }) => {
                         let mut parsed: Vec<solana_sdk::pubkey::Pubkey> = Vec::with_capacity(tables.len());
@@ -688,24 +732,31 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             "[position_failed] pool={} sig={} loc_reported={} dump_pct={:.3} opp={}",
                             r.pool, r.sig, r.landed_location_idx, r.dump_pct, r.opportunity_sig
                         );
-                        // Bot reports landed_location_idx from FR only (the
-                        // wallet-scoped failed-tx subscriber is FR-only), so
-                        // the bot's value is unreliable. Re-derive the
-                        // lander from the on-chain CU price asynchronously
-                        // and overwrite both fields before persisting. RPC
-                        // failure → u8::MAX so the dashboard renders `—`
-                        // instead of misattributing to FR.
+                        // Two parallel RPC-driven resolves before persist:
+                        //   * lane (from our failed tx's CU price) —
+                        //     overwrites the bot's FR-biased report.
+                        //   * leader (from the opp tx's slot) — joins
+                        //     against the validators CSV.
+                        // RPC failures → u8::MAX / leader=None so the
+                        // dashboard renders `—` instead of misattributing.
                         let lanes = state.lanes.clone();
+                        let leaders = state.leaders.clone();
                         let positions = state.positions.clone();
+                        let bcast = state.tx.clone();
                         tokio::spawn(async move {
-                            match lanes.resolve(&r.sig).await {
-                                LaneResolution::Resolved(lane) => {
+                            let lane_fut = lanes.resolve(&r.sig);
+                            let leader_fut = resolve_leader(&leaders, &r.opportunity_sig);
+                            let (lane_res, leader) = tokio::join!(lane_fut, leader_fut);
+                            let mut actual_fee_lamports: u64 = 0;
+                            match lane_res {
+                                LaneResolution::Resolved { lane, actual_fee_lamports: fee } => {
                                     let (path, loc) = decode_lane(lane);
                                     r.landed_location_idx = loc;
                                     r.landed_path = path;
+                                    actual_fee_lamports = fee;
                                     tracing::info!(
-                                        "[position_failed] resolved sig={} lane={} loc={} path={}",
-                                        r.sig, lane, loc, path
+                                        "[position_failed] resolved sig={} lane={} loc={} path={} fee_lamports={}",
+                                        r.sig, lane, loc, path, fee
                                     );
                                 }
                                 LaneResolution::Unknown => {
@@ -713,7 +764,24 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                                     r.landed_path = u8::MAX;
                                 }
                             }
-                            positions.record_failed(r);
+                            r.actual_fee_lamports = actual_fee_lamports;
+                            let broadcast = ServerMsg::PositionFailed {
+                                pool: r.pool.clone(),
+                                sig: r.sig.clone(),
+                                ts_ms: r.ts_ms,
+                                landed_location_idx: r.landed_location_idx,
+                                landed_path: r.landed_path,
+                                dump_pct: r.dump_pct,
+                                opportunity_sig: r.opportunity_sig.clone(),
+                                token_name: r.token_name.clone(),
+                                token_symbol: r.token_symbol.clone(),
+                                buy_size_lamports: r.buy_size_lamports,
+                                expected_cost_lamports: r.expected_cost_lamports,
+                                actual_fee_lamports,
+                                leader: leader.clone(),
+                            };
+                            positions.record_failed(r, leader);
+                            let _ = bcast.send(broadcast);
                         });
                     }
                     Err(e) => {
