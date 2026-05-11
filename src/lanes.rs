@@ -35,6 +35,27 @@ use solana_transaction_status_client_types::UiTransactionEncoding;
 /// Discriminator byte for `SetComputeUnitPrice` in the ComputeBudget program.
 const SET_CU_PRICE_DISCRIMINATOR: u8 = 3;
 
+/// Wait this long before the first RPC attempt. The bot subscribes to
+/// `transactions_status` at `processed` commitment and fires `position_failed`
+/// the instant it sees the failed tx, but `getTransaction` returns nothing
+/// until the tx reaches `confirmed` (~400ms–2s after processed). Without this
+/// delay every resolve races the confirmation and falls through to `Unknown`.
+/// Mirrors the 5s delay used by `bans.rs` for the same reason.
+const LANE_RESOLVE_INITIAL_DELAY: Duration = Duration::from_secs(5);
+
+/// Backoff between RPC retries on transient errors.
+const LANE_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Retries on RPC failure. `Ok(None)` (tx decoded but no `SetComputeUnitPrice`
+/// ix found) is not retried — that's a definitive answer.
+const LANE_RESOLVE_MAX_RETRIES: usize = 3;
+
+/// Polls (× 200ms each) a deduped waiter does before giving up on the
+/// in-flight resolver. Sized to cover the worst-case resolve window
+/// (initial delay + max retries × retry delay = 5 + 3×2 = 11s) plus a
+/// small margin.
+const LANE_RESOLVE_WAIT_POLLS: usize = 60;
+
 /// Result of decoding a sig → lane.
 ///
 /// `Resolved(lane)` carries the raw lane index (0..=8 in the current
@@ -121,7 +142,7 @@ impl LaneStore {
             !g.insert(sig_str.to_string())
         };
         if already_in_flight {
-            for _ in 0..10 {
+            for _ in 0..LANE_RESOLVE_WAIT_POLLS {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 if let Some(lane) = self.cache_get(sig_str) {
                     return LaneResolution::Resolved(lane);
@@ -130,7 +151,22 @@ impl LaneStore {
             return LaneResolution::Unknown;
         }
 
-        let result = fetch_and_decode(&self.inner.rpc_url, sig_str).await;
+        // Tx is at `processed` when the bot reports; wait for `confirmed` to
+        // catch up before the first RPC attempt. Retry only on `Err` —
+        // `Ok(None)` is a definitive "no CU-price ix" answer.
+        tokio::time::sleep(LANE_RESOLVE_INITIAL_DELAY).await;
+        let mut result = fetch_and_decode(&self.inner.rpc_url, sig_str).await;
+        for attempt in 1..=LANE_RESOLVE_MAX_RETRIES {
+            if !matches!(result, Err(_)) {
+                break;
+            }
+            tracing::debug!(
+                "[lanes] sig={sig_str} RPC failed; retry {attempt}/{LANE_RESOLVE_MAX_RETRIES} in {:?}",
+                LANE_RESOLVE_RETRY_DELAY
+            );
+            tokio::time::sleep(LANE_RESOLVE_RETRY_DELAY).await;
+            result = fetch_and_decode(&self.inner.rpc_url, sig_str).await;
+        }
         self.inner.in_flight.lock().unwrap().remove(sig_str);
 
         match result {
