@@ -12,6 +12,7 @@ pub struct Config {
     pub positions_log: PathBuf,
     pub alts_db_path: PathBuf,
     pub bans_db_path: PathBuf,
+    pub lanes_db_path: PathBuf,
 }
 
 impl Config {
@@ -48,6 +49,9 @@ impl Config {
         let bans_db_path = std::env::var("BANS_DB_PATH")
             .unwrap_or_else(|_| "bans.db".into())
             .into();
+        let lanes_db_path = std::env::var("LANES_DB_PATH")
+            .unwrap_or_else(|_| "lanes.db".into())
+            .into();
         Ok(Self {
             mongo_uri,
             mongo_db,
@@ -59,6 +63,7 @@ impl Config {
             positions_log,
             alts_db_path,
             bans_db_path,
+            lanes_db_path,
         })
     }
 }

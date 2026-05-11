@@ -8,6 +8,7 @@ mod ata;
 mod bans;
 mod config;
 mod discover;
+mod lanes;
 mod mongo;
 mod poll;
 mod pool;
@@ -53,6 +54,9 @@ async fn main() -> anyhow::Result<()> {
         broadcast_tx.clone(),
     )?;
     tracing::info!("bans db opened at {}", cfg.bans_db_path.display());
+
+    let lanes = lanes::LaneStore::open(&cfg.lanes_db_path, cfg.rpc_url.clone())?;
+    tracing::info!("lanes db opened at {}", cfg.lanes_db_path.display());
 
     {
         let repo = Arc::clone(&repo);
@@ -104,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         discover_tx,
         alts,
         bans,
+        lanes,
     )
     .await
 }

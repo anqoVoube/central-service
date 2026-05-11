@@ -20,6 +20,7 @@ use tokio_util::io::ReaderStream;
 use crate::{
     alts::AltStore,
     bans::BansStore,
+    lanes::{decode_lane, LaneResolution, LaneStore},
     mongo::Repo,
     pool::{PoolAccounts, PoolDoc},
     positions::{ClosedReport, FailedReport, OpenedReport, Positions},
@@ -138,6 +139,7 @@ struct AppState {
     positions_log: Arc<PathBuf>,
     alts: AltStore,
     bans: BansStore,
+    lanes: LaneStore,
 }
 
 pub async fn serve(
@@ -150,6 +152,7 @@ pub async fn serve(
     discover_tx: UnboundedSender<String>,
     alts: AltStore,
     bans: BansStore,
+    lanes: LaneStore,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -160,6 +163,7 @@ pub async fn serve(
         positions_log: Arc::new(positions_log),
         alts,
         bans,
+        lanes,
     };
     let app = Router::new()
         .route("/", get(serve_sig_ui))
@@ -679,26 +683,38 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         state.positions.record_close(r);
                         let _ = state.tx.send(broadcast);
                     }
-                    Ok(ClientMsg::PositionFailed(r)) => {
+                    Ok(ClientMsg::PositionFailed(mut r)) => {
                         tracing::info!(
-                            "[position_failed] pool={} sig={} loc={} dump_pct={:.3} opp={}",
+                            "[position_failed] pool={} sig={} loc_reported={} dump_pct={:.3} opp={}",
                             r.pool, r.sig, r.landed_location_idx, r.dump_pct, r.opportunity_sig
                         );
-                        let broadcast = ServerMsg::PositionFailed {
-                            pool: r.pool.clone(),
-                            sig: r.sig.clone(),
-                            ts_ms: r.ts_ms,
-                            landed_location_idx: r.landed_location_idx,
-                            landed_path: r.landed_path,
-                            dump_pct: r.dump_pct,
-                            opportunity_sig: r.opportunity_sig.clone(),
-                            token_name: r.token_name.clone(),
-                            token_symbol: r.token_symbol.clone(),
-                            buy_size_lamports: r.buy_size_lamports,
-                            expected_cost_lamports: r.expected_cost_lamports,
-                        };
-                        state.positions.record_failed(r);
-                        let _ = state.tx.send(broadcast);
+                        // Bot reports landed_location_idx from FR only (the
+                        // wallet-scoped failed-tx subscriber is FR-only), so
+                        // the bot's value is unreliable. Re-derive the
+                        // lander from the on-chain CU price asynchronously
+                        // and overwrite both fields before persisting. RPC
+                        // failure → u8::MAX so the dashboard renders `—`
+                        // instead of misattributing to FR.
+                        let lanes = state.lanes.clone();
+                        let positions = state.positions.clone();
+                        tokio::spawn(async move {
+                            match lanes.resolve(&r.sig).await {
+                                LaneResolution::Resolved(lane) => {
+                                    let (path, loc) = decode_lane(lane);
+                                    r.landed_location_idx = loc;
+                                    r.landed_path = path;
+                                    tracing::info!(
+                                        "[position_failed] resolved sig={} lane={} loc={} path={}",
+                                        r.sig, lane, loc, path
+                                    );
+                                }
+                                LaneResolution::Unknown => {
+                                    r.landed_location_idx = u8::MAX;
+                                    r.landed_path = u8::MAX;
+                                }
+                            }
+                            positions.record_failed(r);
+                        });
                     }
                     Err(e) => {
                         tracing::warn!("ws inbound parse error from {addr}: {e}; payload={t}");
