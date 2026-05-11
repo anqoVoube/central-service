@@ -234,7 +234,9 @@ async fn serve_positions_log(
     State(state): State<AppState>,
 ) -> Response {
     if !state.whitelist.contains(&addr.ip()) {
-        tracing::warn!("rejecting positions.jsonl from non-whitelisted ip {}", addr.ip());
+        let ip = addr.ip();
+        tracing::warn!("rejecting positions.jsonl from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /positions.jsonl from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
     let path = state.positions_log.as_path();
@@ -268,7 +270,9 @@ async fn serve_alts_snapshot(
     State(state): State<AppState>,
 ) -> Response {
     if !state.whitelist.contains(&addr.ip()) {
-        tracing::warn!("rejecting alts.bin from non-whitelisted ip {}", addr.ip());
+        let ip = addr.ip();
+        tracing::warn!("rejecting alts.bin from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /alts.bin from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
     let bytes = match state.alts.snapshot_bincode() {
@@ -291,7 +295,9 @@ async fn serve_bans_snapshot(
     State(state): State<AppState>,
 ) -> Response {
     if !state.whitelist.contains(&addr.ip()) {
-        tracing::warn!("rejecting bans.bin from non-whitelisted ip {}", addr.ip());
+        let ip = addr.ip();
+        tracing::warn!("rejecting bans.bin from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /bans.bin from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
     let bytes = match state.bans.snapshot_bincode() {
@@ -604,7 +610,9 @@ async fn upgrade(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if !state.whitelist.contains(&addr.ip()) {
-        tracing::warn!("rejecting ws upgrade from non-whitelisted ip {}", addr.ip());
+        let ip = addr.ip();
+        tracing::warn!("rejecting ws upgrade from non-whitelisted ip {ip}");
+        println!("[whitelist] reject WS upgrade from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, addr, state))
