@@ -45,4 +45,10 @@ pub struct PoolDoc {
     /// Token display symbol (Dexscreener `symbol`). Same fallback rules.
     #[serde(default)]
     pub token_symbol: Option<String>,
+    /// Pool creation time in unix-ms, read from Dexscreener's `pairCreatedAt`
+    /// for the pair whose `pairAddress` matches this pool. `None` when the
+    /// pair isn't indexed yet (very fresh pools) or the Dexscreener fetch
+    /// failed. Stored once at discovery; never refreshed.
+    #[serde(default)]
+    pub pair_created_at_ms: Option<i64>,
 }

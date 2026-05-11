@@ -66,6 +66,7 @@ pub async fn create(
                 let _ = broadcast.send(ServerMsg::NewPool {
                     pool: doc.pool.clone(),
                     accounts: doc.accounts.clone(),
+                    pair_created_at_ms: doc.pair_created_at_ms,
                 });
                 return;
             }

@@ -71,7 +71,8 @@ async fn handle_one(
         .copied()
         .with_context(|| format!("mint {base_mint} data too short for decimals field"))?;
 
-    let (token_name, token_symbol) = fetch_token_meta(&base_mint).await;
+    let (token_name, token_symbol, pair_created_at_ms) =
+        fetch_pair_meta(&base_mint, &pool_pk).await;
 
     let doc = PoolDoc {
         pool: pool_str.clone(),
@@ -89,6 +90,7 @@ async fn handle_one(
         ata_attempts: 0,
         token_name,
         token_symbol,
+        pair_created_at_ms,
     };
 
     let inserted = repo.upsert_pending(&doc).await.context("upsert_pending")?;
@@ -110,56 +112,83 @@ async fn handle_one(
     Ok(())
 }
 
-/// Best-effort Dexscreener lookup. 3s timeout. On any failure (network,
-/// status, parse, or no matching token in the response) returns `(None, None)`.
-async fn fetch_token_meta(mint: &Pubkey) -> (Option<String>, Option<String>) {
+/// Best-effort Dexscreener lookup. 3s timeout. Returns
+/// `(name, symbol, pair_created_at_ms)`; all three are `None` on any
+/// failure (network, status, parse, or no relevant entry).
+///
+/// Match strategy: prefer the pair whose `pairAddress` equals our pool
+/// pubkey — that's the exact Pump.fun pAMM pool we're tracking and its
+/// `pairCreatedAt` is authoritative. If Dexscreener hasn't indexed the
+/// pool yet (common for very fresh pools), fall back to the first pair
+/// whose base/quote token matches our mint for name/symbol; pair age is
+/// left `None` in that case so we don't pin it to a different pool's
+/// timestamp.
+async fn fetch_pair_meta(
+    mint: &Pubkey,
+    pool: &Pubkey,
+) -> (Option<String>, Option<String>, Option<i64>) {
     let url = format!("https://api.dexscreener.com/latest/dex/tokens/{mint}");
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
     let resp = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             eprintln!("[dexscreener] {url} → {}", r.status());
-            return (None, None);
+            return (None, None, None);
         }
         Err(e) => {
             eprintln!("[dexscreener] {url} failed: {e}");
-            return (None, None);
+            return (None, None, None);
         }
     };
     let v: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[dexscreener] {mint} parse failed: {e}");
-            return (None, None);
+            return (None, None, None);
         }
     };
     let mint_s = mint.to_string();
+    let pool_s = pool.to_string();
     let pairs = match v.get("pairs").and_then(|x| x.as_array()) {
         Some(p) => p,
-        None => return (None, None),
+        None => return (None, None, None),
     };
-    for p in pairs {
+
+    let pick_name_symbol = |p: &serde_json::Value| -> (Option<String>, Option<String>) {
         for side in ["baseToken", "quoteToken"] {
             let Some(t) = p.get(side) else { continue };
             let addr = t.get("address").and_then(|x| x.as_str()).unwrap_or("");
             if addr == mint_s {
-                let name = t
-                    .get("name")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_owned());
-                let symbol = t
-                    .get("symbol")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_owned());
+                let name = t.get("name").and_then(|x| x.as_str()).map(str::to_owned);
+                let symbol = t.get("symbol").and_then(|x| x.as_str()).map(str::to_owned);
                 return (name, symbol);
             }
         }
+        (None, None)
+    };
+
+    // Pass 1: exact pool match → reliable pair age.
+    for p in pairs {
+        let addr = p.get("pairAddress").and_then(|x| x.as_str()).unwrap_or("");
+        if addr == pool_s {
+            let (name, symbol) = pick_name_symbol(p);
+            let created = p.get("pairCreatedAt").and_then(|x| x.as_i64());
+            return (name, symbol, created);
+        }
     }
-    (None, None)
+    // Pass 2: no exact pool — keep name/symbol from the first mint match,
+    // leave pair age unknown to avoid pinning to the wrong pool.
+    for p in pairs {
+        let (name, symbol) = pick_name_symbol(p);
+        if name.is_some() || symbol.is_some() {
+            return (name, symbol, None);
+        }
+    }
+    (None, None, None)
 }

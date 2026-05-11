@@ -35,6 +35,11 @@ pub enum ServerMsg {
         pool: String,
         #[serde(flatten)]
         accounts: PoolAccounts,
+        /// Pool creation time (unix ms) from Dexscreener's `pairCreatedAt`,
+        /// resolved at discovery. `None` if Dexscreener hadn't indexed the
+        /// pool yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pair_created_at_ms: Option<i64>,
     },
     CreatorChange {
         pool: String,
@@ -631,6 +636,29 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
             return;
         }
     };
+    // Filter init to "fresh" pools only — younger than INIT_POOL_MAX_AGE_MS.
+    // Older pools stay in Mongo (creator-drift poll, etc.) but are not
+    // shipped to bots, so they won't be traded. Pools with unknown age
+    // (`pair_created_at_ms == None` after the startup backfill) are also
+    // excluded — we can't verify they're fresh, so conservatively drop.
+    const INIT_POOL_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+    let now_ms: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let total = pools.len();
+    let pools: Vec<PoolDoc> = pools
+        .into_iter()
+        .filter(|p| {
+            p.pair_created_at_ms
+                .map(|c| now_ms.saturating_sub(c) < INIT_POOL_MAX_AGE_MS)
+                .unwrap_or(false)
+        })
+        .collect();
+    println!(
+        "[ws] init for {addr}: {} of {total} pools within 7-day window",
+        pools.len()
+    );
     let positions_payload = state.positions.current_open();
     let init_payload = json!({
         "type": "init",

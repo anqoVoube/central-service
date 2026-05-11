@@ -110,6 +110,26 @@ impl Repo {
         Ok(())
     }
 
+    /// Set `pair_created_at_ms` for a pool. Called by the startup backfill
+    /// once it resolves a missing age from Dexscreener — never overwrites
+    /// an existing value, the caller pre-filters by `is_none()`.
+    pub async fn update_pair_created_at_ms(
+        &self,
+        pool: &str,
+        ms: i64,
+    ) -> anyhow::Result<()> {
+        self.pools
+            .update_one(
+                doc! { "pool": pool },
+                doc! { "$set": {
+                    "pair_created_at_ms": ms,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn update_creator(&self, pool: &str, new_creator: &str) -> anyhow::Result<()> {
         self.pools
             .update_one(

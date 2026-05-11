@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 mod alts;
 mod ata;
+mod backfill;
 mod bans;
 mod config;
 mod discover;
@@ -45,6 +46,12 @@ async fn main() -> anyhow::Result<()> {
 
     let repo = Arc::new(mongo::Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?);
     repo.ensure_indexes().await?;
+
+    // Migrate any pool docs that pre-date `pair_created_at_ms`. Blocks
+    // startup so the WS init filter (< 7 days) sees a fully-populated set
+    // on first connect. After the first run this is a no-op since all
+    // pools have the field set.
+    backfill::run(&repo).await;
 
     let positions = positions::Positions::load_and_spawn(cfg.positions_log.clone()).await?;
 
