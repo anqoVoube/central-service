@@ -91,6 +91,15 @@ pub enum ServerMsg {
         banned_until_ms: u64,
         reason: String,
     },
+    /// Late-arriving leader info for a `position_opened` whose leader RPC
+    /// took longer than the bot's open→close cycle (or any time after the
+    /// open). Bots merge this into the matching `central_positions` entry
+    /// keyed by `opportunity_sig`; if no entry exists (already closed),
+    /// the message is a no-op. Never re-creates a row.
+    LeaderResolved {
+        opportunity_sig: String,
+        leader: LeaderInfo,
+    },
     /// Broadcast after a buy attempt landed on chain but reverted. Pure
     /// dashboard feed — locations don't act on this; their own balance-delta
     /// detection already keeps `Holding` in sync.
@@ -658,42 +667,50 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             "[position_opened] pool={} amt={} buy_price={} loc={} sig={} opp={}",
                             r.pool, r.token_amount, r.buy_price_sol, r.landed_location_idx, r.sig, r.opportunity_sig
                         );
-                        // Persist the Open row to JSONL IMMEDIATELY so the
-                        // history file always sees `opened` before any
-                        // following `closed` for the same pool. The leader
-                        // RPC takes ~5s; deferring the open write would
-                        // strand fast TPs as orphan closes in the file.
-                        // The broadcast (live page) still goes out after
-                        // leader resolves so the central_positions entry
-                        // includes leader on first appearance.
+                        // Persist and broadcast IMMEDIATELY (leader=None).
+                        // Both the history JSONL and the live dashboard
+                        // must see `opened` before any following `closed`
+                        // for the same pool — a fast TP that completes
+                        // inside the ~5s leader RPC window would otherwise
+                        // strand the row as an orphan close (in the file)
+                        // or worse, re-create a stale `central_positions`
+                        // entry on the bot (live page would show a held
+                        // row that's already sold).
+                        let opp_sig = r.opportunity_sig.clone();
                         state.positions.record_open(r.clone(), None);
+                        let _ = state.tx.send(ServerMsg::PositionOpened {
+                            pool: r.pool.clone(),
+                            token_amount: r.token_amount,
+                            buy_price_sol: r.buy_price_sol,
+                            landed_location_idx: r.landed_location_idx,
+                            sig: r.sig.clone(),
+                            ts_ms: r.ts_ms,
+                            landed_path: r.landed_path,
+                            token_name: r.token_name.clone(),
+                            token_symbol: r.token_symbol.clone(),
+                            dump_pct: r.dump_pct,
+                            opportunity_sig: opp_sig.clone(),
+                            process_us: r.process_us,
+                            leader: None,
+                        });
+                        // Resolve leader async; emit a follow-up
+                        // `leader_resolved` JSONL line + WS broadcast that
+                        // patches the matching `central_positions` row on
+                        // the bot. The bot never re-inserts: if the row
+                        // was already removed by `position_closed`, the
+                        // `leader_resolved` message is a no-op.
                         let leaders = state.leaders.clone();
                         let positions = state.positions.clone();
                         let bcast = state.tx.clone();
                         tokio::spawn(async move {
-                            let leader = resolve_leader(&leaders, &r.opportunity_sig).await;
-                            if let Some(ref l) = leader {
-                                positions.record_leader_resolved(
-                                    r.opportunity_sig.clone(),
-                                    l.clone(),
-                                );
-                            }
-                            let broadcast = ServerMsg::PositionOpened {
-                                pool: r.pool,
-                                token_amount: r.token_amount,
-                                buy_price_sol: r.buy_price_sol,
-                                landed_location_idx: r.landed_location_idx,
-                                sig: r.sig,
-                                ts_ms: r.ts_ms,
-                                landed_path: r.landed_path,
-                                token_name: r.token_name,
-                                token_symbol: r.token_symbol,
-                                dump_pct: r.dump_pct,
-                                opportunity_sig: r.opportunity_sig,
-                                process_us: r.process_us,
-                                leader,
+                            let Some(leader) = resolve_leader(&leaders, &opp_sig).await else {
+                                return;
                             };
-                            let _ = bcast.send(broadcast);
+                            positions.record_leader_resolved(opp_sig.clone(), leader.clone());
+                            let _ = bcast.send(ServerMsg::LeaderResolved {
+                                opportunity_sig: opp_sig,
+                                leader,
+                            });
                         });
                     }
                     Ok(ClientMsg::AltsUnknown { tables }) => {
