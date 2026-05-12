@@ -58,6 +58,13 @@ pub struct OpenPosition {
     /// confirmed, or the leader pubkey isn't in the validators CSV.
     #[serde(default)]
     pub leader: Option<LeaderInfo>,
+    /// Authoritative on-chain cost of the buy in lamports: native SOL paid
+    /// (fee + priority + tip + any system rent) + WSOL spent on the swap.
+    /// Computed by the bot from `tx.meta` balance deltas at landing time
+    /// (mirrors P6's `sol_received_lamports` recv-truth pattern). 0 for
+    /// legacy lines; dashboard then falls back to its estimate.
+    #[serde(default)]
+    pub cost_lamports: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +87,9 @@ pub struct OpenedReport {
     pub opportunity_sig: String,
     #[serde(default)]
     pub process_us: u32,
+    /// See `OpenPosition::cost_lamports`. 0 for legacy bots.
+    #[serde(default)]
+    pub cost_lamports: u64,
 }
 
 /// A buy attempt that landed on chain but reverted — the wallet paid the
@@ -181,6 +191,9 @@ enum LogEvent {
         /// validator isn't in the CSV.
         #[serde(default)]
         leader: Option<LeaderInfo>,
+        /// See `OpenPosition::cost_lamports`. 0 for legacy lines.
+        #[serde(default)]
+        cost_lamports: u64,
     },
     Closed {
         ts_ms: u64,
@@ -296,6 +309,7 @@ impl Positions {
             opportunity_sig: r.opportunity_sig.clone(),
             process_us: r.process_us,
             leader: leader.clone(),
+            cost_lamports: r.cost_lamports,
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -313,6 +327,7 @@ impl Positions {
             opportunity_sig: r.opportunity_sig,
             process_us: r.process_us,
             leader,
+            cost_lamports: r.cost_lamports,
         });
     }
 
@@ -399,6 +414,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 opportunity_sig,
                 process_us,
                 leader,
+                cost_lamports,
             } => {
                 out.insert(
                     pool.clone(),
@@ -416,6 +432,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         opportunity_sig,
                         process_us,
                         leader,
+                        cost_lamports,
                     },
                 );
             }

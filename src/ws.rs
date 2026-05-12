@@ -65,6 +65,10 @@ pub enum ServerMsg {
         /// `None` when unresolved or the validator isn't in the CSV.
         #[serde(default)]
         leader: Option<LeaderInfo>,
+        /// Authoritative on-chain cost in lamports from the bot's `tx.meta`
+        /// delta. 0 for legacy bots — receivers fall back to local estimate.
+        #[serde(default)]
+        cost_lamports: u64,
     },
     /// Forwarded to all locations after the lander reports it. Each location
     /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
@@ -728,6 +732,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             opportunity_sig: opp_sig.clone(),
                             process_us: r.process_us,
                             leader: None,
+                            cost_lamports: r.cost_lamports,
                         });
                         // Resolve leader async; emit a follow-up
                         // `leader_resolved` JSONL line + WS broadcast that
