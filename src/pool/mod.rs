@@ -25,7 +25,12 @@ pub enum AtaStatus {
 
 impl Default for AtaStatus {
     fn default() -> Self {
-        Self::Pending
+        // Default to Confirmed so any pool doc lacking an explicit
+        // `ata_status` field reaches bots via `init.pools`. The on-chain
+        // ATA creation tx is still spawned by `discover::run` (via
+        // `ata::create`) on best-effort — visibility-to-bots no longer
+        // waits for it to succeed.
+        Self::Confirmed
     }
 }
 

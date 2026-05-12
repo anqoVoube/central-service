@@ -86,7 +86,12 @@ async fn handle_one(
             is_cashback,
             token_decimals,
         }),
-        ata_status: AtaStatus::Pending,
+        // Always insert as Confirmed so the WS init filter ships the pool
+        // to bots immediately. The on-chain ATA creation still runs below
+        // (via `ata::create`) on best-effort — bots get visibility right
+        // away, and if ATA creation fails the buy will revert at trade
+        // time rather than stranding the pool in pending forever.
+        ata_status: AtaStatus::Confirmed,
         ata_attempts: 0,
         token_name,
         token_symbol,
