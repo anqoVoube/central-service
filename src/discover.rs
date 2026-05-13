@@ -98,7 +98,7 @@ async fn handle_one(
         pair_created_at_ms,
         compute_unit_limit: None,
         cu_measured_at: None,
-        is_unique: None,
+        is_unique: false,
     };
 
     let inserted = repo.upsert_pending(&doc).await.context("upsert_pending")?;

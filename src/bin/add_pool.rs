@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
             format!("{} days", ms / (24 * 60 * 60 * 1_000))
         });
         println!("[add_pool] {pool_pk} already exists in Mongo — no insert performed");
-        println!("  is_unique:           {:?}", existing.is_unique);
+        println!("  is_unique:           {}", existing.is_unique);
         println!("  ata_status:          {:?}", existing.ata_status);
         println!("  token_symbol:        {:?}", existing.token_symbol);
         println!("  pair_created_at_ms:  {:?}  ({})", existing.pair_created_at_ms, age.as_deref().unwrap_or("unknown"));
@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  token_name:          {token_name:?}");
     println!("  token_symbol:        {token_symbol:?}");
     println!("  pair_created_at_ms:  {pair_created_at_ms:?}");
-    println!("  is_unique:           {is_unique:?}");
+    println!("  is_unique:           {is_unique}");
 
     let doc = PoolDoc {
         pool: pool_str.clone(),
@@ -168,22 +168,22 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_unique_flag(args: &[String]) -> anyhow::Result<Option<bool>> {
+fn parse_unique_flag(args: &[String]) -> anyhow::Result<bool> {
     for a in args.iter().skip(1) {
         if let Some(v) = a.strip_prefix("--unique=") {
             return match v {
-                "true" | "1" | "yes" => Ok(Some(true)),
-                "false" | "0" | "no" => Ok(Some(false)),
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" => Ok(false),
                 other => Err(anyhow!(
                     "--unique=<bool>: got {other:?}, expected true/false"
                 )),
             };
         }
     }
-    // Default: Some(true) — manually-added pools usually want the age
-    // filter bypassed (otherwise why bother adding them manually?). Pass
+    // Default: true — manually-added pools usually want the age filter
+    // bypassed (otherwise why bother adding them manually?). Pass
     // `--unique=false` to fall back to the standard 7-day window.
-    Ok(Some(true))
+    Ok(true)
 }
 
 /// Best-effort Dexscreener lookup — mirrors `central_service::discover::fetch_pair_meta`.
