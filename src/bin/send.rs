@@ -1,19 +1,22 @@
-//! Single-tx CU probe with selectable tip-ix position. Fires ONE 0.001
-//! SOL buy for the given pool and prints the landed `cu_consumed`.
+//! One-shot send of a real on-chain PumpFun pAMM buy. Hard-coded swap
+//! amount and tip amount per the current ask: 0.001213357 SOL each.
 //!
-//! Tip ix layout selected by `--new=<bool>`:
-//!   `--new=true`  → tip at slot 1 (right after advance_nonce_account)
-//!   `--new=false` → tip at the end of the ix list (legacy bot layout)
+//! Tx layout matches the bot's production buy:
+//!   ix[0] advance_nonce_account
+//!   ix[1] system::transfer(TIP_LAMPORTS → SUPRA tip vault)
+//!   ix[2] set_compute_unit_limit(CU_LIMIT_CEILING)
+//!   ix[3] set_compute_unit_price(CU_PRICE)
+//!   ix[4] set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT)
+//!   ix[5] pump_fun_buy_exact_in(sol_in = SWAP_IN_LAMPORTS)
 //!
-//! Doesn't update Mongo — call once with `--new=true`, once with
-//! `--new=false`, compare the two prints. Useful for verifying the bot's
-//! tx-layout decision before paying for a full `measure_cu --force`
-//! re-measure pass.
-//!
-//! Run:
+//! Run (either form works):
 //!   `cd ~/Work/central-service-seed && \
-//!     ~/Work/central-service/target/release/compare_tip_position \
-//!     <pool_pubkey> --new=true`
+//!     ~/Work/central-service/target/release/send <pool_pubkey>`
+//!   `cd ~/Work/central-service-seed && \
+//!     ~/Work/central-service/target/release/send --pool <pool_pubkey>`
+//!
+//! Other `--*` flags are accepted but ignored — kept for compatibility with
+//! the old cu-sim-test send binary so muscle memory still works.
 //!
 //! Requires `.env` with `WALLET_KEYPAIR`, `MONGO_URI`, `MONGO_DB`.
 
@@ -39,7 +42,7 @@ use solana_transaction_status_client_types::{
 };
 
 use central_service::{
-    pool::{PoolAccounts, PoolDoc, PumpFunAccounts},
+    pool::{PoolAccounts, PoolDoc},
     swap_pump_fun::{
         build_pump_fun_buy_ix, find_ata, system_program_pk, token_program_pk, wsol_pk,
         PumpStaticPdas,
@@ -51,8 +54,11 @@ const HELIUS_RPC: &str =
 const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
 const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
 const SYSVAR_RECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
-const TIP_LAMPORTS: u64 = 1_213_357;          // 0.001213357 SOL — matches send / measure.rs
-const SWAP_IN_LAMPORTS: u64 = 1_213_357;      // 0.001213357 SOL
+
+/// 0.001213357 SOL.
+const SWAP_IN_LAMPORTS: u64 = 1_213_357;
+/// 0.001213357 SOL — same as the swap, per request.
+const TIP_LAMPORTS: u64 = 1_213_357;
 const CU_LIMIT_CEILING: u32 = 400_000;
 const CU_PRICE: u64 = 1_000_000;
 const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;
@@ -68,14 +74,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let pool_str = args
-        .iter()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .cloned()
-        .context("usage: compare_tip_position <pool_pubkey> --new=<true|false>")?;
-    let new_layout = parse_new_flag(&args)?;
+    let pool_str = parse_pool_arg().context(
+        "usage: send <pool_pubkey>  |  send --pool <pool_pubkey>",
+    )?;
     let pool_pk = Pubkey::from_str(&pool_str).context("invalid pool pubkey")?;
 
     let wallet_keypair_b58 =
@@ -87,10 +88,9 @@ async fn main() -> anyhow::Result<()> {
     let client = mongodb::Client::with_uri_str(&mongo_uri)
         .await
         .context("mongo connect")?;
-    let pools = client
+    let pool_doc = client
         .database(&mongo_db)
-        .collection::<PoolDoc>("pools");
-    let pool_doc = pools
+        .collection::<PoolDoc>("pools")
         .find_one(doc! { "pool": &pool_str })
         .await?
         .ok_or_else(|| anyhow!("pool {pool_str} not found in Mongo"))?;
@@ -102,40 +102,13 @@ async fn main() -> anyhow::Result<()> {
     let rpc =
         RpcClient::new_with_commitment(HELIUS_RPC.to_string(), CommitmentConfig::confirmed());
 
-    let layout_label = if new_layout { "tip@slot1 (new)" } else { "tip@end (legacy)" };
-    tracing::info!(pool = %pool_pk, layout = layout_label, "probing");
+    tracing::info!(
+        pool = %pool_pk,
+        swap_lamports = SWAP_IN_LAMPORTS,
+        tip_lamports = TIP_LAMPORTS,
+        "send starting"
+    );
 
-    let cu = run_probe(&rpc, &wallet_kp, &pool_pk, &pump, new_layout).await?;
-
-    println!();
-    println!("======================");
-    println!("pool:          {pool_pk}");
-    println!("layout:        {layout_label}");
-    println!("cu_consumed:   {cu}");
-    println!("======================");
-    Ok(())
-}
-
-fn parse_new_flag(args: &[String]) -> anyhow::Result<bool> {
-    for a in args.iter().skip(1) {
-        if let Some(v) = a.strip_prefix("--new=") {
-            return match v {
-                "true" | "1" | "yes" => Ok(true),
-                "false" | "0" | "no" => Ok(false),
-                other => Err(anyhow!("--new=<bool>: got {other:?}, expected true/false")),
-            };
-        }
-    }
-    Err(anyhow!("--new=<true|false> required"))
-}
-
-async fn run_probe(
-    rpc: &RpcClient,
-    wallet_kp: &Keypair,
-    pool_pk: &Pubkey,
-    pump: &PumpFunAccounts,
-    new_layout: bool,
-) -> anyhow::Result<u32> {
     let wallet_pk = wallet_kp.pubkey();
     let pdas = PumpStaticPdas::derive(&wallet_pk);
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
@@ -161,7 +134,7 @@ async fn run_probe(
         u64::from_le_bytes(quote_vault_acct.data[64..72].try_into().unwrap());
 
     let swap_ix = build_pump_fun_buy_ix(
-        pool_pk,
+        &pool_pk,
         &base_mint,
         &pool_base_vault,
         &pool_quote_vault,
@@ -203,33 +176,24 @@ async fn run_probe(
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
     let tip_ix = system_instruction::transfer(&wallet_pk, &tip_to, TIP_LAMPORTS);
 
-    let ixs: Vec<Instruction> = if new_layout {
-        vec![
+    let message = Message::new_with_blockhash(
+        &[
             advance_nonce_ix,
             tip_ix,
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
-        ]
-    } else {
-        vec![
-            advance_nonce_ix,
-            cu_limit_ix,
-            cu_price_ix,
-            data_size_ix,
-            swap_ix,
-            tip_ix,
-        ]
-    };
-
-    let message =
-        Message::new_with_blockhash(&ixs, Some(&wallet_pk), &nonce_blockhash);
+        ],
+        Some(&wallet_pk),
+        &nonce_blockhash,
+    );
     let mut tx = Transaction::new_unsigned(message);
-    tx.sign(&[wallet_kp], nonce_blockhash);
+    tx.sign(&[&wallet_kp], nonce_blockhash);
 
     let sig: Signature = rpc.send_transaction(&tx).await.context("send_transaction")?;
     tracing::info!("sent sig={sig}");
+    println!("https://solscan.io/tx/{sig}");
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
@@ -271,6 +235,43 @@ async fn run_probe(
         .meta
         .ok_or_else(|| anyhow!("tx meta missing"))?;
     let cu_opt: Option<u64> = meta.compute_units_consumed.into();
-    let cu = cu_opt.ok_or_else(|| anyhow!("compute_units_consumed missing"))?;
-    Ok(cu.min(u32::MAX as u64) as u32)
+    let cu = cu_opt.unwrap_or(0);
+
+    println!();
+    println!("=== landed ===");
+    println!("pool:         {pool_pk}");
+    println!("sig:          {sig}");
+    println!("swap_in:      {SWAP_IN_LAMPORTS} lamports (0.001213357 SOL)");
+    println!("tip:          {TIP_LAMPORTS} lamports (0.001213357 SOL)");
+    println!("cu_consumed:  {cu}");
+    println!("base_fee:     {} lamports", meta.fee);
+    Ok(())
+}
+
+/// Pool pubkey can be passed positionally (`send <pubkey>`) or with the
+/// `--pool <pubkey>` flag. Other `--*` flags are consumed (key + value) so
+/// they don't get treated as the positional arg.
+fn parse_pool_arg() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    let mut positional: Option<String> = None;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--pool" {
+            return args.get(i + 1).cloned();
+        } else if let Some(v) = a.strip_prefix("--pool=") {
+            return Some(v.to_string());
+        } else if a.starts_with("--") {
+            // Skip flag + its value (if any). This is a forgiving parser —
+            // an unknown bool-only flag would also skip the next positional,
+            // but for this binary the only positional we care about is the
+            // pool pubkey and the user can always pass it after the flags.
+            i += 2;
+            continue;
+        } else if positional.is_none() {
+            positional = Some(a.clone());
+        }
+        i += 1;
+    }
+    positional
 }

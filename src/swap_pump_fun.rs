@@ -31,6 +31,12 @@ pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 /// `BuyExactQuoteIn` discriminator. Identical to the bot's constant.
 pub const PUMP_FUN_PREFIX_BUY_EXACT_IN: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
 
+/// `Buy` (exact-output) discriminator — ordinary buy. Empirically ~3k CU
+/// cheaper than `BuyExactQuoteIn`. Identical accounts, swapped u64 args
+/// (`base_amount_out`, `max_quote_amount_in`). Mirrors `PUMP_FUN_PREFIX_BUY`
+/// in the bot's `statics/mod.rs`.
+pub const PUMP_FUN_PREFIX_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+
 pub fn pump_fun_pk() -> Pubkey { Pubkey::from_str(PUMP_FUN).unwrap() }
 pub fn pump_fee_program_pk() -> Pubkey { Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap() }
 pub fn pump_global_config_pk() -> Pubkey { Pubkey::from_str(PUMP_GLOBAL_CONFIG).unwrap() }
@@ -129,12 +135,25 @@ pub fn pool_v2_pda(base_mint: &Pubkey) -> Pubkey {
 }
 
 // =============================================================================
-// BuyExactQuoteIn ix builder
+// Buy (exact-output) ix builder
 // =============================================================================
 
-/// Build a PumpFun pAMM `BuyExactQuoteIn` ix matching the bot's production
+/// Build a PumpFun pAMM ordinary `Buy` ix matching the bot's production
 /// layout. Account ordering + data shape are byte-identical with the bot;
 /// CU consumption when this lands is what `measure_cu` records.
+///
+/// Interface stays SOL-denominated (`sol_in`, `slippage_bps`) so callers
+/// don't have to know about the exact-out semantics. Internally:
+///   * `base_amount_out` = constant-product output for `sol_in` against the
+///     given reserves (which on the shred path are the simulated post-dump
+///     reserves — caller mutates the snapshot before calling, same as
+///     before).
+///   * `max_quote_amount_in` = `sol_in × (1 + slippage_bps/10_000)` — caps
+///     how much SOL the program is allowed to debit before reverting.
+///
+/// On a fake dump the actual SOL needed at pre-dump reserves exceeds
+/// `max_quote_amount_in` → `SlippageToleranceExceeded` (mirror of the
+/// previous `min_base_amount_out` floor on `buy_exact_in`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_pump_fun_buy_ix(
     pool_pk: &Pubkey,
@@ -153,8 +172,9 @@ pub fn build_pump_fun_buy_ix(
     sol_in: u64,
     slippage_bps: u32,
 ) -> Instruction {
-    let expected_out = constant_product_out(sol_in, quote_reserves, base_reserves);
-    let min_base_amount_out = apply_slippage_floor(expected_out, slippage_bps);
+    let base_amount_out = constant_product_out(sol_in, quote_reserves, base_reserves);
+    let max_quote_amount_in =
+        ((sol_in as u128 * (10_000u128 + slippage_bps as u128)) / 10_000u128) as u64;
 
     let (coin_creator_vault_authority, coin_creator_vault_ata) = creator_vault(coin_creator);
     let pool_v2 = pool_v2_pda(base_mint);
@@ -195,11 +215,11 @@ pub fn build_pump_fun_buy_ix(
     accounts.push(AccountMeta::new_readonly(static_pdas.amm_fee_recipient, false));
     accounts.push(AccountMeta::new(static_pdas.amm_fee_recipient_wsol_ata, false));
 
-    // data = [disc(8), sol_in(8), min_base_amount_out(8), track_volume=Some(true)]
+    // data = [disc(8), base_amount_out(8), max_quote_amount_in(8), track_volume=Some(true)]
     let mut data = Vec::with_capacity(26);
-    data.extend_from_slice(&PUMP_FUN_PREFIX_BUY_EXACT_IN);
-    data.extend_from_slice(&sol_in.to_le_bytes());
-    data.extend_from_slice(&min_base_amount_out.to_le_bytes());
+    data.extend_from_slice(&PUMP_FUN_PREFIX_BUY);
+    data.extend_from_slice(&base_amount_out.to_le_bytes());
+    data.extend_from_slice(&max_quote_amount_in.to_le_bytes());
     data.push(1); // OptionBool::Some
     data.push(1); // true
     Instruction {

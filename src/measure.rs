@@ -47,11 +47,11 @@ use crate::swap_pump_fun::{
 
 pub const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
 pub const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
-pub const TIP_LAMPORTS: u64 = 1;
-/// 0.001 SOL — bigger than the legacy batch (0.0001 SOL) so the swap moves
-/// past any per-pool minimum that might cause the smaller amount to revert,
-/// and so the CU profile better matches the bot's typical buy size.
-pub const SWAP_IN_LAMPORTS: u64 = 1_000_000;
+/// 0.001213357 SOL — matches the manual `send` binary so auto-measured
+/// CU values reflect the same conditions we test by hand.
+pub const TIP_LAMPORTS: u64 = 1_213_357;
+/// 0.001213357 SOL — see TIP_LAMPORTS rationale.
+pub const SWAP_IN_LAMPORTS: u64 = 1_213_357;
 pub const CU_LIMIT_CEILING: u32 = 400_000;
 pub const CU_PRICE: u64 = 1_000_000;
 pub const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;
