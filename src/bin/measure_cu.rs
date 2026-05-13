@@ -2,8 +2,12 @@
 //!
 //! Walks Mongo pools (PumpFun, ata_status=confirmed, < 7 days old, not
 //! measured in last 7 days), fires a real 0.0001 SOL buy per pool via
-//! Helius, reads `meta.compute_units_consumed` from the landed tx,
-//! multiplies by 1.01 (1% margin), persists into `compute_unit_limit`.
+//! Helius, reads `meta.compute_units_consumed` from the landed tx, and
+//! persists the RAW value into `compute_unit_limit`. The bot applies the
+//! per-tx safety margin (+1% or whatever it's set to) when sizing the
+//! ComputeBudget ix at fire time. Storing raw keeps the source of truth
+//! single — the margin policy can be tuned in the bot without re-running
+//! this script.
 //!
 //! Tx layout matches the bot's production shape so the recorded CU is
 //! what the bot would actually consume:
@@ -65,10 +69,6 @@ const LOADED_DATA_SIZE_LIMIT: u32 = 12_900_000;    // matches bot's prod constan
 const SLIPPAGE_BPS: u32 = 5_000;                   // 50% — generous, we just want it to land
 const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
-/// 1% margin: `cu_consumed * 101 / 100` rounded up.
-fn with_margin(cu: u64) -> i32 {
-    ((cu * 101 + 99) / 100).min(i32::MAX as u64) as i32
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -156,10 +156,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         {
-            Ok(MeasureOutcome::Ok { cu_consumed, cu_with_margin }) => {
-                tracing::info!(
-                    "{prefix} measured cu={cu_consumed} stored={cu_with_margin} (+1%)"
-                );
+            Ok(MeasureOutcome::Ok { cu_consumed }) => {
+                tracing::info!("{prefix} measured cu={cu_consumed} (stored raw)");
                 measured += 1;
             }
             Ok(MeasureOutcome::SkipAtaMissing) => {
@@ -187,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 enum MeasureOutcome {
-    Ok { cu_consumed: u64, cu_with_margin: i32 },
+    Ok { cu_consumed: u64 },
     SkipAtaMissing,
 }
 
@@ -338,10 +336,10 @@ async fn measure_one(
     let cu_consumed_opt: Option<u64> = meta.compute_units_consumed.into();
     let cu_consumed =
         cu_consumed_opt.ok_or_else(|| anyhow!("compute_units_consumed missing"))?;
-    let cu_with_margin = with_margin(cu_consumed);
+    let cu_raw = cu_consumed.min(i32::MAX as u64) as i32;
 
-    // 8. Persist.
-    repo.update_cu_limit(&pool_pk.to_string(), cu_with_margin).await?;
+    // 8. Persist raw — bot applies its safety margin at fire time.
+    repo.update_cu_limit(&pool_pk.to_string(), cu_raw).await?;
 
-    Ok(MeasureOutcome::Ok { cu_consumed, cu_with_margin })
+    Ok(MeasureOutcome::Ok { cu_consumed })
 }
