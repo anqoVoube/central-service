@@ -1,13 +1,19 @@
-//! One-off A/B comparator: fires the same 0.001 SOL probe buy for ONE
-//! pool twice — first with the tip ix at slot 1, then at the end — and
-//! prints both `compute_units_consumed` values + delta.
+//! Single-tx CU probe with selectable tip-ix position. Fires ONE 0.001
+//! SOL buy for the given pool and prints the landed `cu_consumed`.
 //!
-//! Doesn't update Mongo. Use for verifying the bot's tx-layout decision
-//! before paying for a full `measure_cu --force` re-measure pass.
+//! Tip ix layout selected by `--new=<bool>`:
+//!   `--new=true`  → tip at slot 1 (right after advance_nonce_account)
+//!   `--new=false` → tip at the end of the ix list (legacy bot layout)
+//!
+//! Doesn't update Mongo — call once with `--new=true`, once with
+//! `--new=false`, compare the two prints. Useful for verifying the bot's
+//! tx-layout decision before paying for a full `measure_cu --force`
+//! re-measure pass.
 //!
 //! Run:
 //!   `cd ~/Work/central-service-seed && \
-//!     ~/Work/central-service/target/release/compare_tip_position <pool_pubkey>`
+//!     ~/Work/central-service/target/release/compare_tip_position \
+//!     <pool_pubkey> --new=true`
 //!
 //! Requires `.env` with `WALLET_KEYPAIR`, `MONGO_URI`, `MONGO_DB`.
 
@@ -52,14 +58,6 @@ const CU_PRICE: u64 = 1_000_000;
 const LOADED_DATA_SIZE_LIMIT: u32 = 12_900_000;
 const SLIPPAGE_BPS: u32 = 5_000;
 
-#[derive(Clone, Copy, Debug)]
-enum TipPos {
-    /// Tip ix immediately after `advance_nonce_account`.
-    Slot1,
-    /// Tip ix at the end of the ix list (legacy bot layout).
-    End,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -70,9 +68,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let pool_str = std::env::args()
-        .nth(1)
-        .context("usage: compare_tip_position <pool_pubkey>")?;
+    let args: Vec<String> = std::env::args().collect();
+    let pool_str = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .context("usage: compare_tip_position <pool_pubkey> --new=<true|false>")?;
+    let new_layout = parse_new_flag(&args)?;
     let pool_pk = Pubkey::from_str(&pool_str).context("invalid pool pubkey")?;
 
     let wallet_keypair_b58 =
@@ -99,35 +102,31 @@ async fn main() -> anyhow::Result<()> {
     let rpc =
         RpcClient::new_with_commitment(HELIUS_RPC.to_string(), CommitmentConfig::confirmed());
 
-    tracing::info!(pool = %pool_pk, "comparing tip-at-slot-1 vs tip-at-end");
+    let layout_label = if new_layout { "tip@slot1 (new)" } else { "tip@end (legacy)" };
+    tracing::info!(pool = %pool_pk, layout = layout_label, "probing");
 
-    // First: tip at slot 1 (new layout)
-    let cu_slot1 = run_probe(&rpc, &wallet_kp, &pool_pk, &pump, TipPos::Slot1).await?;
-    tracing::info!("tip at slot 1: cu_consumed = {cu_slot1}");
+    let cu = run_probe(&rpc, &wallet_kp, &pool_pk, &pump, new_layout).await?;
 
-    // Pause so the nonce can settle and any state drift is minimal.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Second: tip at end (legacy layout)
-    let cu_end = run_probe(&rpc, &wallet_kp, &pool_pk, &pump, TipPos::End).await?;
-    tracing::info!("tip at end:    cu_consumed = {cu_end}");
-
-    let delta = cu_end as i64 - cu_slot1 as i64;
     println!();
     println!("======================");
-    println!("pool:              {pool_pk}");
-    println!("tip at slot 1 cu:  {cu_slot1}");
-    println!("tip at end cu:     {cu_end}");
-    println!("delta (end - 1):   {delta:+}");
+    println!("pool:          {pool_pk}");
+    println!("layout:        {layout_label}");
+    println!("cu_consumed:   {cu}");
     println!("======================");
-    if delta > 0 {
-        println!("→ slot-1 saves {delta} CU per tx");
-    } else if delta < 0 {
-        println!("→ end is actually cheaper by {} CU per tx", -delta);
-    } else {
-        println!("→ no measurable difference");
-    }
     Ok(())
+}
+
+fn parse_new_flag(args: &[String]) -> anyhow::Result<bool> {
+    for a in args.iter().skip(1) {
+        if let Some(v) = a.strip_prefix("--new=") {
+            return match v {
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" => Ok(false),
+                other => Err(anyhow!("--new=<bool>: got {other:?}, expected true/false")),
+            };
+        }
+    }
+    Err(anyhow!("--new=<true|false> required"))
 }
 
 async fn run_probe(
@@ -135,7 +134,7 @@ async fn run_probe(
     wallet_kp: &Keypair,
     pool_pk: &Pubkey,
     pump: &PumpFunAccounts,
-    tip_pos: TipPos,
+    new_layout: bool,
 ) -> anyhow::Result<u32> {
     let wallet_pk = wallet_kp.pubkey();
     let pdas = PumpStaticPdas::derive(&wallet_pk);
@@ -148,12 +147,10 @@ async fn run_probe(
     let owner_program = Pubkey::from_str(&pump.owner_program)?;
     let wallet_token_ata = find_ata(&wallet_pk, &base_mint, &owner_program);
 
-    // Ensure ATA exists.
     if rpc.get_account(&wallet_token_ata).await.is_err() {
         anyhow::bail!("wallet base-mint ATA missing — run create_missing_atas first");
     }
 
-    // Live reserves for slippage.
     let base_vault_acct = rpc.get_account(&pool_base_vault).await?;
     let quote_vault_acct = rpc.get_account(&pool_quote_vault).await?;
     if base_vault_acct.data.len() < 72 || quote_vault_acct.data.len() < 72 {
@@ -181,7 +178,6 @@ async fn run_probe(
         SLIPPAGE_BPS,
     );
 
-    // Nonce blockhash.
     let nonce_pk = Pubkey::from_str(BUY_NONCE)?;
     let tip_to = Pubkey::from_str(TIP_RECIPIENT)?;
     let sysvar_recent_blockhashes = Pubkey::from_str(SYSVAR_RECENT_BLOCKHASHES)?;
@@ -207,23 +203,24 @@ async fn run_probe(
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
     let tip_ix = system_instruction::transfer(&wallet_pk, &tip_to, TIP_LAMPORTS);
 
-    let ixs: Vec<Instruction> = match tip_pos {
-        TipPos::Slot1 => vec![
+    let ixs: Vec<Instruction> = if new_layout {
+        vec![
             advance_nonce_ix,
             tip_ix,
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
-        ],
-        TipPos::End => vec![
+        ]
+    } else {
+        vec![
             advance_nonce_ix,
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
             tip_ix,
-        ],
+        ]
     };
 
     let message =
@@ -232,9 +229,8 @@ async fn run_probe(
     tx.sign(&[wallet_kp], nonce_blockhash);
 
     let sig: Signature = rpc.send_transaction(&tx).await.context("send_transaction")?;
-    tracing::debug!("{:?} sent sig={sig}", tip_pos);
+    tracing::info!("sent sig={sig}");
 
-    // Poll.
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
     loop {
@@ -259,7 +255,6 @@ async fn run_probe(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Fetch cu_consumed.
     let tx_info = rpc
         .get_transaction_with_config(
             &sig,
