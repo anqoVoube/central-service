@@ -156,6 +156,10 @@ impl Repo {
     /// recency clause — used by the `--force` flag on `measure_cu` to
     /// re-measure ALL pump-fun pools (e.g. after a tx-layout change
     /// invalidates earlier CU values).
+    ///
+    /// Age gate: `pair_created_at_ms > now - 7d` OR `is_unique == true`.
+    /// Matches the WS init filter semantics — pools the bot trades are
+    /// the pools we measure.
     pub async fn pools_for_remeasurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -166,11 +170,17 @@ impl Repo {
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
-            "pair_created_at_ms": { "$gt": stale_cutoff_ms },
+            "$or": [
+                { "is_unique": true },
+                { "pair_created_at_ms": { "$gt": stale_cutoff_ms } },
+            ],
         };
         Ok(self.pools.find(filter).await?.try_collect().await?)
     }
 
+    /// Age gate identical to `pools_for_remeasurement`; additionally
+    /// requires the pool to be unmeasured or stale (so re-runs are
+    /// idempotent for already-recent values).
     pub async fn pools_for_cu_measurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -182,10 +192,19 @@ impl Repo {
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
-            "pair_created_at_ms": { "$gt": stale_cutoff_ms },
-            "$or": [
-                { "cu_measured_at": null },
-                { "cu_measured_at": { "$lt": stale_cutoff } },
+            "$and": [
+                {
+                    "$or": [
+                        { "is_unique": true },
+                        { "pair_created_at_ms": { "$gt": stale_cutoff_ms } },
+                    ]
+                },
+                {
+                    "$or": [
+                        { "cu_measured_at": null },
+                        { "cu_measured_at": { "$lt": stale_cutoff } },
+                    ]
+                },
             ],
         };
         Ok(self.pools.find(filter).await?.try_collect().await?)

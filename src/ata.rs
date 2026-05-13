@@ -92,9 +92,12 @@ pub async fn create(
     eprintln!("[ata] {pool} exhausted all 3 attempts — row stays pending");
 }
 
-/// Run the CU probe for a freshly-ATA'd pool. Logs but never propagates
-/// errors — the broadcast happens regardless, just with `compute_unit_limit:
-/// None` on failure (bot falls back to its static `CU_LIMIT_PUMP_FUN`).
+/// Run the CU probe for a freshly-ATA'd pool. Retries up to 3 times on
+/// transient errors (confirm timeout, get_transaction returning null,
+/// etc.) before giving up and broadcasting without cu — that way bots
+/// see a measured value for the first trade rather than the static
+/// `CU_LIMIT_PUMP_FUN` fallback. `SkipAtaMissing` is never retried (it
+/// indicates a chain-state race, not a probe failure).
 async fn measure_one(
     rpc: &RpcClient,
     wallet_kp: &Keypair,
@@ -102,28 +105,40 @@ async fn measure_one(
     repo: &Repo,
     pool: &str,
 ) -> Option<i32> {
-    match measure_pool_cu(rpc, wallet_kp, doc).await {
-        Ok(MeasureOutcome::Ok(cu)) => {
-            let cu_i32 = cu as i32;
-            if let Err(e) = repo.update_cu_limit(pool, cu_i32).await {
-                eprintln!("[ata] {pool} update_cu_limit failed: {e:#}");
+    const PROBE_BACKOFF: [u64; 3] = [2, 5, 15];
+    for attempt in 1usize..=3 {
+        match measure_pool_cu(rpc, wallet_kp, doc).await {
+            Ok(MeasureOutcome::Ok(cu)) => {
+                let cu_i32 = cu as i32;
+                if let Err(e) = repo.update_cu_limit(pool, cu_i32).await {
+                    eprintln!("[ata] {pool} update_cu_limit failed: {e:#}");
+                    return None;
+                }
+                println!("[ata] {pool} measured cu={cu} (attempt {attempt}/3)");
+                return Some(cu_i32);
+            }
+            Ok(MeasureOutcome::SkipAtaMissing) => {
+                // ATA confirmed seconds ago — this is a chain-state race,
+                // not something a retry will fix. Bail without retrying.
+                eprintln!(
+                    "[ata] {pool} cu probe reported ATA missing after successful ATA-create — \
+                     broadcasting without cu (no retry)"
+                );
                 return None;
             }
-            println!("[ata] {pool} measured cu={cu}");
-            Some(cu_i32)
-        }
-        Ok(MeasureOutcome::SkipAtaMissing) => {
-            // Shouldn't happen — we just confirmed the ATA above. Log and
-            // broadcast without cu so bot uses its static fallback.
-            eprintln!(
-                "[ata] {pool} cu probe reported ATA missing after a successful ATA-create — \
-                 chain state may be racy. Broadcasting without cu."
-            );
-            None
-        }
-        Err(e) => {
-            eprintln!("[ata] {pool} cu probe failed: {e:#} — broadcasting without cu");
-            None
+            Err(e) => {
+                eprintln!(
+                    "[ata] {pool} cu probe attempt {attempt}/3 failed: {e:#}"
+                );
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(PROBE_BACKOFF[attempt - 1])).await;
+                }
+            }
         }
     }
+    eprintln!(
+        "[ata] {pool} cu probe exhausted all 3 attempts — broadcasting without cu \
+         (bot will use static CU_LIMIT_PUMP_FUN until next measure_cu pass)"
+    );
+    None
 }
