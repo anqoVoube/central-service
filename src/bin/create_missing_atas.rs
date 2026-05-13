@@ -33,7 +33,6 @@ use solana_transaction_status_client_types::TransactionConfirmationStatus;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
 use central_service::{
-    config::Config,
     mongo::Repo,
     pool::PoolAccounts,
     swap_pump_fun::{find_ata, token_program_pk},
@@ -54,12 +53,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = Config::from_env()?;
-    let wallet_kp = Keypair::from_base58_string(&cfg.wallet_keypair_b58);
+    // Minimal env — only what's needed for the ATA-create pass.
+    let wallet_keypair_b58 =
+        std::env::var("WALLET_KEYPAIR").context("WALLET_KEYPAIR not set")?;
+    let mongo_uri = std::env::var("MONGO_URI").context("MONGO_URI not set")?;
+    let mongo_db = std::env::var("MONGO_DB").context("MONGO_DB not set")?;
+    let wallet_kp = Keypair::from_base58_string(&wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
     tracing::info!(wallet = %wallet_pk, "starting create_missing_atas");
 
-    let repo = Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?;
+    let repo = Repo::connect(&mongo_uri, &mongo_db).await?;
     let rpc =
         RpcClient::new_with_commitment(HELIUS_RPC.to_string(), CommitmentConfig::confirmed());
 

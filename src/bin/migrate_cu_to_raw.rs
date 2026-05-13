@@ -17,7 +17,8 @@
 //!     cd ~/Work/central-service && cargo build --release --bin migrate_cu_to_raw
 //!     cd ~/Work/central-service-seed && ~/Work/central-service/target/release/migrate_cu_to_raw
 
-use central_service::{config::Config, mongo::Repo};
+use anyhow::Context;
+use central_service::mongo::Repo;
 
 /// (pool_pubkey, raw cu_consumed) pairs lifted verbatim from the 2026-05-13
 /// measure_cu run log. 112 entries — the 3 pools that hit ATA-missing
@@ -147,10 +148,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = Config::from_env()?;
-    tracing::info!(db = %cfg.mongo_db, "migrating {} pools to raw cu", PAIRS.len());
+    // Skip the full `Config::from_env()` so this binary runs from any
+    // .env that only carries Mongo creds (e.g. central-service-seed).
+    let mongo_uri = std::env::var("MONGO_URI").context("MONGO_URI not set")?;
+    let mongo_db = std::env::var("MONGO_DB").context("MONGO_DB not set")?;
+    tracing::info!(db = %mongo_db, "migrating {} pools to raw cu", PAIRS.len());
 
-    let repo = Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?;
+    let repo = Repo::connect(&mongo_uri, &mongo_db).await?;
 
     let mut ok = 0usize;
     let mut failed = 0usize;
