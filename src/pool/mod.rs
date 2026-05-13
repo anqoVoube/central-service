@@ -68,4 +68,11 @@ pub struct PoolDoc {
     /// skips pools whose value is recent (< 7 days). `None` for unmeasured.
     #[serde(default)]
     pub cu_measured_at: Option<mongodb::bson::DateTime>,
+    /// Override the 7-day age filter on the WS `init.pools` payload. When
+    /// `Some(true)`, the pool is shipped to bots regardless of
+    /// `pair_created_at_ms`. Used for high-value long-lived pools we want
+    /// to keep trading past the freshness window. `None` / `Some(false)` →
+    /// age filter applies as usual.
+    #[serde(default)]
+    pub is_unique: Option<bool>,
 }

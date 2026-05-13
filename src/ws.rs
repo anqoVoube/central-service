@@ -651,6 +651,10 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
     // shipped to bots, so they won't be traded. Pools with unknown age
     // (`pair_created_at_ms == None` after the startup backfill) are also
     // excluded — we can't verify they're fresh, so conservatively drop.
+    //
+    // `is_unique == Some(true)` bypasses the age check entirely — used for
+    // long-lived high-value pools we want to keep shipping past the
+    // freshness window.
     const INIT_POOL_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
     let now_ms: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -660,13 +664,16 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
     let pools: Vec<PoolDoc> = pools
         .into_iter()
         .filter(|p| {
+            if p.is_unique == Some(true) {
+                return true;
+            }
             p.pair_created_at_ms
                 .map(|c| now_ms.saturating_sub(c) < INIT_POOL_MAX_AGE_MS)
                 .unwrap_or(false)
         })
         .collect();
     println!(
-        "[ws] init for {addr}: {} of {total} pools within 7-day window",
+        "[ws] init for {addr}: {} of {total} pools admitted (7-day window OR is_unique)",
         pools.len()
     );
     let positions_payload = state.positions.current_open();
