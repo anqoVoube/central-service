@@ -56,4 +56,16 @@ pub struct PoolDoc {
     /// failed. Stored once at discovery; never refreshed.
     #[serde(default)]
     pub pair_created_at_ms: Option<i64>,
+    /// Pool-specific CU ceiling derived from a one-shot 0.0001 SOL buy
+    /// measurement: `ceil(meta.compute_units_consumed × 1.01)`. The bot
+    /// reads this and uses it in place of the static `CU_LIMIT_*` constants
+    /// when present (per-pool optimisation). `None` for pools that haven't
+    /// been measured yet — bot falls back to its static constant.
+    /// Re-measured on schedule (see `cu_measured_at`).
+    #[serde(default)]
+    pub compute_unit_limit: Option<i32>,
+    /// Timestamp of the last successful CU measurement. Measurement script
+    /// skips pools whose value is recent (< 7 days). `None` for unmeasured.
+    #[serde(default)]
+    pub cu_measured_at: Option<mongodb::bson::DateTime>,
 }

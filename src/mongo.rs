@@ -142,4 +142,49 @@ impl Repo {
             .await?;
         Ok(())
     }
+
+    /// Pools that the `measure_cu` binary should hit on this run. Filter:
+    ///   - `ata_status == "confirmed"` (the wallet's ATA exists for the base
+    ///     mint, otherwise the buy ix errors with AccountNotInitialized)
+    ///   - `pair_created_at_ms > now - 7 days` (fresh pools only; the bot's
+    ///     `init.pools` filter uses the same window)
+    ///   - `cu_measured_at` is null OR older than 7 days (idempotent re-run:
+    ///     pools we've recently measured are skipped)
+    ///   - `pool_type == "pump_fun"` for now — Raydium AMM/CPMM measurement
+    ///     can be added when the bot needs per-pool CU for those too.
+    pub async fn pools_for_cu_measurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let seven_days_ms: i64 = 7 * 24 * 60 * 60 * 1000;
+        let stale_cutoff_ms = now_ms - seven_days_ms;
+        let stale_cutoff = DateTime::from_millis(stale_cutoff_ms);
+        let filter = doc! {
+            "ata_status": "confirmed",
+            "pool_type": "pump_fun",
+            "pair_created_at_ms": { "$gt": stale_cutoff_ms },
+            "$or": [
+                { "cu_measured_at": null },
+                { "cu_measured_at": { "$lt": stale_cutoff } },
+            ],
+        };
+        Ok(self.pools.find(filter).await?.try_collect().await?)
+    }
+
+    /// Persist a fresh CU measurement (already padded by the caller's 1%
+    /// margin) and stamp the time. Idempotent — overwrites prior values.
+    pub async fn update_cu_limit(&self, pool: &str, cu_with_margin: i32) -> anyhow::Result<()> {
+        self.pools
+            .update_one(
+                doc! { "pool": pool },
+                doc! { "$set": {
+                    "compute_unit_limit": cu_with_margin,
+                    "cu_measured_at": DateTime::now(),
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        Ok(())
+    }
 }

@@ -96,6 +96,8 @@ async fn handle_one(
         token_name,
         token_symbol,
         pair_created_at_ms,
+        compute_unit_limit: None,
+        cu_measured_at: None,
     };
 
     let inserted = repo.upsert_pending(&doc).await.context("upsert_pending")?;

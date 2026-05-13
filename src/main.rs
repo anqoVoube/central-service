@@ -3,20 +3,10 @@ use std::{sync::Arc, time::Duration};
 use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::broadcast;
 
-mod alts;
-mod ata;
-mod backfill;
-mod bans;
-mod config;
-mod discover;
-mod lanes;
-mod leaders;
-mod mongo;
-mod poll;
-mod pool;
-mod positions;
-mod validators;
-mod ws;
+use central_service::{
+    alts, ata, backfill, bans, config, discover, lanes, leaders, mongo, poll, pool, positions,
+    validators, ws,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
