@@ -14,7 +14,7 @@
 //!   ix[0] advance_nonce_account
 //!   ix[1] set_compute_unit_limit(400_000)               ← high ceiling
 //!   ix[2] set_compute_unit_price(1_000_000)             ← ~$0.04 priority
-//!   ix[3] set_loaded_accounts_data_size_limit(12_900_000)
+//!   ix[3] set_loaded_accounts_data_size_limit(13_500_000)
 //!   ix[4] swap_buy_ix                                   ← 0.0001 SOL in
 //!   ix[5] system::transfer(1 lamport → SUPRA tip)
 //!
@@ -65,7 +65,7 @@ const TIP_LAMPORTS: u64 = 1;                       // minimum — keeps tip ix i
 const SWAP_IN_LAMPORTS: u64 = 100_000;             // 0.0001 SOL
 const CU_LIMIT_CEILING: u32 = 400_000;             // high enough to never bite
 const CU_PRICE: u64 = 1_000_000;                   // microlamports/CU → ~$0.04 priority
-const LOADED_DATA_SIZE_LIMIT: u32 = 12_900_000;    // matches bot's prod constant
+const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;    // matches bot's prod constant
 const SLIPPAGE_BPS: u32 = 5_000;                   // 50% — generous, we just want it to land
 const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 

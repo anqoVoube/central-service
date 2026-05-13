@@ -54,7 +54,7 @@ pub const TIP_LAMPORTS: u64 = 1;
 pub const SWAP_IN_LAMPORTS: u64 = 1_000_000;
 pub const CU_LIMIT_CEILING: u32 = 400_000;
 pub const CU_PRICE: u64 = 1_000_000;
-pub const LOADED_DATA_SIZE_LIMIT: u32 = 12_900_000;
+pub const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;
 pub const SLIPPAGE_BPS: u32 = 5_000;  // 50% — we just want it to land
 
 const SYSVAR_RECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";

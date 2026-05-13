@@ -55,7 +55,7 @@ const TIP_LAMPORTS: u64 = 1;
 const SWAP_IN_LAMPORTS: u64 = 1_000_000; // 0.001 SOL
 const CU_LIMIT_CEILING: u32 = 400_000;
 const CU_PRICE: u64 = 1_000_000;
-const LOADED_DATA_SIZE_LIMIT: u32 = 12_900_000;
+const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;
 const SLIPPAGE_BPS: u32 = 5_000;
 
 #[tokio::main]
