@@ -82,17 +82,18 @@ pub enum LaneResolution {
 /// tens digit = path, ones digit = location.
 ///
 /// - path 0 = GEYSER, 1 = SHRED_SHREDER, 2 = SHRED_RAIDEN,
-///        3..=8 reserved, 9 = DASHBOARD
-/// - loc  0 = FR, 1 = AMS, 2 = NY, 3 = TYO, 4 = FR2, 5..=9 reserved
+///        3 = SHRED_CORVUS, 4..=8 reserved, 9 = DASHBOARD
+/// - loc  0 = FR, 1 = AMS, 2 = NY, 3 = TYO, 4 = FR2, 5 = AMS2, 6 = LT,
+///        7..=9 reserved
 ///
-/// Reserved path (3..=8) → `(u8::MAX, u8::MAX)`. Reserved location slots
+/// Reserved path (4..=8) → `(u8::MAX, u8::MAX)`. Reserved location slots
 /// inside a valid path are returned as-is and rendered as `—` by the
 /// dashboard.
 pub fn decode_lane(lane: u8) -> (u8, u8) {
     let path = lane / 10;
     let loc = lane % 10;
     match path {
-        0 | 1 | 2 => (path, loc),
+        0 | 1 | 2 | 3 => (path, loc),
         9 => (9, loc),
         _ => (u8::MAX, u8::MAX),
     }
@@ -294,23 +295,26 @@ mod tests {
     #[test]
     fn decode_lane_table() {
         // Two-digit encoding: tens = path (0=GEYSER, 1=SHRED_SHREDER,
-        // 2=SHRED_RAIDEN, 3..=8 reserved, 9=DASHBOARD), ones = location
-        // (0=FR, 1=AMS, 2=NY, 3=TYO, 4=FR2, 5..=9 reserved).
+        // 2=SHRED_RAIDEN, 3=SHRED_CORVUS, 4..=8 reserved, 9=DASHBOARD),
+        // ones = location (0=FR, 1=AMS, 2=NY, 3=TYO, 4=FR2, 5=AMS2,
+        // 6=LT, 7..=9 reserved).
         assert_eq!(decode_lane(0),  (0, 0));         // GEYSER × FR
         assert_eq!(decode_lane(1),  (0, 1));         // GEYSER × AMS
         assert_eq!(decode_lane(2),  (0, 2));         // GEYSER × NY
         assert_eq!(decode_lane(3),  (0, 3));         // GEYSER × TYO
         assert_eq!(decode_lane(4),  (0, 4));         // GEYSER × FR2
+        assert_eq!(decode_lane(6),  (0, 6));         // GEYSER × LT
         assert_eq!(decode_lane(10), (1, 0));         // SHRED_SHREDER × FR
         assert_eq!(decode_lane(14), (1, 4));         // SHRED_SHREDER × FR2
         assert_eq!(decode_lane(20), (2, 0));         // SHRED_RAIDEN × FR
         assert_eq!(decode_lane(24), (2, 4));         // SHRED_RAIDEN × FR2
+        assert_eq!(decode_lane(36), (3, 6));         // SHRED_CORVUS × LT
         assert_eq!(decode_lane(90), (9, 0));         // DASHBOARD × FR
         // Reserved location slots still resolve — path is valid.
-        assert_eq!(decode_lane(5),  (0, 5));         // GEYSER × reserved-5
+        assert_eq!(decode_lane(7),  (0, 7));         // GEYSER × reserved-7
         assert_eq!(decode_lane(19), (1, 9));         // SHRED_SHREDER × reserved-9
-        // Reserved path slots (3..=8) are unknown.
-        assert_eq!(decode_lane(30), (u8::MAX, u8::MAX));
+        // Reserved path slots (4..=8) are unknown.
+        assert_eq!(decode_lane(40), (u8::MAX, u8::MAX));
         assert_eq!(decode_lane(85), (u8::MAX, u8::MAX));
         // Lane 99 = path 9 (DASHBOARD), loc 9 (reserved).
         assert_eq!(decode_lane(99), (9, 9));
