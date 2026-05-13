@@ -66,12 +66,28 @@ async fn main() -> anyhow::Result<()> {
     let pools_coll = client
         .database(&mongo_db)
         .collection::<PoolDoc>("pools");
-    if pools_coll
+    if let Some(existing) = pools_coll
         .find_one(mongodb::bson::doc! { "pool": &pool_str })
         .await?
-        .is_some()
     {
-        println!("[add_pool] {pool_pk} already exists in Mongo — no-op");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let age = existing.pair_created_at_ms.map(|c| {
+            let ms = now_ms.saturating_sub(c);
+            format!("{} days", ms / (24 * 60 * 60 * 1_000))
+        });
+        println!("[add_pool] {pool_pk} already exists in Mongo — no insert performed");
+        println!("  is_unique:           {:?}", existing.is_unique);
+        println!("  ata_status:          {:?}", existing.ata_status);
+        println!("  token_symbol:        {:?}", existing.token_symbol);
+        println!("  pair_created_at_ms:  {:?}  ({})", existing.pair_created_at_ms, age.as_deref().unwrap_or("unknown"));
+        println!("  compute_unit_limit:  {:?}", existing.compute_unit_limit);
+        println!(
+            "[add_pool] to flip is_unique=true on an existing pool, run: \
+             `mark_unique {pool_pk}`"
+        );
         return Ok(());
     }
 
