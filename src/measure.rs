@@ -50,8 +50,12 @@ pub const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
 /// 0.001213357 SOL — matches the manual `send` binary so auto-measured
 /// CU values reflect the same conditions we test by hand.
 pub const TIP_LAMPORTS: u64 = 1_213_357;
-/// 0.001213357 SOL — see TIP_LAMPORTS rationale.
-pub const SWAP_IN_LAMPORTS: u64 = 1_213_357;
+/// 0.0001213357 SOL — 10× smaller than `TIP_LAMPORTS`. Both
+/// `base_amount_out` and `max_quote_amount_in` derived inside the buy ix
+/// scale linearly with this for the small-amount-vs-reserves regime, so
+/// the on-chain CU charge stays representative while the per-pool SOL
+/// cost of a full sweep drops 10×.
+pub const SWAP_IN_LAMPORTS: u64 = 121_335;
 pub const CU_LIMIT_CEILING: u32 = 400_000;
 pub const CU_PRICE: u64 = 1_000_000;
 pub const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;
