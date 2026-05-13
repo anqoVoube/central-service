@@ -40,6 +40,12 @@ pub enum ServerMsg {
         /// pool yet.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pair_created_at_ms: Option<i64>,
+        /// Raw `compute_units_consumed` from the 0.001 SOL probe tx that
+        /// the discover pipeline runs once the wallet's ATA is created.
+        /// `None` when the measurement failed (e.g. pool drained mid-flow);
+        /// bot falls back to its static `CU_LIMIT_PUMP_FUN` constant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compute_unit_limit: Option<i32>,
     },
     CreatorChange {
         pool: String,

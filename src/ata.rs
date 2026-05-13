@@ -11,7 +11,12 @@ use solana_sdk::{
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use tokio::sync::broadcast;
 
-use crate::{mongo::Repo, pool::PoolDoc, ws::ServerMsg};
+use crate::{
+    measure::{measure_pool_cu, MeasureOutcome},
+    mongo::Repo,
+    pool::PoolDoc,
+    ws::ServerMsg,
+};
 
 const CU_PRICE: u64 = 100_000;
 const CU_LIMIT: u32 = 50_000;
@@ -63,10 +68,16 @@ pub async fn create(
                 if let Err(e) = repo.mark_ata_confirmed(&pool).await {
                     eprintln!("[ata] {pool} mark_ata_confirmed failed: {e:#}");
                 }
+                // Now that the ATA exists, fire a 0.001 SOL probe buy to
+                // record the pool's CU consumption. Result is persisted +
+                // included in the NewPool broadcast so bots see the value
+                // at first sight, not after a separate measurement pass.
+                let measured_cu = measure_one(&rpc, &wallet_kp, &doc, &repo, &pool).await;
                 let _ = broadcast.send(ServerMsg::NewPool {
                     pool: doc.pool.clone(),
                     accounts: doc.accounts.clone(),
                     pair_created_at_ms: doc.pair_created_at_ms,
+                    compute_unit_limit: measured_cu,
                 });
                 return;
             }
@@ -79,4 +90,40 @@ pub async fn create(
         }
     }
     eprintln!("[ata] {pool} exhausted all 3 attempts — row stays pending");
+}
+
+/// Run the CU probe for a freshly-ATA'd pool. Logs but never propagates
+/// errors — the broadcast happens regardless, just with `compute_unit_limit:
+/// None` on failure (bot falls back to its static `CU_LIMIT_PUMP_FUN`).
+async fn measure_one(
+    rpc: &RpcClient,
+    wallet_kp: &Keypair,
+    doc: &PoolDoc,
+    repo: &Repo,
+    pool: &str,
+) -> Option<i32> {
+    match measure_pool_cu(rpc, wallet_kp, doc).await {
+        Ok(MeasureOutcome::Ok(cu)) => {
+            let cu_i32 = cu as i32;
+            if let Err(e) = repo.update_cu_limit(pool, cu_i32).await {
+                eprintln!("[ata] {pool} update_cu_limit failed: {e:#}");
+                return None;
+            }
+            println!("[ata] {pool} measured cu={cu}");
+            Some(cu_i32)
+        }
+        Ok(MeasureOutcome::SkipAtaMissing) => {
+            // Shouldn't happen — we just confirmed the ATA above. Log and
+            // broadcast without cu so bot uses its static fallback.
+            eprintln!(
+                "[ata] {pool} cu probe reported ATA missing after a successful ATA-create — \
+                 chain state may be racy. Broadcasting without cu."
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("[ata] {pool} cu probe failed: {e:#} — broadcasting without cu");
+            None
+        }
+    }
 }

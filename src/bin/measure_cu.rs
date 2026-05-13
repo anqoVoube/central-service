@@ -114,8 +114,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let pools = repo.pools_for_cu_measurement().await?;
-    tracing::info!(count = pools.len(), "pools queued for measurement");
+    // CLI: pass `--force` (or any first arg) to ignore the cu_measured_at
+    // recency filter and re-measure every pump-fun pool. Useful after a
+    // tx-layout change that invalidates prior CU values.
+    let force = std::env::args().any(|a| a == "--force" || a == "--all");
+    let pools = if force {
+        repo.pools_for_remeasurement().await?
+    } else {
+        repo.pools_for_cu_measurement().await?
+    };
+    tracing::info!(
+        count = pools.len(),
+        force,
+        "pools queued for measurement"
+    );
 
     let mut measured = 0usize;
     let mut skipped_ata = 0usize;
@@ -277,11 +289,11 @@ async fn measure_one(
     let message = Message::new_with_blockhash(
         &[
             advance_nonce_ix,
+            tip_ix,            // slot 1 — matches bot's production layout
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
-            tip_ix,
         ],
         Some(&wallet_pk),
         &nonce_blockhash,

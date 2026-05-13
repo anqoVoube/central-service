@@ -10,6 +10,7 @@ pub mod config;
 pub mod discover;
 pub mod lanes;
 pub mod leaders;
+pub mod measure;
 pub mod mongo;
 pub mod poll;
 pub mod pool;

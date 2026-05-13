@@ -152,6 +152,25 @@ impl Repo {
     ///     pools we've recently measured are skipped)
     ///   - `pool_type == "pump_fun"` for now — Raydium AMM/CPMM measurement
     ///     can be added when the bot needs per-pool CU for those too.
+    /// Like `pools_for_cu_measurement` but ignores the `cu_measured_at`
+    /// recency clause — used by the `--force` flag on `measure_cu` to
+    /// re-measure ALL pump-fun pools (e.g. after a tx-layout change
+    /// invalidates earlier CU values).
+    pub async fn pools_for_remeasurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let seven_days_ms: i64 = 7 * 24 * 60 * 60 * 1000;
+        let stale_cutoff_ms = now_ms - seven_days_ms;
+        let filter = doc! {
+            "ata_status": "confirmed",
+            "pool_type": "pump_fun",
+            "pair_created_at_ms": { "$gt": stale_cutoff_ms },
+        };
+        Ok(self.pools.find(filter).await?.try_collect().await?)
+    }
+
     pub async fn pools_for_cu_measurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
