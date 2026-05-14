@@ -52,6 +52,28 @@ impl Repo {
             .await?)
     }
 
+    /// Pools eligible for the creator-drift poll: confirmed pump_fun pools
+    /// that the WS init filter would actually ship to bots — i.e.
+    /// `is_unique == true OR pair_created_at_ms > now - 7d`. Old non-unique
+    /// pools stay in Mongo for history but skip polling, since the bots
+    /// won't see them anyway.
+    pub async fn load_pump_fun_for_creator_poll(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let stale_cutoff_ms = now_ms - 7 * 24 * 60 * 60 * 1000;
+        let filter = doc! {
+            "pool_type": "pump_fun",
+            "ata_status": "confirmed",
+            "$or": [
+                { "is_unique": true },
+                { "pair_created_at_ms": { "$gt": stale_cutoff_ms } },
+            ],
+        };
+        Ok(self.pools.find(filter).await?.try_collect().await?)
+    }
+
     /// Pool pubkeys for every row still stuck in `ata_status: pending`.
     /// Used at central startup to re-feed these into the discovery pipeline
     /// so the ATA creator gets another shot (subject to a fresh 3-attempt
