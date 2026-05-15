@@ -65,6 +65,11 @@ pub struct OpenPosition {
     /// legacy lines; dashboard then falls back to its estimate.
     #[serde(default)]
     pub cost_lamports: u64,
+    /// Pool USD liquidity at buy fire time (2 × WSOL_reserves × SOL_PRICE_USD).
+    /// Captured bot-side from current reserves at the moment the dump
+    /// trigger fired. 0 for legacy lines.
+    #[serde(default)]
+    pub liquidity_usd: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +95,9 @@ pub struct OpenedReport {
     /// See `OpenPosition::cost_lamports`. 0 for legacy bots.
     #[serde(default)]
     pub cost_lamports: u64,
+    /// See `OpenPosition::liquidity_usd`. 0 for legacy bots.
+    #[serde(default)]
+    pub liquidity_usd: f64,
 }
 
 /// A buy attempt that landed on chain but reverted — the wallet paid the
@@ -130,6 +138,10 @@ pub struct FailedReport {
     /// resolve failed.
     #[serde(default)]
     pub actual_fee_lamports: u64,
+    /// Pool USD liquidity at buy fire time. See `OpenPosition::liquidity_usd`.
+    /// 0 for legacy bots.
+    #[serde(default)]
+    pub liquidity_usd: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -194,6 +206,9 @@ enum LogEvent {
         /// See `OpenPosition::cost_lamports`. 0 for legacy lines.
         #[serde(default)]
         cost_lamports: u64,
+        /// See `OpenPosition::liquidity_usd`. 0 for legacy lines.
+        #[serde(default)]
+        liquidity_usd: f64,
     },
     Closed {
         ts_ms: u64,
@@ -241,6 +256,9 @@ enum LogEvent {
         actual_fee_lamports: u64,
         #[serde(default)]
         leader: Option<LeaderInfo>,
+        /// See `OpenPosition::liquidity_usd`. 0 for legacy lines.
+        #[serde(default)]
+        liquidity_usd: f64,
     },
     /// Late-arriving leader info, emitted after central's async resolve
     /// completes. Keyed by `opportunity_sig`. The dashboard merges this
@@ -310,6 +328,7 @@ impl Positions {
             process_us: r.process_us,
             leader: leader.clone(),
             cost_lamports: r.cost_lamports,
+            liquidity_usd: r.liquidity_usd,
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -328,6 +347,7 @@ impl Positions {
             process_us: r.process_us,
             leader,
             cost_lamports: r.cost_lamports,
+            liquidity_usd: r.liquidity_usd,
         });
     }
 
@@ -377,6 +397,7 @@ impl Positions {
             expected_cost_lamports: r.expected_cost_lamports,
             actual_fee_lamports: r.actual_fee_lamports,
             leader,
+            liquidity_usd: r.liquidity_usd,
         });
     }
 }
@@ -415,6 +436,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 process_us,
                 leader,
                 cost_lamports,
+                liquidity_usd,
             } => {
                 out.insert(
                     pool.clone(),
@@ -433,6 +455,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         process_us,
                         leader,
                         cost_lamports,
+                        liquidity_usd,
                     },
                 );
             }

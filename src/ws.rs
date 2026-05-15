@@ -75,6 +75,10 @@ pub enum ServerMsg {
         /// delta. 0 for legacy bots — receivers fall back to local estimate.
         #[serde(default)]
         cost_lamports: u64,
+        /// Pool USD liquidity at fire time, snapshotted bot-side. 0 for
+        /// legacy bots.
+        #[serde(default)]
+        liquidity_usd: f64,
     },
     /// Forwarded to all locations after the lander reports it. Each location
     /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
@@ -140,6 +144,10 @@ pub enum ServerMsg {
         actual_fee_lamports: u64,
         #[serde(default)]
         leader: Option<LeaderInfo>,
+        /// Pool USD liquidity at fire time, snapshotted bot-side. 0 for
+        /// legacy bots.
+        #[serde(default)]
+        liquidity_usd: f64,
     },
 }
 
@@ -746,6 +754,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             process_us: r.process_us,
                             leader: None,
                             cost_lamports: r.cost_lamports,
+                            liquidity_usd: r.liquidity_usd,
                         });
                         // Resolve leader async; emit a follow-up
                         // `leader_resolved` JSONL line + WS broadcast that
@@ -859,6 +868,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                                 expected_cost_lamports: r.expected_cost_lamports,
                                 actual_fee_lamports,
                                 leader: leader.clone(),
+                                liquidity_usd: r.liquidity_usd,
                             };
                             positions.record_failed(r, leader);
                             let _ = bcast.send(broadcast);
