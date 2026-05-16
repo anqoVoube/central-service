@@ -180,6 +180,7 @@
       <label><input type="checkbox" id="hide-skip" /> hide [shred-skip] / [skip]</label>
       <label><input type="checkbox" id="hide-tx" /> hide [tx]</label>
       <label><input type="checkbox" id="auto-ts" checked /> show timestamps</label>
+      <label><input type="checkbox" id="sort-arrival" /> sort [tx] by since_arrival_us</label>
     </div>
     <div class="status" id="status"></div>
     <div class="lines" id="lines">
@@ -227,7 +228,11 @@
       else if (prefix === 'tx-err')                   cls = 't-tx-err';
       else if (prefix === 'skip')                     cls = 't-skip';
       else if (prefix === 'ws')                       cls = 't-other';
-      return { tag: prefix, cls, body, ts };
+      // Parse `since_arrival_us=<N>` if present (appears on [tx] and
+      // [tx-err]); enables the toolbar "sort by send order" toggle.
+      const m_arr = body.match(/\bsince_arrival_us=(\d+)/);
+      const since_arrival_us = m_arr ? parseInt(m_arr[1], 10) : null;
+      return { tag: prefix, cls, body, ts, since_arrival_us };
     }
 
     function fmtTs(d) {
@@ -264,6 +269,24 @@
         return;
       }
 
+      // Sort by since_arrival_us when the toolbar toggle is on. Lines
+      // without that field (sig-recv, buy-trigger, etc.) keep their
+      // original chronological order at the top; [tx]/[tx-err] lines
+      // follow, sorted ASC by their since_arrival_us value — easy to
+      // see which sender's tx hit the wire first vs last for the same
+      // fire.
+      const sortByArrival = $('sort-arrival').checked;
+      const toRender = sortByArrival
+        ? filtered.slice().sort((a, b) => {
+            const aHas = a.since_arrival_us != null;
+            const bHas = b.since_arrival_us != null;
+            if (aHas && bHas) return a.since_arrival_us - b.since_arrival_us;
+            if (aHas) return 1;   // tx lines go after non-tx lines
+            if (bHas) return -1;
+            return 0;             // stable: keep original relative order
+          })
+        : filtered;
+
       // Trigger / fired lines are very long and noisy. We only really care
       // about the opportunity sig (clickable to solscan). For those tags,
       // render a compact body of just `opp=<short_sig>` linked to solscan.
@@ -283,7 +306,7 @@
         return s.slice(0, 6) + '…' + s.slice(-6);
       }
 
-      const html = filtered.map(l => {
+      const html = toRender.map(l => {
         const tsHtml = (showTs && l.ts)
           ? `<span class="ts">${fmtTs(l.ts)}</span>`
           : '';
@@ -424,7 +447,7 @@
         if (e.key === 'Enter') searchTime();
       });
     });
-    ['hide-recv', 'hide-skip', 'hide-tx', 'auto-ts'].forEach(id => {
+    ['hide-recv', 'hide-skip', 'hide-tx', 'auto-ts', 'sort-arrival'].forEach(id => {
       $(id).addEventListener('change', render);
     });
 
