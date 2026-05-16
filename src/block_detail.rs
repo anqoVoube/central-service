@@ -67,7 +67,8 @@ const RESOLVE_MAX_RETRIES: usize = 3;
 /// so we give it twice the room.
 const RESOLVE_WAIT_POLLS: usize = 120;
 
-/// One competitor (or own) buy attempt in the same block as the opportunity.
+/// One competitor (or own) buy attempt in the dump's block or the
+/// immediately-following block (slot+1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuyAttempt {
     /// Tx signature (base58).
@@ -100,9 +101,16 @@ pub struct BuyAttempt {
     /// 0-based position in the block's transaction list — preserves
     /// validator landing order so the dashboard can sort by it.
     pub intra_block_order: u32,
+    /// Slot this attempt landed in. Either `BlockDetail.slot` (the dump's
+    /// block) or `BlockDetail.next_slot` (the immediately-following block).
+    /// `#[serde(default)]` so older cached entries keep deserialising.
+    #[serde(default)]
+    pub slot: u64,
 }
 
-/// Aggregated result for one `(opp_sig, pool)` lookup.
+/// Aggregated result for one `(opp_sig, pool)` lookup. Covers two
+/// consecutive blocks — the dump's block plus the next produced block —
+/// so an attempt that slipped into the following slot is still visible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockDetail {
     pub opp_sig: String,
@@ -112,6 +120,16 @@ pub struct BlockDetail {
     pub block_height: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_time_ms: Option<i64>,
+    /// Slot of the next produced block walked (typically `slot + 1`, but
+    /// can be `slot + 2` if slot+1 was skipped by its leader). `None` if
+    /// the follow-up fetch failed (skipped slot beyond our scan window,
+    /// RPC error, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_block_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_block_time_ms: Option<i64>,
     pub attempts: Vec<BuyAttempt>,
 }
 
@@ -231,10 +249,20 @@ fn cache_key(opp_sig: &str, pool: &str) -> String {
     format!("{opp_sig}|{pool}")
 }
 
-/// `getTransaction(opp_sig)` → slot, then `getBlock(slot, full+base64)` →
-/// walk every tx, filter PumpFun BUY / BUY_EXACT_IN for the given pool,
-/// return one `BuyAttempt` per match. `Ok(None)` = the tx isn't confirmed
-/// yet or the block isn't retrievable.
+/// How many additional slots past the dump's slot to scan for late-landing
+/// competitor / own buys. Solana leader slot length is ~400ms; latency
+/// between shred-stream observation of the dump and our buy hitting a
+/// leader's QUIC is usually well under one slot, but occasionally the buy
+/// lands in slot+1 (or +2 if slot+1 was skipped). Two extra blocks covers
+/// the typical worst case without ballooning the per-resolve RPC bill.
+const NEXT_BLOCK_SCAN_RANGE: u64 = 2;
+
+/// `getTransaction(opp_sig)` → slot, then `getBlock(slot, full+base64)` for
+/// the dump's slot plus the next produced block (best-effort), walking
+/// every tx and filtering PumpFun BUY / BUY_EXACT_IN for the given pool.
+/// `Ok(None)` = the tx isn't confirmed yet or the dump's block isn't
+/// retrievable. Failure to fetch the follow-up block degrades gracefully
+/// — primary block's attempts are still returned with `next_slot = None`.
 async fn fetch_block_detail(
     rpc_url: &str,
     opp_sig: &str,
@@ -265,7 +293,7 @@ async fn fetch_block_detail(
         max_supported_transaction_version: Some(0),
     };
     let block = rpc
-        .get_block_with_config(slot, block_cfg)
+        .get_block_with_config(slot, block_cfg.clone())
         .await
         .context("getBlock")?;
     let block_height = block.block_height;
@@ -274,8 +302,44 @@ async fn fetch_block_detail(
 
     let mut attempts: Vec<BuyAttempt> = Vec::new();
     for (idx, tx) in txs.iter().enumerate() {
-        if let Some(att) = try_parse_pump_buy(tx, &pool_pk, idx as u32) {
+        if let Some(mut att) = try_parse_pump_buy(tx, &pool_pk, idx as u32) {
+            att.slot = slot;
             attempts.push(att);
+        }
+    }
+
+    // Best-effort scan of the next 1-2 slots so a buy that landed in
+    // slot+1 (or +2 if +1 was skipped) is still surfaced. Use the first
+    // successfully-fetched block as `next_*`; any RPC error is logged and
+    // ignored so the dump-block attempts still come back.
+    let mut next_slot_out: Option<u64> = None;
+    let mut next_block_height: Option<u64> = None;
+    let mut next_block_time_ms: Option<i64> = None;
+    for offset in 1..=NEXT_BLOCK_SCAN_RANGE {
+        let candidate = slot + offset;
+        match rpc.get_block_with_config(candidate, block_cfg.clone()).await {
+            Ok(b) => {
+                next_slot_out = Some(candidate);
+                next_block_height = b.block_height;
+                next_block_time_ms = b.block_time.map(|s| s * 1000);
+                let txs2 = b.transactions.unwrap_or_default();
+                for (idx, tx) in txs2.iter().enumerate() {
+                    if let Some(mut att) = try_parse_pump_buy(tx, &pool_pk, idx as u32) {
+                        att.slot = candidate;
+                        attempts.push(att);
+                    }
+                }
+                break;
+            }
+            Err(e) => {
+                // `BlockNotAvailable` is the normal case for a skipped
+                // slot — keep walking. Other errors (network etc.) we
+                // also tolerate but log.
+                tracing::debug!(
+                    "[block_detail] getBlock(slot={candidate}) failed for opp={opp_sig}: {e:#}; trying next offset"
+                );
+                continue;
+            }
         }
     }
 
@@ -285,6 +349,9 @@ async fn fetch_block_detail(
         slot,
         block_height,
         block_time_ms,
+        next_slot: next_slot_out,
+        next_block_height,
+        next_block_time_ms,
         attempts,
     }))
 }
@@ -388,6 +455,9 @@ fn try_parse_pump_buy(
         cu_limit,
         cu_price,
         priority_fee_lamports,
+        // Filled in by the caller (fetch_block_detail) so try_parse_pump_buy
+        // stays agnostic about which block it's walking.
+        slot: 0,
         tip_lamports,
         tip_recipient,
         intra_block_order,
