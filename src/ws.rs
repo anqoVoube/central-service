@@ -20,6 +20,7 @@ use tokio_util::io::ReaderStream;
 use crate::{
     alts::AltStore,
     bans::BansStore,
+    block_detail::BlockDetailStore,
     lanes::{decode_lane, LaneResolution, LaneStore},
     leaders::{LeaderResolution, LeaderStore},
     mongo::Repo,
@@ -189,6 +190,7 @@ struct AppState {
     bans: BansStore,
     lanes: LaneStore,
     leaders: LeaderStore,
+    block_details: BlockDetailStore,
 }
 
 pub async fn serve(
@@ -203,6 +205,7 @@ pub async fn serve(
     bans: BansStore,
     lanes: LaneStore,
     leaders: LeaderStore,
+    block_details: BlockDetailStore,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -215,6 +218,7 @@ pub async fn serve(
         bans,
         lanes,
         leaders,
+        block_details,
     };
     let app = Router::new()
         .route("/", get(serve_sig_ui))
@@ -225,6 +229,7 @@ pub async fn serve(
         .route("/bans/:wallet", get(serve_ban_lookup))
         .route("/sig/:sig", get(serve_sig_search))
         .route("/time/:time", get(serve_time_search))
+        .route("/block-detail/:opp_sig", get(serve_block_detail))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -383,6 +388,50 @@ async fn serve_ban_lookup(
         }
         None => (StatusCode::NOT_FOUND, "not banned").into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockDetailQuery {
+    /// Pool pubkey we tried to buy on. Required — the resolver filters the
+    /// block down to PumpFun BUYs targeting this pool.
+    pool: String,
+}
+
+/// `GET /block-detail/<opp_sig>?pool=<pubkey>` — dashboard history-row
+/// dropdown. Cache hit → 200 JSON `BlockDetail`. Cache miss → 202 with an
+/// empty body so the dashboard knows to poll. Resolution is auto-kicked
+/// when the bot reports `position_opened` / `position_failed`, so a typical
+/// click ~5-10s after the row lands hits the cache directly.
+///
+/// IP whitelisted — same list as `/positions.jsonl`.
+async fn serve_block_detail(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Path(opp_sig): Path<String>,
+    Query(q): Query<BlockDetailQuery>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting block-detail from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    if opp_sig.is_empty() || q.pool.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing opp_sig or pool").into_response();
+    }
+    if let Some(d) = state.block_details.get_cached(&opp_sig, &q.pool) {
+        return Json(d).into_response();
+    }
+    // Not in cache yet — kick off resolution in the background so a later
+    // poll lands on a warm entry. Bot-driven resolution already runs on
+    // every Opened/Failed; this branch covers click-through on legacy rows
+    // whose Opened predated this feature.
+    let store = state.block_details.clone();
+    let opp = opp_sig.clone();
+    let pool = q.pool.clone();
+    tokio::spawn(async move {
+        let _ = store.resolve(&opp, &pool).await;
+    });
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "pending"}))).into_response()
 }
 
 /// `GET /` — serve the embedded HTML UI for sig-trace search. Open to any IP
@@ -765,16 +814,31 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         let leaders = state.leaders.clone();
                         let positions = state.positions.clone();
                         let bcast = state.tx.clone();
+                        let opp_for_leader = opp_sig.clone();
                         tokio::spawn(async move {
-                            let Some(leader) = resolve_leader(&leaders, &opp_sig).await else {
+                            let Some(leader) = resolve_leader(&leaders, &opp_for_leader).await
+                            else {
                                 return;
                             };
-                            positions.record_leader_resolved(opp_sig.clone(), leader.clone());
+                            positions
+                                .record_leader_resolved(opp_for_leader.clone(), leader.clone());
                             let _ = bcast.send(ServerMsg::LeaderResolved {
-                                opportunity_sig: opp_sig,
+                                opportunity_sig: opp_for_leader,
                                 leader,
                             });
                         });
+                        // Resolve block-detail (competitor buys in same
+                        // block) async — warms the sled cache so the
+                        // dashboard's row-dropdown click hits a ready
+                        // entry. Failure is silent; the dashboard
+                        // re-kicks on its own GET.
+                        if !opp_sig.is_empty() {
+                            let store = state.block_details.clone();
+                            let pool = r.pool.clone();
+                            tokio::spawn(async move {
+                                let _ = store.resolve(&opp_sig, &pool).await;
+                            });
+                        }
                     }
                     Ok(ClientMsg::AltsUnknown { tables }) => {
                         let mut parsed: Vec<solana_sdk::pubkey::Pubkey> = Vec::with_capacity(tables.len());
@@ -832,6 +896,17 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         let leaders = state.leaders.clone();
                         let positions = state.positions.clone();
                         let bcast = state.tx.clone();
+                        // Same shape as the opened-path: warm the block-detail
+                        // cache so the dashboard dropdown loads instantly when
+                        // the user clicks a failed-buy row a few seconds later.
+                        if !r.opportunity_sig.is_empty() {
+                            let store = state.block_details.clone();
+                            let opp = r.opportunity_sig.clone();
+                            let pool = r.pool.clone();
+                            tokio::spawn(async move {
+                                let _ = store.resolve(&opp, &pool).await;
+                            });
+                        }
                         tokio::spawn(async move {
                             let lane_fut = lanes.resolve(&r.sig);
                             let leader_fut = resolve_leader(&leaders, &r.opportunity_sig);
