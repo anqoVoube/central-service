@@ -694,6 +694,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "bs58",
  "csv",
  "dotenvy",
  "futures",

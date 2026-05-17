@@ -25,7 +25,8 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcBlockConfig, RpcTransactionConfig};
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature};
 use solana_transaction_status_client_types::{
-    EncodedTransactionWithStatusMeta, TransactionDetails, UiTransactionEncoding,
+    EncodedTransactionWithStatusMeta, TransactionDetails, UiInnerInstructions, UiInstruction,
+    UiTransactionEncoding,
 };
 
 /// PumpFun program id (`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`). Hardcoded
@@ -438,6 +439,46 @@ fn try_parse_pump_buy(
         }
     }
 
+    // Inner-ix walk: aggregators (Jupiter/OKX/DFlow) and bot wrappers
+    // invoke PumpFun via CPI, so the BUY ix lands inside meta.inner_instructions
+    // rather than the outer ix list. Same combined `all_keys` applies (CPI
+    // re-uses the parent tx's address resolution). CU + tip stay outer-only
+    // (those ixs are never CPI'd).
+    if !found_pump_buy {
+        if let Some(inners) = inner_instructions(&tx.meta) {
+            'inner_search: for group in inners {
+                for ix in &group.instructions {
+                    let UiInstruction::Compiled(c) = ix else {
+                        continue;
+                    };
+                    let prog_idx = c.program_id_index as usize;
+                    let Some(prog) = all_keys.get(prog_idx) else {
+                        continue;
+                    };
+                    if *prog != pump_pk {
+                        continue;
+                    }
+                    let Ok(data) = bs58::decode(&c.data).into_vec() else {
+                        continue;
+                    };
+                    let Some((amount, exact_in)) = parse_pump_buy_data(&data) else {
+                        continue;
+                    };
+                    let pool_idx = c.accounts.first().copied().unwrap_or(0) as usize;
+                    let Some(ix_pool) = all_keys.get(pool_idx) else {
+                        continue;
+                    };
+                    if ix_pool == pool {
+                        sol_in_lamports = amount;
+                        is_buy_exact_in = exact_in;
+                        found_pump_buy = true;
+                        break 'inner_search;
+                    }
+                }
+            }
+        }
+    }
+
     if !found_pump_buy {
         return None;
     }
@@ -462,6 +503,21 @@ fn try_parse_pump_buy(
         tip_recipient,
         intra_block_order,
     })
+}
+
+/// Returns the inner-instruction groups for a tx, or `None` if absent.
+/// Used to catch PumpFun BUY ixs invoked via CPI from an aggregator
+/// (Jupiter / OKX / DFlow) or a smart-contract wrapper — outer-only
+/// walks miss these and undercount competitor landings.
+fn inner_instructions(
+    meta: &Option<solana_transaction_status_client_types::UiTransactionStatusMeta>,
+) -> Option<&Vec<UiInnerInstructions>> {
+    use solana_transaction_status_client_types::option_serializer::OptionSerializer;
+    let m = meta.as_ref()?;
+    match &m.inner_instructions {
+        OptionSerializer::Some(v) => Some(v),
+        _ => None,
+    }
 }
 
 /// Returns `(loaded.writable, loaded.readonly)` for v0 txs, or empty for
