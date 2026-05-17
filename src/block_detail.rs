@@ -410,7 +410,17 @@ fn try_parse_pump_buy(
                     continue;
                 };
                 if ix_pool == pool {
-                    sol_in_lamports = amount;
+                    // For BuyExactIn the cap == exact spend (always accurate).
+                    // For Buy the cap is often u64::MAX (CPI wrappers disable
+                    // the slippage cap and let their own logic enforce it),
+                    // so derive actual SOL spent from the pool's quote vault
+                    // delta. quote_vault is at PumpFun account index 8.
+                    sol_in_lamports = if exact_in {
+                        amount
+                    } else {
+                        pool_quote_vault_delta(&tx.meta, &ix.accounts)
+                            .unwrap_or(amount)
+                    };
                     is_buy_exact_in = exact_in;
                     found_pump_buy = true;
                 }
@@ -469,7 +479,15 @@ fn try_parse_pump_buy(
                         continue;
                     };
                     if ix_pool == pool {
-                        sol_in_lamports = amount;
+                        // Inner BUY ixs almost always have max_quote == u64::MAX;
+                        // resolve to actual spend from the pool's quote vault
+                        // delta (account index 8 in PumpFun's layout).
+                        sol_in_lamports = if exact_in {
+                            amount
+                        } else {
+                            pool_quote_vault_delta(&tx.meta, &c.accounts)
+                                .unwrap_or(amount)
+                        };
                         is_buy_exact_in = exact_in;
                         found_pump_buy = true;
                         break 'inner_search;
@@ -503,6 +521,44 @@ fn try_parse_pump_buy(
         tip_recipient,
         intra_block_order,
     })
+}
+
+/// PumpFun account index of the pool's quote (WSOL) vault. Same for both
+/// `Buy` and `BuyExactIn` ixs — the program dispatches on the discriminator
+/// but accounts are identical.
+const PUMP_QUOTE_VAULT_IX_ACCOUNT_IDX: usize = 8;
+
+/// Actual SOL deposited into the pool by this BUY ix — `post - pre` on the
+/// pool's quote (WSOL) vault. Used to override `max_quote_amount_in` from
+/// the ix data, which is often `u64::MAX` for CPI'd buys.
+///
+/// `ix_accounts` is the BUY ix's `Vec<u8>` of account indices (works for
+/// both outer `CompiledInstruction` and inner `UiCompiledInstruction`).
+fn pool_quote_vault_delta(
+    meta: &Option<solana_transaction_status_client_types::UiTransactionStatusMeta>,
+    ix_accounts: &[u8],
+) -> Option<u64> {
+    use solana_transaction_status_client_types::option_serializer::OptionSerializer;
+    let m = meta.as_ref()?;
+    let vault_account_idx = *ix_accounts.get(PUMP_QUOTE_VAULT_IX_ACCOUNT_IDX)?;
+
+    let pre = match &m.pre_token_balances {
+        OptionSerializer::Some(v) => v,
+        _ => return None,
+    };
+    let post = match &m.post_token_balances {
+        OptionSerializer::Some(v) => v,
+        _ => return None,
+    };
+    let pre_amt = pre
+        .iter()
+        .find(|b| b.account_index == vault_account_idx)
+        .and_then(|b| b.ui_token_amount.amount.parse::<u64>().ok())?;
+    let post_amt = post
+        .iter()
+        .find(|b| b.account_index == vault_account_idx)
+        .and_then(|b| b.ui_token_amount.amount.parse::<u64>().ok())?;
+    Some(post_amt.saturating_sub(pre_amt))
 }
 
 /// Returns the inner-instruction groups for a tx, or `None` if absent.
