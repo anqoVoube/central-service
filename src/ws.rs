@@ -149,6 +149,9 @@ pub enum ServerMsg {
         /// legacy bots.
         #[serde(default)]
         liquidity_usd: f64,
+        /// Bot's local dispatch latency at fire time (µs). 0 for legacy bots.
+        #[serde(default)]
+        process_us: u32,
     },
 }
 
@@ -944,6 +947,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                                 actual_fee_lamports,
                                 leader: leader.clone(),
                                 liquidity_usd: r.liquidity_usd,
+                                process_us: r.process_us,
                             };
                             positions.record_failed(r, leader);
                             let _ = bcast.send(broadcast);

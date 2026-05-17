@@ -142,6 +142,11 @@ pub struct FailedReport {
     /// 0 for legacy bots.
     #[serde(default)]
     pub liquidity_usd: f64,
+    /// Bot's local dispatch latency at fire time (arrival → `fire_async`,
+    /// µs). Drives the dashboard's "proc" column for failed rows. 0 for
+    /// legacy bots that didn't send it.
+    #[serde(default)]
+    pub process_us: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,6 +264,10 @@ enum LogEvent {
         /// See `OpenPosition::liquidity_usd`. 0 for legacy lines.
         #[serde(default)]
         liquidity_usd: f64,
+        /// Bot's local dispatch latency at fire time (µs).
+        /// `#[serde(default)]` so pre-patch lines deserialize as 0.
+        #[serde(default)]
+        process_us: u32,
     },
     /// Late-arriving leader info, emitted after central's async resolve
     /// completes. Keyed by `opportunity_sig`. The dashboard merges this
@@ -398,6 +407,7 @@ impl Positions {
             actual_fee_lamports: r.actual_fee_lamports,
             leader,
             liquidity_usd: r.liquidity_usd,
+            process_us: r.process_us,
         });
     }
 }
