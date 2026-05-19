@@ -83,7 +83,7 @@ pub enum LaneResolution {
 ///
 /// - path 0 = GEYSER, 1 = SHRED_SHREDER, 2 = SHRED_RAIDEN,
 ///        3 = SHRED_CORVUS, 4 = SHRED_UDP (Raiden's UDP forward),
-///        5 = SHRED_HELIUS_UDP (Helius's UDP forward),
+///        5 = SHRED_EVERSTAKE (Everstake's UDP forward),
 ///        6..=8 reserved, 9 = DASHBOARD
 /// - loc  0 = FR, 1 = AMS, 2 = NY, 3 = TYO, 4 = FR2, 5 = AMS2, 6 = LT,
 ///        7..=9 reserved
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn decode_lane_table() {
         // Two-digit encoding: tens = path (0=GEYSER, 1=SHRED_SHREDER,
-        // 2=SHRED_RAIDEN, 3=SHRED_CORVUS, 4=SHRED_UDP, 5=SHRED_HELIUS_UDP,
+        // 2=SHRED_RAIDEN, 3=SHRED_CORVUS, 4=SHRED_UDP, 5=SHRED_EVERSTAKE,
         // 6..=8 reserved, 9=DASHBOARD), ones = location (0=FR, 1=AMS,
         // 2=NY, 3=TYO, 4=FR2, 5=AMS2, 6=LT, 7..=9 reserved).
         assert_eq!(decode_lane(0),  (0, 0));         // GEYSER × FR
@@ -313,8 +313,8 @@ mod tests {
         assert_eq!(decode_lane(36), (3, 6));         // SHRED_CORVUS × LT
         assert_eq!(decode_lane(40), (4, 0));         // SHRED_UDP × FR
         assert_eq!(decode_lane(44), (4, 4));         // SHRED_UDP × FR2
-        assert_eq!(decode_lane(50), (5, 0));         // SHRED_HELIUS_UDP × FR
-        assert_eq!(decode_lane(54), (5, 4));         // SHRED_HELIUS_UDP × FR2
+        assert_eq!(decode_lane(50), (5, 0));         // SHRED_EVERSTAKE × FR
+        assert_eq!(decode_lane(54), (5, 4));         // SHRED_EVERSTAKE × FR2
         assert_eq!(decode_lane(90), (9, 0));         // DASHBOARD × FR
         // Reserved location slots still resolve — path is valid.
         assert_eq!(decode_lane(7),  (0, 7));         // GEYSER × reserved-7
