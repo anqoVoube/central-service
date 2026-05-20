@@ -5,7 +5,7 @@
 //!
 //! Best-effort. Pools Dexscreener can't index (dust / dead / very fresh)
 //! stay `None`; the WS init filter then drops them when computing the
-//! "< 7 days" set, which is the intended behavior.
+//! "< 14 days" set, which is the intended behavior.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,7 @@ use crate::mongo::Repo;
 /// Init filter cutoff — pools older than this aren't shipped to bots.
 /// Mirrored from `ws.rs::INIT_POOL_MAX_AGE_MS` so the post-backfill report
 /// shows the same set the WS init will later drop.
-const INIT_POOL_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const INIT_POOL_MAX_AGE_MS: i64 = 14 * 24 * 60 * 60 * 1_000;
 
 /// How many Dexscreener requests can be in flight at once. The public API
 /// is generous but no need to hammer.
@@ -92,7 +92,7 @@ pub async fn run(repo: &Repo) {
 
 /// One-shot report after backfill: every confirmed pool that would be
 /// filtered out by the WS init's 7-day window. Two buckets:
-///   * `[outdated old]`  — has age, but older than 7d.
+///   * `[outdated old]`  — has age, but older than 14d.
 ///   * `[outdated none]` — age missing (Dexscreener never indexed it).
 /// Use this to sanity-check that what gets dropped from `init.pools` is
 /// what you expected.
@@ -145,7 +145,7 @@ async fn report_outdated(repo: &Repo) {
     let total = pools.len();
     let fresh = total - old_count - none_count;
     println!(
-        "[outdated] summary: total={total} fresh<7d={fresh} old>=7d={old_count} unindexed={none_count}"
+        "[outdated] summary: total={total} fresh<14d={fresh} old>=14d={old_count} unindexed={none_count}"
     );
 }
 

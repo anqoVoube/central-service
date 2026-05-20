@@ -32,14 +32,14 @@ async fn scan_once(
     tx: &broadcast::Sender<ServerMsg>,
 ) -> anyhow::Result<()> {
     // Narrowed to pools the bot will actually trade — `is_unique=true OR
-    // pair_created_at_ms > now - 7d`. Old non-unique pools stay in Mongo
+    // pair_created_at_ms > now - 14d`. Old non-unique pools stay in Mongo
     // but skip polling to keep RPC load proportional to active set.
     let pools = repo.load_pump_fun_for_creator_poll().await?;
     if pools.is_empty() {
         return Ok(());
     }
     tracing::info!(
-        "scanning {} pump_fun pools for creator drift (is_unique=true OR age<7d)",
+        "scanning {} pump_fun pools for creator drift (is_unique=true OR age<14d)",
         pools.len()
     );
 

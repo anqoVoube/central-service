@@ -715,7 +715,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
     // `is_unique == true` bypasses the age check entirely — used for
     // long-lived high-value pools we want to keep shipping past the
     // freshness window.
-    const INIT_POOL_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+    const INIT_POOL_MAX_AGE_MS: i64 = 14 * 24 * 60 * 60 * 1_000;
     let now_ms: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

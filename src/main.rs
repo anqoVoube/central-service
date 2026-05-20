@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     repo.ensure_indexes().await?;
 
     // Migrate any pool docs that pre-date `pair_created_at_ms`. Blocks
-    // startup so the WS init filter (< 7 days) sees a fully-populated set
+    // startup so the WS init filter (< 14 days) sees a fully-populated set
     // on first connect. After the first run this is a no-op since all
     // pools have the field set.
     backfill::run(&repo).await;
