@@ -1,6 +1,13 @@
 use anyhow::Context;
 use std::{collections::HashSet, net::{IpAddr, SocketAddr}, path::PathBuf};
 
+/// Pool freshness window — the WS init filter, backfill report, creator-
+/// drift poll, and CU-measurement scripts all use this. `is_unique == true`
+/// pools bypass the age gate entirely. Bumping this constant is the only
+/// place that needs to change to broaden/narrow the active pool set.
+pub const POOL_MAX_AGE_DAYS: i64 = 30;
+pub const POOL_MAX_AGE_MS: i64 = POOL_MAX_AGE_DAYS * 24 * 60 * 60 * 1_000;
+
 pub struct Config {
     pub mongo_uri: String,
     pub mongo_db: String,

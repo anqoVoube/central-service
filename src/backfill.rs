@@ -14,9 +14,9 @@ use futures::{stream, StreamExt};
 use crate::mongo::Repo;
 
 /// Init filter cutoff — pools older than this aren't shipped to bots.
-/// Mirrored from `ws.rs::INIT_POOL_MAX_AGE_MS` so the post-backfill report
+/// Imported from `config::POOL_MAX_AGE_MS` so the post-backfill report
 /// shows the same set the WS init will later drop.
-const INIT_POOL_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+use crate::config::POOL_MAX_AGE_MS as INIT_POOL_MAX_AGE_MS;
 
 /// How many Dexscreener requests can be in flight at once. The public API
 /// is generous but no need to hammer.

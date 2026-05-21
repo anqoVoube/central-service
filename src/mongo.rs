@@ -62,7 +62,7 @@ impl Repo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let stale_cutoff_ms = now_ms - 30 * 24 * 60 * 60 * 1000;
+        let stale_cutoff_ms = now_ms - crate::config::POOL_MAX_AGE_MS;
         let filter = doc! {
             "pool_type": "pump_fun",
             "ata_status": "confirmed",
@@ -187,8 +187,7 @@ impl Repo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let thirty_days_ms: i64 = 30 * 24 * 60 * 60 * 1000;
-        let stale_cutoff_ms = now_ms - thirty_days_ms;
+        let stale_cutoff_ms = now_ms - crate::config::POOL_MAX_AGE_MS;
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
@@ -208,8 +207,7 @@ impl Repo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let thirty_days_ms: i64 = 30 * 24 * 60 * 60 * 1000;
-        let stale_cutoff_ms = now_ms - thirty_days_ms;
+        let stale_cutoff_ms = now_ms - crate::config::POOL_MAX_AGE_MS;
         let stale_cutoff = DateTime::from_millis(stale_cutoff_ms);
         let filter = doc! {
             "ata_status": "confirmed",
