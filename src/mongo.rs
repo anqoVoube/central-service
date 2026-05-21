@@ -54,7 +54,7 @@ impl Repo {
 
     /// Pools eligible for the creator-drift poll: confirmed pump_fun pools
     /// that the WS init filter would actually ship to bots — i.e.
-    /// `is_unique == true OR pair_created_at_ms > now - 14d`. Old non-unique
+    /// `is_unique == true OR pair_created_at_ms > now - 30d`. Old non-unique
     /// pools stay in Mongo for history but skip polling, since the bots
     /// won't see them anyway.
     pub async fn load_pump_fun_for_creator_poll(&self) -> anyhow::Result<Vec<PoolDoc>> {
@@ -62,7 +62,7 @@ impl Repo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let stale_cutoff_ms = now_ms - 14 * 24 * 60 * 60 * 1000;
+        let stale_cutoff_ms = now_ms - 30 * 24 * 60 * 60 * 1000;
         let filter = doc! {
             "pool_type": "pump_fun",
             "ata_status": "confirmed",
@@ -168,9 +168,9 @@ impl Repo {
     /// Pools that the `measure_cu` binary should hit on this run. Filter:
     ///   - `ata_status == "confirmed"` (the wallet's ATA exists for the base
     ///     mint, otherwise the buy ix errors with AccountNotInitialized)
-    ///   - `pair_created_at_ms > now - 14 days` (fresh pools only; the bot's
+    ///   - `pair_created_at_ms > now - 30 days` (fresh pools only; the bot's
     ///     `init.pools` filter uses the same window)
-    ///   - `cu_measured_at` is null OR older than 14 days (idempotent re-run:
+    ///   - `cu_measured_at` is null OR older than 30 days (idempotent re-run:
     ///     pools we've recently measured are skipped)
     ///   - `pool_type == "pump_fun"` for now — Raydium AMM/CPMM measurement
     ///     can be added when the bot needs per-pool CU for those too.
@@ -179,7 +179,7 @@ impl Repo {
     /// re-measure ALL pump-fun pools (e.g. after a tx-layout change
     /// invalidates earlier CU values).
     ///
-    /// Age gate: `pair_created_at_ms > now - 14d` OR `is_unique == true`.
+    /// Age gate: `pair_created_at_ms > now - 30d` OR `is_unique == true`.
     /// Matches the WS init filter semantics — pools the bot trades are
     /// the pools we measure.
     pub async fn pools_for_remeasurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
@@ -187,8 +187,8 @@ impl Repo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let fourteen_days_ms: i64 = 14 * 24 * 60 * 60 * 1000;
-        let stale_cutoff_ms = now_ms - fourteen_days_ms;
+        let thirty_days_ms: i64 = 30 * 24 * 60 * 60 * 1000;
+        let stale_cutoff_ms = now_ms - thirty_days_ms;
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
@@ -208,8 +208,8 @@ impl Repo {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let fourteen_days_ms: i64 = 14 * 24 * 60 * 60 * 1000;
-        let stale_cutoff_ms = now_ms - fourteen_days_ms;
+        let thirty_days_ms: i64 = 30 * 24 * 60 * 60 * 1000;
+        let stale_cutoff_ms = now_ms - thirty_days_ms;
         let stale_cutoff = DateTime::from_millis(stale_cutoff_ms);
         let filter = doc! {
             "ata_status": "confirmed",

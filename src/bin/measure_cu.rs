@@ -1,7 +1,7 @@
 //! One-shot CU measurement script.
 //!
-//! Walks Mongo pools (PumpFun, ata_status=confirmed, < 14 days old, not
-//! measured in last 14 days), fires a real 0.0001 SOL buy per pool via
+//! Walks Mongo pools (PumpFun, ata_status=confirmed, < 30 days old, not
+//! measured in last 30 days), fires a real 0.0001 SOL buy per pool via
 //! Helius, reads `meta.compute_units_consumed` from the landed tx, and
 //! persists the RAW value into `compute_unit_limit`. The bot applies the
 //! per-tx safety margin (+1% or whatever it's set to) when sizing the

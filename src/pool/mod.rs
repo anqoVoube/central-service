@@ -65,7 +65,7 @@ pub struct PoolDoc {
     #[serde(default)]
     pub compute_unit_limit: Option<i32>,
     /// Timestamp of the last successful CU measurement. Measurement script
-    /// skips pools whose value is recent (< 14 days). `None` for unmeasured.
+    /// skips pools whose value is recent (< 30 days). `None` for unmeasured.
     #[serde(default)]
     pub cu_measured_at: Option<mongodb::bson::DateTime>,
     /// Override the 7-day age filter on the WS `init.pools` payload. When
