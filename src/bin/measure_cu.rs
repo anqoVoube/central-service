@@ -114,11 +114,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // CLI: pass `--force` (or any first arg) to ignore the cu_measured_at
-    // recency filter and re-measure every pump-fun pool. Useful after a
-    // tx-layout change that invalidates prior CU values.
-    let force = std::env::args().any(|a| a == "--force" || a == "--all");
-    let pools = if force {
+    // CLI flags:
+    //   --pool <pubkey>  Measure just this one pool (overrides force/recency).
+    //   --force / --all  Ignore the cu_measured_at recency filter and
+    //                    re-measure every pump-fun pool. Useful after a
+    //                    tx-layout change invalidates prior CU values.
+    let args: Vec<String> = std::env::args().collect();
+    let force = args.iter().any(|a| a == "--force" || a == "--all");
+    let pool_filter: Option<String> = args
+        .iter()
+        .position(|a| a == "--pool")
+        .and_then(|i| args.get(i + 1).cloned());
+    let pools = if let Some(pubkey) = &pool_filter {
+        match repo.pool_by_pubkey(pubkey).await? {
+            Some(d) => vec![d],
+            None => {
+                anyhow::bail!(
+                    "--pool {pubkey}: not found in `pools` collection"
+                );
+            }
+        }
+    } else if force {
         repo.pools_for_remeasurement().await?
     } else {
         repo.pools_for_cu_measurement().await?
@@ -126,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         count = pools.len(),
         force,
+        single_pool = pool_filter.as_deref().unwrap_or("-"),
         "pools queued for measurement"
     );
 

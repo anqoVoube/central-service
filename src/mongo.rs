@@ -230,6 +230,14 @@ impl Repo {
         Ok(self.pools.find(filter).await?.try_collect().await?)
     }
 
+    /// Lookup a single PumpFun pool doc by its pubkey. Returns `None`
+    /// if the pool isn't in the collection. Used by `measure_cu` when
+    /// passed `--pool <pubkey>` to target one specific pool, and any
+    /// other single-pool bin that needs the same shape `PoolDoc`.
+    pub async fn pool_by_pubkey(&self, pool: &str) -> anyhow::Result<Option<PoolDoc>> {
+        Ok(self.pools.find_one(doc! { "pool": pool }).await?)
+    }
+
     /// Persist a fresh CU measurement (already padded by the caller's 1%
     /// margin) and stamp the time. Idempotent — overwrites prior values.
     pub async fn update_cu_limit(&self, pool: &str, cu_with_margin: i32) -> anyhow::Result<()> {
