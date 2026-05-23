@@ -26,7 +26,7 @@ use central_service::{
 };
 
 const HELIUS_RPC: &str =
-    "https://mainnet.helius-rpc.com/?api-key=e57668cb-43f4-4d35-9d83-fbb9c1d71ad2";
+    "https://api.mainnet-beta.solana.com";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -39,7 +39,7 @@ use central_service::{
 };
 
 const HELIUS_RPC: &str =
-    "https://mainnet.helius-rpc.com/?api-key=e57668cb-43f4-4d35-9d83-fbb9c1d71ad2";
+    "https://api.mainnet-beta.solana.com";
 const CU_LIMIT: u32 = 50_000;
 const CU_PRICE: u64 = 100_000;
 
