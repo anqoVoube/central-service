@@ -9,18 +9,17 @@
 //! single — the margin policy can be tuned in the bot without re-running
 //! this script.
 //!
-//! Bundle layout (Jito sendBundle path):
+//! Bundle layout (Jito sendBundle path) — single tx, direct in-tx Jito tip:
 //!   TX1 — buy, signed by `wallet_kp`, durable nonce:
 //!     ix[0] advance_nonce_account
 //!     ix[1] system::transfer(0.002 SOL → EXTRA_TRANSFER_RECIPIENT)
-//!     ix[2] set_compute_unit_limit(400_000)             ← high ceiling
-//!     ix[3] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
-//!     ix[4] set_loaded_accounts_data_size_limit(13_500_000)
-//!     ix[5] swap_buy_ix                                 ← 0.0001 SOL in
-//!   TX2 — Jito tip, signed by `tipper_kp`, regular recent blockhash:
-//!     ix[0] system::transfer(0.001 SOL → rotating Jito tip account)
+//!     ix[2] system::transfer(0.001 SOL → rotating Jito tip account)
+//!     ix[3] set_compute_unit_limit(400_000)             ← high ceiling
+//!     ix[4] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
+//!     ix[5] set_loaded_accounts_data_size_limit(13_500_000)
+//!     ix[6] swap_buy_ix                                 ← 0.0001 SOL in
 //!
-//! With `--rpc` only TX1 is sent (sendTransaction can't bundle).
+//! With `--rpc` the same tx is sent via standard `sendTransaction`.
 //!
 //! Sequential, 1 pool at a time. Idempotent: pools with recent
 //! `cu_measured_at` are skipped on re-run. Pools missing the wallet's ATA
@@ -71,11 +70,7 @@ const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111"
 /// to TX2 (whose transfer goes to a real Jito tip account).
 const EXTRA_TRANSFER_RECIPIENT: &str = "6ovsLNZTPpSGd9Q5uz7kbUoMMeXME6Aksc4zYx8YmvJQ";
 const EXTRA_TRANSFER_LAMPORTS: u64 = 2_000_000;    // 0.002 SOL
-/// Base58 keypair that signs TX2 (the Jito tip transaction). Must be
-/// funded with enough SOL to cover BUNDLE_TIP_LAMPORTS × #pools plus fees.
-const TIPPER_KEYPAIR_B58: &str =
-    "3PZdWbacaGVir3mUH8Zn3ervqEpuxqDT9QW2r3j79PHkKyPad7BRbry847cxUMr83fgMkSQx6LRZRH1CHK8VZ95n";
-const BUNDLE_TIP_LAMPORTS: u64 = 1_000_000;        // 0.001 SOL — TX2 tip
+const BUNDLE_TIP_LAMPORTS: u64 = 1_000_000;        // 0.001 SOL — direct in-tx Jito tip
 /// Jito tip accounts (8 published pubkeys, random pick per send). All
 /// tips on Jito's sendBundle path MUST go to one of these to be
 /// auction-eligible. See <https://docs.jito.wtf/lowlatencytxnsend/>.
@@ -114,14 +109,12 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     let wallet_kp = Keypair::from_base58_string(&cfg.wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
-    let tipper_kp = Keypair::from_base58_string(TIPPER_KEYPAIR_B58);
-    let tipper_pk = tipper_kp.pubkey();
     let extra_transfer_to = Pubkey::from_str(EXTRA_TRANSFER_RECIPIENT)?;
     // x-jito-auth token for the Frankfurt block-engine. Required on the
     // sendBundle path; the --rpc fallback ignores it.
     let jito_auth = std::env::var("X_JITO_AUTH")
         .context("X_JITO_AUTH not set (required for Jito sendBundle; set in .env)")?;
-    tracing::info!(wallet = %wallet_pk, tipper = %tipper_pk, "starting measure_cu");
+    tracing::info!(wallet = %wallet_pk, "starting measure_cu");
 
     let repo = Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?;
     let rpc =
@@ -235,8 +228,6 @@ async fn main() -> anyhow::Result<()> {
             nonce_pk,
             sysvar_recent_blockhashes,
             extra_transfer_to,
-            &tipper_kp,
-            tipper_pk,
             jito_tip_pk,
             &jito_auth,
             pool_pk,
@@ -290,8 +281,6 @@ async fn measure_one(
     nonce_pk: Pubkey,
     sysvar_recent_blockhashes: Pubkey,
     extra_transfer_to: Pubkey,
-    tipper_kp: &Keypair,
-    tipper_pk: Pubkey,
     jito_tip_to: Pubkey,
     jito_auth: &str,
     pool_pk: Pubkey,
@@ -369,11 +358,14 @@ async fn measure_one(
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
     let extra_transfer_ix =
         system_instruction::transfer(&wallet_pk, &extra_transfer_to, EXTRA_TRANSFER_LAMPORTS);
+    let jito_tip_ix =
+        system_instruction::transfer(&wallet_pk, &jito_tip_to, BUNDLE_TIP_LAMPORTS);
 
     let message = Message::new_with_blockhash(
         &[
             advance_nonce_ix,
             extra_transfer_ix,
+            jito_tip_ix,
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
@@ -397,31 +389,13 @@ async fn measure_one(
         debug_assert_eq!(sent_sig, sig);
         tracing::debug!(sig = %sig, "sent via rpc");
     } else {
-        // TX2 — standalone tip tx signed by the tipper keypair. Uses a
-        // regular recent blockhash (no nonce); bundles tolerate mixed
-        // blockhash sources as long as each tx is independently valid.
-        let tip_blockhash = rpc
-            .get_latest_blockhash()
-            .await
-            .context("get blockhash for tip tx")?;
-        let tip_transfer_ix =
-            system_instruction::transfer(&tipper_pk, &jito_tip_to, BUNDLE_TIP_LAMPORTS);
-        let tip_tx = Transaction::new_signed_with_payer(
-            &[tip_transfer_ix],
-            Some(&tipper_pk),
-            &[tipper_kp],
-            tip_blockhash,
-        );
-
-        let tx1_bytes = bincode::serialize(&tx).context("serialize buy tx for bundle")?;
-        let tx2_bytes = bincode::serialize(&tip_tx).context("serialize tip tx for bundle")?;
-        let tx1_b64 = base64::engine::general_purpose::STANDARD.encode(&tx1_bytes);
-        let tx2_b64 = base64::engine::general_purpose::STANDARD.encode(&tx2_bytes);
+        let tx_bytes = bincode::serialize(&tx).context("serialize buy tx for bundle")?;
+        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [[tx1_b64, tx2_b64], {"encoding": "base64"}],
+            "params": [[tx_b64], {"encoding": "base64"}],
         });
         let resp = http
             .post(JITO_BUNDLE_URL)
