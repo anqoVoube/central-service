@@ -61,6 +61,9 @@ use central_service::{
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
+/// SUPRA tip recipient — used when `--rpc` falls back to the prior
+/// `sendTransaction` path. Matches `src/measure.rs` / `src/bin/send.rs`.
+const SUPRA_TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
 /// Jito tip accounts (8 published pubkeys, random pick per send). All
 /// tips on Jito's sendBundle path MUST go to one of these to be
 /// auction-eligible. See <https://docs.jito.wtf/lowlatencytxnsend/>.
@@ -199,8 +202,14 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // Rotate through Jito's 8 tip accounts so we don't hammer one.
-        let tip_pk = Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?;
+        // Tip recipient depends on send path: SUPRA on the RPC fallback
+        // (no auction — tip is informational/recipient-of-record), and
+        // a rotating Jito tip account when going through sendBundle.
+        let tip_pk = if use_rpc_send {
+            Pubkey::from_str(SUPRA_TIP_RECIPIENT)?
+        } else {
+            Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?
+        };
         let prefix = format!("[{}/{}] pool={}", idx + 1, pools.len(), pool_doc.pool);
         match measure_one(
             &rpc,
