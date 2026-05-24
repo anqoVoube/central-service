@@ -10,12 +10,13 @@
 //! this script.
 //!
 //! Bundle layout (Jito sendBundle path):
-//!   TX1 — buy, signed by `wallet_kp`, regular recent blockhash:
-//!     ix[0] system::transfer(0.002 SOL → EXTRA_TRANSFER_RECIPIENT)
-//!     ix[1] set_compute_unit_limit(400_000)             ← high ceiling
-//!     ix[2] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
-//!     ix[3] set_loaded_accounts_data_size_limit(13_500_000)
-//!     ix[4] swap_buy_ix                                 ← 0.0001 SOL in
+//!   TX1 — buy, signed by `wallet_kp`, durable nonce:
+//!     ix[0] advance_nonce_account
+//!     ix[1] system::transfer(0.002 SOL → EXTRA_TRANSFER_RECIPIENT)
+//!     ix[2] set_compute_unit_limit(400_000)             ← high ceiling
+//!     ix[3] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
+//!     ix[4] set_loaded_accounts_data_size_limit(13_500_000)
+//!     ix[5] swap_buy_ix                                 ← 0.0001 SOL in
 //!   TX2 — Jito tip, signed by `tipper_kp`, regular recent blockhash:
 //!     ix[0] system::transfer(0.001 SOL → rotating Jito tip account)
 //!
@@ -39,6 +40,8 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
     message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
@@ -54,12 +57,15 @@ use central_service::{
     mongo::Repo,
     pool::PoolAccounts,
     swap_pump_fun::{
-        build_pump_fun_buy_ix, wsol_pk, PumpStaticPdas, find_ata, token_program_pk,
+        build_pump_fun_buy_ix, system_program_pk, wsol_pk, PumpStaticPdas, find_ata,
+        token_program_pk,
     },
 };
 
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
+const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
+const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 /// Recipient of the 0.002 SOL transfer embedded in TX1. Sits in the slot
 /// the prior Jito tip used; replacing the tip moves auction-eligibility
 /// to TX2 (whose transfer goes to a real Jito tip account).
@@ -121,6 +127,11 @@ async fn main() -> anyhow::Result<()> {
     let rpc =
         RpcClient::new_with_commitment(HELIUS_RPC.to_string(), CommitmentConfig::confirmed());
 
+    // Durable nonce: re-fetched on each iter inside `measure_one` (the
+    // advance_nonce ix rotates it on land so each iteration sees a fresh
+    // hash). Static refs to the nonce + the recent-blockhashes sysvar.
+    let nonce_pk = Pubkey::from_str(BUY_NONCE)?;
+    let sysvar_recent_blockhashes = Pubkey::from_str(SVRECENT_BLOCKHASHES)?;
     // Tip pubkey is picked per-iteration inside `measure_one` (rotates
     // through JITO_TIP_ACCOUNTS to spread load). The shared HTTP client
     // is built here once and reused.
@@ -221,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
             wallet_pk,
             wallet_wsol_ata,
             &pdas,
+            nonce_pk,
+            sysvar_recent_blockhashes,
             extra_transfer_to,
             &tipper_kp,
             tipper_pk,
@@ -274,6 +287,8 @@ async fn measure_one(
     wallet_pk: Pubkey,
     wallet_wsol_ata: Pubkey,
     pdas: &PumpStaticPdas,
+    nonce_pk: Pubkey,
+    sysvar_recent_blockhashes: Pubkey,
     extra_transfer_to: Pubkey,
     tipper_kp: &Keypair,
     tipper_pk: Pubkey,
@@ -326,13 +341,28 @@ async fn measure_one(
         SLIPPAGE_BPS,
     );
 
-    // 4. Fetch a regular recent blockhash for the buy tx (no durable nonce).
-    let recent_blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .context("get_latest_blockhash for buy tx")?;
+    // 4. Read the nonce's stored blockhash. Used as the tx's
+    //    recent_blockhash; the advance_nonce ix rotates it on land so each
+    //    iteration sees a fresh hash.
+    let nonce_acct = rpc.get_account(&nonce_pk).await.context("get nonce account")?;
+    if nonce_acct.data.len() < 72 {
+        anyhow::bail!("nonce account data too short");
+    }
+    let nonce_hash_bytes: [u8; 32] = nonce_acct.data[40..72]
+        .try_into()
+        .context("slice nonce blockhash")?;
+    let nonce_blockhash = Hash::new_from_array(nonce_hash_bytes);
 
-    // 5. Compose the tx. compute-budget + transfer + swap. No advance_nonce.
+    // 5. Compose the tx. advance_nonce + transfer + compute-budget + swap.
+    let advance_nonce_ix = Instruction {
+        program_id: system_program_pk(),
+        accounts: vec![
+            AccountMeta::new(nonce_pk, false),
+            AccountMeta::new_readonly(sysvar_recent_blockhashes, false),
+            AccountMeta::new_readonly(wallet_pk, true),
+        ],
+        data: vec![4, 0, 0, 0],  // SystemInstruction::AdvanceNonceAccount = 4
+    };
     let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT_CEILING);
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let data_size_ix =
@@ -342,6 +372,7 @@ async fn measure_one(
 
     let message = Message::new_with_blockhash(
         &[
+            advance_nonce_ix,
             extra_transfer_ix,
             cu_limit_ix,
             cu_price_ix,
@@ -349,10 +380,10 @@ async fn measure_one(
             swap_ix,
         ],
         Some(&wallet_pk),
-        &recent_blockhash,
+        &nonce_blockhash,
     );
     let mut tx = Transaction::new_unsigned(message);
-    tx.sign(&[wallet_kp], recent_blockhash);
+    tx.sign(&[wallet_kp], nonce_blockhash);
 
     // 6. Send. Default path: Jito sendBundle (matches bot's production
     //    sender mix). With `--rpc`: fall back to standard JSON-RPC
