@@ -35,7 +35,7 @@ use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use central_service::pool::{pump_fun, AtaStatus, PoolAccounts, PoolDoc, PumpFunAccounts};
 
 const DEFAULT_RPC: &str =
-    "https://api.mainnet-beta.solana.com";
+    "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

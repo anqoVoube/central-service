@@ -58,7 +58,7 @@ use central_service::{
 };
 
 const HELIUS_RPC: &str =
-    "https://api.mainnet-beta.solana.com";
+    "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
 const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
 const TIP_LAMPORTS: u64 = 1_213_357;               // 0.001213357 SOL — matches send / measure.rs
