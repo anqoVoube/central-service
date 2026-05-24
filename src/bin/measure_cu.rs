@@ -12,11 +12,11 @@
 //! Bundle layout (Jito sendBundle path) — single tx, direct in-tx Jito tip:
 //!   TX1 — buy, signed by `wallet_kp`, durable nonce:
 //!     ix[0] advance_nonce_account
-//!     ix[1] system::transfer(0.001 SOL → rotating Jito tip account)
-//!     ix[2] set_compute_unit_limit(400_000)             ← high ceiling
-//!     ix[3] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
-//!     ix[4] set_loaded_accounts_data_size_limit(13_500_000)
-//!     ix[5] swap_buy_ix                                 ← 0.0001 SOL in
+//!     ix[1] set_compute_unit_limit(400_000)             ← high ceiling
+//!     ix[2] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
+//!     ix[3] set_loaded_accounts_data_size_limit(13_500_000)
+//!     ix[4] swap_buy_ix                                 ← 0.0001 SOL in
+//!     ix[5] system::transfer(0.001 SOL → rotating Jito tip account)
 //!
 //! With `--rpc` the same tx is sent via standard `sendTransaction`.
 //!
@@ -356,11 +356,11 @@ async fn measure_one(
     let message = Message::new_with_blockhash(
         &[
             advance_nonce_ix,
-            jito_tip_ix,
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
+            jito_tip_ix,
         ],
         Some(&wallet_pk),
         &nonce_blockhash,
