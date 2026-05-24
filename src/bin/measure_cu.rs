@@ -12,12 +12,11 @@
 //! Bundle layout (Jito sendBundle path) — single tx, direct in-tx Jito tip:
 //!   TX1 — buy, signed by `wallet_kp`, durable nonce:
 //!     ix[0] advance_nonce_account
-//!     ix[1] system::transfer(0.002 SOL → EXTRA_TRANSFER_RECIPIENT)
-//!     ix[2] system::transfer(0.001 SOL → rotating Jito tip account)
-//!     ix[3] set_compute_unit_limit(400_000)             ← high ceiling
-//!     ix[4] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
-//!     ix[5] set_loaded_accounts_data_size_limit(13_500_000)
-//!     ix[6] swap_buy_ix                                 ← 0.0001 SOL in
+//!     ix[1] system::transfer(0.001 SOL → rotating Jito tip account)
+//!     ix[2] set_compute_unit_limit(400_000)             ← high ceiling
+//!     ix[3] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
+//!     ix[4] set_loaded_accounts_data_size_limit(13_500_000)
+//!     ix[5] swap_buy_ix                                 ← 0.0001 SOL in
 //!
 //! With `--rpc` the same tx is sent via standard `sendTransaction`.
 //!
@@ -68,8 +67,6 @@ const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111"
 /// Recipient of the 0.002 SOL transfer embedded in TX1. Sits in the slot
 /// the prior Jito tip used; replacing the tip moves auction-eligibility
 /// to TX2 (whose transfer goes to a real Jito tip account).
-const EXTRA_TRANSFER_RECIPIENT: &str = "6ovsLNZTPpSGd9Q5uz7kbUoMMeXME6Aksc4zYx8YmvJQ";
-const EXTRA_TRANSFER_LAMPORTS: u64 = 2_000_000;    // 0.002 SOL
 const BUNDLE_TIP_LAMPORTS: u64 = 1_000_000;        // 0.001 SOL — direct in-tx Jito tip
 /// Jito tip accounts (8 published pubkeys, random pick per send). All
 /// tips on Jito's sendBundle path MUST go to one of these to be
@@ -109,7 +106,6 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     let wallet_kp = Keypair::from_base58_string(&cfg.wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
-    let extra_transfer_to = Pubkey::from_str(EXTRA_TRANSFER_RECIPIENT)?;
     // x-jito-auth token for the Frankfurt block-engine. Required on the
     // sendBundle path; the --rpc fallback ignores it.
     let jito_auth = std::env::var("X_JITO_AUTH")
@@ -227,7 +223,6 @@ async fn main() -> anyhow::Result<()> {
             &pdas,
             nonce_pk,
             sysvar_recent_blockhashes,
-            extra_transfer_to,
             jito_tip_pk,
             &jito_auth,
             pool_pk,
@@ -280,7 +275,6 @@ async fn measure_one(
     pdas: &PumpStaticPdas,
     nonce_pk: Pubkey,
     sysvar_recent_blockhashes: Pubkey,
-    extra_transfer_to: Pubkey,
     jito_tip_to: Pubkey,
     jito_auth: &str,
     pool_pk: Pubkey,
@@ -356,15 +350,12 @@ async fn measure_one(
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let data_size_ix =
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
-    let extra_transfer_ix =
-        system_instruction::transfer(&wallet_pk, &extra_transfer_to, EXTRA_TRANSFER_LAMPORTS);
     let jito_tip_ix =
         system_instruction::transfer(&wallet_pk, &jito_tip_to, BUNDLE_TIP_LAMPORTS);
 
     let message = Message::new_with_blockhash(
         &[
             advance_nonce_ix,
-            extra_transfer_ix,
             jito_tip_ix,
             cu_limit_ix,
             cu_price_ix,
