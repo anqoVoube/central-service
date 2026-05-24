@@ -9,17 +9,14 @@
 //! single — the margin policy can be tuned in the bot without re-running
 //! this script.
 //!
-//! Bundle layout (Jito sendBundle path):
-//!   TX1 — buy, signed by `wallet_kp`, regular recent blockhash:
-//!     ix[0] system::transfer(0.002 SOL → EXTRA_TRANSFER_RECIPIENT)
-//!     ix[1] set_compute_unit_limit(400_000)             ← high ceiling
-//!     ix[2] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
-//!     ix[3] set_loaded_accounts_data_size_limit(13_500_000)
-//!     ix[4] swap_buy_ix                                 ← 0.0001 SOL in
-//!   TX2 — Jito tip, signed by `tipper_kp`, regular recent blockhash:
-//!     ix[0] system::transfer(0.001 SOL → rotating Jito tip account)
-//!
-//! With `--rpc` only TX1 is sent (sendTransaction can't bundle).
+//! Tx layout matches the bot's production shape so the recorded CU is
+//! what the bot would actually consume:
+//!   ix[0] advance_nonce_account
+//!   ix[1] set_compute_unit_limit(400_000)               ← high ceiling
+//!   ix[2] set_compute_unit_price(1_000_000)             ← ~$0.04 priority
+//!   ix[3] set_loaded_accounts_data_size_limit(13_500_000)
+//!   ix[4] swap_buy_ix                                   ← 0.0001 SOL in
+//!   ix[5] system::transfer(1 lamport → SUPRA tip)
 //!
 //! Sequential, 1 pool at a time. Idempotent: pools with recent
 //! `cu_measured_at` are skipped on re-run. Pools missing the wallet's ATA
@@ -34,11 +31,12 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use base64::Engine;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::{AccountMeta, Instruction},
     message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
@@ -52,47 +50,26 @@ use solana_transaction_status_client_types::{
 use central_service::{
     config::Config,
     mongo::Repo,
-    pool::PoolAccounts,
+    pool::{PoolAccounts, PoolDoc},
     swap_pump_fun::{
-        build_pump_fun_buy_ix, wsol_pk, PumpStaticPdas, find_ata, token_program_pk,
+        build_pump_fun_buy_ix, system_program_pk, wsol_pk, PumpStaticPdas, find_ata,
+        token_program_pk,
     },
 };
 
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
-/// Recipient of the 0.002 SOL transfer embedded in TX1. Sits in the slot
-/// the prior Jito tip used; replacing the tip moves auction-eligibility
-/// to TX2 (whose transfer goes to a real Jito tip account).
-const EXTRA_TRANSFER_RECIPIENT: &str = "6ovsLNZTPpSGd9Q5uz7kbUoMMeXME6Aksc4zYx8YmvJQ";
-const EXTRA_TRANSFER_LAMPORTS: u64 = 2_000_000;    // 0.002 SOL
-/// Base58 keypair that signs TX2 (the Jito tip transaction). Must be
-/// funded with enough SOL to cover BUNDLE_TIP_LAMPORTS × #pools plus fees.
-const TIPPER_KEYPAIR_B58: &str =
-    "3PZdWbacaGVir3mUH8Zn3ervqEpuxqDT9QW2r3j79PHkKyPad7BRbry847cxUMr83fgMkSQx6LRZRH1CHK8VZ95n";
-const BUNDLE_TIP_LAMPORTS: u64 = 1_000_000;        // 0.001 SOL — TX2 tip
-/// Jito tip accounts (8 published pubkeys, random pick per send). All
-/// tips on Jito's sendBundle path MUST go to one of these to be
-/// auction-eligible. See <https://docs.jito.wtf/lowlatencytxnsend/>.
-const JITO_TIP_ACCOUNTS: &[&str] = &[
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-    "ADuUkR4vqLUMWXxW9gh6D6L8pivKeVBBjNS6ABEhz3JT",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-];
-/// Jito bundle endpoint. Frankfurt block-engine — pick the closest
-/// region to where this binary actually runs (FR co-locates with our
-/// central-service deployment).
-const JITO_BUNDLE_URL: &str =
-    "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
+const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
+/// SUPRA tip recipient on the RPC `sendTransaction` path. Matches
+/// `src/measure.rs` / `src/bin/send.rs`.
+const SUPRA_TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
+const TIP_LAMPORTS: u64 = 1_213_357;               // 0.001213357 SOL — matches send / measure.rs
 const SWAP_IN_LAMPORTS: u64 = 121_335;             // 0.0001213357 SOL — 10× smaller per ask
 const CU_LIMIT_CEILING: u32 = 400_000;             // high enough to never bite
 const CU_PRICE: u64 = 1_000_000;                   // microlamports/CU → ~$0.04 priority
 const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;    // matches bot's prod constant
 const SLIPPAGE_BPS: u32 = 5_000;                   // 50% — generous, we just want it to land
+const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
 
 #[tokio::main]
@@ -108,23 +85,18 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     let wallet_kp = Keypair::from_base58_string(&cfg.wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
-    let tipper_kp = Keypair::from_base58_string(TIPPER_KEYPAIR_B58);
-    let tipper_pk = tipper_kp.pubkey();
-    let extra_transfer_to = Pubkey::from_str(EXTRA_TRANSFER_RECIPIENT)?;
-    tracing::info!(wallet = %wallet_pk, tipper = %tipper_pk, "starting measure_cu");
+    tracing::info!(wallet = %wallet_pk, "starting measure_cu");
 
     let repo = Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?;
     let rpc =
         RpcClient::new_with_commitment(HELIUS_RPC.to_string(), CommitmentConfig::confirmed());
 
-    // Tip pubkey is picked per-iteration inside `measure_one` (rotates
-    // through JITO_TIP_ACCOUNTS to spread load). The shared HTTP client
-    // is built here once and reused.
-    let http = reqwest::Client::builder()
-        .pool_max_idle_per_host(4)
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("build http client")?;
+    // Fetch nonce blockhash up-front. Sequential script, so we read it once
+    // and re-fetch on each iter (the advance_nonce ix advances it on the
+    // chain too).
+    let nonce_pk = Pubkey::from_str(BUY_NONCE)?;
+    let sysvar_recent_blockhashes = Pubkey::from_str(SVRECENT_BLOCKHASHES)?;
+    let tip_pk = Pubkey::from_str(SUPRA_TIP_RECIPIENT)?;
 
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
     {
@@ -149,13 +121,8 @@ async fn main() -> anyhow::Result<()> {
     //   --force / --all  Ignore the cu_measured_at recency filter and
     //                    re-measure every pump-fun pool. Useful after a
     //                    tx-layout change invalidates prior CU values.
-    //   --rpc            Send via standard RPC `sendTransaction` instead
-    //                    of Jito's sendBundle. Useful when the Jito
-    //                    endpoint is degraded or for the Helius mainnet
-    //                    fallback path.
     let args: Vec<String> = std::env::args().collect();
     let force = args.iter().any(|a| a == "--force" || a == "--all");
-    let use_rpc_send = args.iter().any(|a| a == "--rpc");
     let pool_filter: Option<String> = args
         .iter()
         .position(|a| a == "--pool")
@@ -204,26 +171,19 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // TX2's Jito tip recipient rotates per pool to spread load across
-        // the 8 published accounts. Unused on the `--rpc` path (no TX2).
-        let jito_tip_pk =
-            Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?;
         let prefix = format!("[{}/{}] pool={}", idx + 1, pools.len(), pool_doc.pool);
         match measure_one(
             &rpc,
-            &http,
             &repo,
             &wallet_kp,
             wallet_pk,
             wallet_wsol_ata,
             &pdas,
-            extra_transfer_to,
-            &tipper_kp,
-            tipper_pk,
-            jito_tip_pk,
+            nonce_pk,
+            sysvar_recent_blockhashes,
+            tip_pk,
             pool_pk,
             pump,
-            use_rpc_send,
         )
         .await
         {
@@ -263,19 +223,16 @@ enum MeasureOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn measure_one(
     rpc: &RpcClient,
-    http: &reqwest::Client,
     repo: &Repo,
     wallet_kp: &Keypair,
     wallet_pk: Pubkey,
     wallet_wsol_ata: Pubkey,
     pdas: &PumpStaticPdas,
-    extra_transfer_to: Pubkey,
-    tipper_kp: &Keypair,
-    tipper_pk: Pubkey,
-    jito_tip_to: Pubkey,
+    nonce_pk: Pubkey,
+    sysvar_recent_blockhashes: Pubkey,
+    tip_to: Pubkey,
     pool_pk: Pubkey,
     pump: &central_service::pool::PumpFunAccounts,
-    use_rpc_send: bool,
 ) -> anyhow::Result<MeasureOutcome> {
     let base_mint = Pubkey::from_str(&pump.base_mint)?;
     let pool_base_vault = Pubkey::from_str(&pump.pool_base_token_account)?;
@@ -320,91 +277,58 @@ async fn measure_one(
         SLIPPAGE_BPS,
     );
 
-    // 4. Fetch a regular recent blockhash for the buy tx (no durable nonce).
-    let recent_blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .context("get_latest_blockhash for buy tx")?;
+    // 4. Read the nonce's stored blockhash. Used as the tx's
+    //    recent_blockhash; the advance_nonce ix rotates it on land so each
+    //    iteration sees a fresh hash.
+    let nonce_acct = rpc.get_account(&nonce_pk).await.context("get nonce account")?;
+    if nonce_acct.data.len() < 72 {
+        anyhow::bail!("nonce account data too short");
+    }
+    let nonce_hash_bytes: [u8; 32] = nonce_acct.data[40..72]
+        .try_into()
+        .context("slice nonce blockhash")?;
+    let nonce_blockhash = Hash::new_from_array(nonce_hash_bytes);
 
-    // 5. Compose the tx. compute-budget + transfer + swap. No advance_nonce.
+    // 5. Compose the tx. advance_nonce + compute-budget + swap + tip.
+    let advance_nonce_ix = Instruction {
+        program_id: system_program_pk(),
+        accounts: vec![
+            AccountMeta::new(nonce_pk, false),
+            AccountMeta::new_readonly(sysvar_recent_blockhashes, false),
+            AccountMeta::new_readonly(wallet_pk, true),
+        ],
+        data: vec![4, 0, 0, 0],  // SystemInstruction::AdvanceNonceAccount = 4
+    };
     let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT_CEILING);
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let data_size_ix =
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
-    let extra_transfer_ix =
-        system_instruction::transfer(&wallet_pk, &extra_transfer_to, EXTRA_TRANSFER_LAMPORTS);
+    let tip_ix = system_instruction::transfer(&wallet_pk, &tip_to, TIP_LAMPORTS);
 
     let message = Message::new_with_blockhash(
         &[
-            extra_transfer_ix,
+            advance_nonce_ix,
+            tip_ix,            // slot 1 — matches bot's production layout
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
         ],
         Some(&wallet_pk),
-        &recent_blockhash,
+        &nonce_blockhash,
     );
     let mut tx = Transaction::new_unsigned(message);
-    tx.sign(&[wallet_kp], recent_blockhash);
+    tx.sign(&[wallet_kp], nonce_blockhash);
 
-    // 6. Send. Default path: Jito sendBundle (matches bot's production
-    //    sender mix). With `--rpc`: fall back to standard JSON-RPC
-    //    `sendTransaction` against the Helius mainnet endpoint.
+    // 6. Send via standard JSON-RPC `sendTransaction` against the Helius
+    //    mainnet endpoint.
     let sig: Signature = tx.signatures[0];
-    if use_rpc_send {
-        let sent_sig = rpc
-            .send_transaction(&tx)
-            .await
-            .context("rpc send_transaction")?;
-        debug_assert_eq!(sent_sig, sig);
-        tracing::debug!(sig = %sig, "sent via rpc");
-    } else {
-        // TX2 — standalone tip tx signed by the tipper keypair. Uses a
-        // regular recent blockhash (no nonce); bundles tolerate mixed
-        // blockhash sources as long as each tx is independently valid.
-        let tip_blockhash = rpc
-            .get_latest_blockhash()
-            .await
-            .context("get blockhash for tip tx")?;
-        let tip_transfer_ix =
-            system_instruction::transfer(&tipper_pk, &jito_tip_to, BUNDLE_TIP_LAMPORTS);
-        let tip_tx = Transaction::new_signed_with_payer(
-            &[tip_transfer_ix],
-            Some(&tipper_pk),
-            &[tipper_kp],
-            tip_blockhash,
-        );
-
-        let tx1_bytes = bincode::serialize(&tx).context("serialize buy tx for bundle")?;
-        let tx2_bytes = bincode::serialize(&tip_tx).context("serialize tip tx for bundle")?;
-        let tx1_b64 = base64::engine::general_purpose::STANDARD.encode(&tx1_bytes);
-        let tx2_b64 = base64::engine::general_purpose::STANDARD.encode(&tx2_bytes);
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [[tx1_b64, tx2_b64], {"encoding": "base64"}],
-        });
-        let resp = http
-            .post(JITO_BUNDLE_URL)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .context("jito sendBundle http")?;
-        let status = resp.status();
-        let resp_text = resp.text().await.context("jito sendBundle body")?;
-        if !status.is_success() {
-            return Err(anyhow!("jito sendBundle non-2xx: status={status} body={resp_text}"));
-        }
-        let parsed: serde_json::Value = serde_json::from_str(&resp_text)
-            .context("jito sendBundle parse body")?;
-        if let Some(err) = parsed.get("error") {
-            return Err(anyhow!("jito sendBundle rpc-level error: {err}"));
-        }
-        tracing::debug!(sig = %sig, bundle = ?parsed.get("result"), "sent via jito");
-    }
+    let sent_sig = rpc
+        .send_transaction(&tx)
+        .await
+        .context("rpc send_transaction")?;
+    debug_assert_eq!(sent_sig, sig);
+    tracing::debug!(sig = %sig, "sent via rpc");
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
