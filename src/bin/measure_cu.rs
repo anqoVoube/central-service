@@ -80,9 +80,6 @@ const TIP_LAMPORTS: u64 = 1_213_357;               // 0.001213357 SOL — matche
 /// central-service deployment).
 const JITO_BUNDLE_URL: &str =
     "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
-/// Jito Block Engine API key. Sent via the `x-jito-auth` header on
-/// every sendBundle call. Required for authenticated endpoints.
-const JITO_AUTH_KEY: &str = "6ovsLNZTPpSGd9Q5uz7kbUoMMeXME6Aksc4zYx8YmvJQ";
 const SWAP_IN_LAMPORTS: u64 = 121_335;             // 0.0001213357 SOL — 10× smaller per ask
 const CU_LIMIT_CEILING: u32 = 400_000;             // high enough to never bite
 const CU_PRICE: u64 = 1_000_000;                   // microlamports/CU → ~$0.04 priority
@@ -368,7 +365,6 @@ async fn measure_one(
     let resp = http
         .post(JITO_BUNDLE_URL)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("x-jito-auth", JITO_AUTH_KEY)
         .body(body.to_string())
         .send()
         .await
