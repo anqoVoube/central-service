@@ -9,14 +9,18 @@
 //! single — the margin policy can be tuned in the bot without re-running
 //! this script.
 //!
-//! Tx layout matches the bot's production shape so the recorded CU is
-//! what the bot would actually consume:
-//!   ix[0] advance_nonce_account
-//!   ix[1] set_compute_unit_limit(400_000)               ← high ceiling
-//!   ix[2] set_compute_unit_price(1_000_000)             ← ~$0.04 priority
-//!   ix[3] set_loaded_accounts_data_size_limit(13_500_000)
-//!   ix[4] swap_buy_ix                                   ← 0.0001 SOL in
-//!   ix[5] system::transfer(1 lamport → SUPRA tip)
+//! Bundle layout (Jito sendBundle path):
+//!   TX1 — buy, signed by `wallet_kp`:
+//!     ix[0] advance_nonce_account
+//!     ix[1] system::transfer(0.002 SOL → EXTRA_TRANSFER_RECIPIENT)
+//!     ix[2] set_compute_unit_limit(400_000)             ← high ceiling
+//!     ix[3] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
+//!     ix[4] set_loaded_accounts_data_size_limit(13_500_000)
+//!     ix[5] swap_buy_ix                                 ← 0.0001 SOL in
+//!   TX2 — Jito tip, signed by `tipper_kp`:
+//!     ix[0] system::transfer(0.001 SOL → rotating Jito tip account)
+//!
+//! With `--rpc` only TX1 is sent (sendTransaction can't bundle).
 //!
 //! Sequential, 1 pool at a time. Idempotent: pools with recent
 //! `cu_measured_at` are skipped on re-run. Pools missing the wallet's ATA
@@ -61,9 +65,16 @@ use central_service::{
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
-/// SUPRA tip recipient — used when `--rpc` falls back to the prior
-/// `sendTransaction` path. Matches `src/measure.rs` / `src/bin/send.rs`.
-const SUPRA_TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
+/// Recipient of the 0.002 SOL transfer embedded in TX1. Sits in the slot
+/// the prior Jito tip used; replacing the tip moves auction-eligibility
+/// to TX2 (whose transfer goes to a real Jito tip account).
+const EXTRA_TRANSFER_RECIPIENT: &str = "6ovsLNZTPpSGd9Q5uz7kbUoMMeXME6Aksc4zYx8YmvJQ";
+const EXTRA_TRANSFER_LAMPORTS: u64 = 2_000_000;    // 0.002 SOL
+/// Base58 keypair that signs TX2 (the Jito tip transaction). Must be
+/// funded with enough SOL to cover BUNDLE_TIP_LAMPORTS × #pools plus fees.
+const TIPPER_KEYPAIR_B58: &str =
+    "3PZdWbacaGVir3mUH8Zn3ervqEpuxqDT9QW2r3j79PHkKyPad7BRbry847cxUMr83fgMkSQx6LRZRH1CHK8VZ95n";
+const BUNDLE_TIP_LAMPORTS: u64 = 1_000_000;        // 0.001 SOL — TX2 tip
 /// Jito tip accounts (8 published pubkeys, random pick per send). All
 /// tips on Jito's sendBundle path MUST go to one of these to be
 /// auction-eligible. See <https://docs.jito.wtf/lowlatencytxnsend/>.
@@ -77,7 +88,6 @@ const JITO_TIP_ACCOUNTS: &[&str] = &[
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
-const TIP_LAMPORTS: u64 = 1_213_357;               // 0.001213357 SOL — matches send / measure.rs
 /// Jito bundle endpoint. Frankfurt block-engine — pick the closest
 /// region to where this binary actually runs (FR co-locates with our
 /// central-service deployment).
@@ -104,7 +114,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env()?;
     let wallet_kp = Keypair::from_base58_string(&cfg.wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
-    tracing::info!(wallet = %wallet_pk, "starting measure_cu");
+    let tipper_kp = Keypair::from_base58_string(TIPPER_KEYPAIR_B58);
+    let tipper_pk = tipper_kp.pubkey();
+    let extra_transfer_to = Pubkey::from_str(EXTRA_TRANSFER_RECIPIENT)?;
+    tracing::info!(wallet = %wallet_pk, tipper = %tipper_pk, "starting measure_cu");
 
     let repo = Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?;
     let rpc =
@@ -202,14 +215,10 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // Tip recipient depends on send path: SUPRA on the RPC fallback
-        // (no auction — tip is informational/recipient-of-record), and
-        // a rotating Jito tip account when going through sendBundle.
-        let tip_pk = if use_rpc_send {
-            Pubkey::from_str(SUPRA_TIP_RECIPIENT)?
-        } else {
-            Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?
-        };
+        // TX2's Jito tip recipient rotates per pool to spread load across
+        // the 8 published accounts. Unused on the `--rpc` path (no TX2).
+        let jito_tip_pk =
+            Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?;
         let prefix = format!("[{}/{}] pool={}", idx + 1, pools.len(), pool_doc.pool);
         match measure_one(
             &rpc,
@@ -221,7 +230,10 @@ async fn main() -> anyhow::Result<()> {
             &pdas,
             nonce_pk,
             sysvar_recent_blockhashes,
-            tip_pk,
+            extra_transfer_to,
+            &tipper_kp,
+            tipper_pk,
+            jito_tip_pk,
             pool_pk,
             pump,
             use_rpc_send,
@@ -272,7 +284,10 @@ async fn measure_one(
     pdas: &PumpStaticPdas,
     nonce_pk: Pubkey,
     sysvar_recent_blockhashes: Pubkey,
-    tip_to: Pubkey,
+    extra_transfer_to: Pubkey,
+    tipper_kp: &Keypair,
+    tipper_pk: Pubkey,
+    jito_tip_to: Pubkey,
     pool_pk: Pubkey,
     pump: &central_service::pool::PumpFunAccounts,
     use_rpc_send: bool,
@@ -346,12 +361,13 @@ async fn measure_one(
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let data_size_ix =
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
-    let tip_ix = system_instruction::transfer(&wallet_pk, &tip_to, TIP_LAMPORTS);
+    let extra_transfer_ix =
+        system_instruction::transfer(&wallet_pk, &extra_transfer_to, EXTRA_TRANSFER_LAMPORTS);
 
     let message = Message::new_with_blockhash(
         &[
             advance_nonce_ix,
-            tip_ix,            // slot 1 — matches bot's production layout
+            extra_transfer_ix, // slot 1 — replaces the prior Jito tip; auction tip now lives in TX2
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
@@ -375,13 +391,31 @@ async fn measure_one(
         debug_assert_eq!(sent_sig, sig);
         tracing::debug!(sig = %sig, "sent via rpc");
     } else {
-        let tx_bytes = bincode::serialize(&tx).context("serialize tx for bundle")?;
-        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+        // TX2 — standalone tip tx signed by the tipper keypair. Uses a
+        // regular recent blockhash (no nonce); bundles tolerate mixed
+        // blockhash sources as long as each tx is independently valid.
+        let tip_blockhash = rpc
+            .get_latest_blockhash()
+            .await
+            .context("get blockhash for tip tx")?;
+        let tip_transfer_ix =
+            system_instruction::transfer(&tipper_pk, &jito_tip_to, BUNDLE_TIP_LAMPORTS);
+        let tip_tx = Transaction::new_signed_with_payer(
+            &[tip_transfer_ix],
+            Some(&tipper_pk),
+            &[tipper_kp],
+            tip_blockhash,
+        );
+
+        let tx1_bytes = bincode::serialize(&tx).context("serialize buy tx for bundle")?;
+        let tx2_bytes = bincode::serialize(&tip_tx).context("serialize tip tx for bundle")?;
+        let tx1_b64 = base64::engine::general_purpose::STANDARD.encode(&tx1_bytes);
+        let tx2_b64 = base64::engine::general_purpose::STANDARD.encode(&tx2_bytes);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [[tx_b64], {"encoding": "base64"}],
+            "params": [[tx1_b64, tx2_b64], {"encoding": "base64"}],
         });
         let resp = http
             .post(JITO_BUNDLE_URL)
