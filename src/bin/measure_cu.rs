@@ -31,6 +31,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use base64::Engine;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -60,8 +61,28 @@ use central_service::{
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
-const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
+/// Jito tip accounts (8 published pubkeys, random pick per send). All
+/// tips on Jito's sendBundle path MUST go to one of these to be
+/// auction-eligible. See <https://docs.jito.wtf/lowlatencytxnsend/>.
+const JITO_TIP_ACCOUNTS: &[&str] = &[
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pivKeVBBjNS6ABEhz3JT",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+];
 const TIP_LAMPORTS: u64 = 1_213_357;               // 0.001213357 SOL — matches send / measure.rs
+/// Jito bundle endpoint. Frankfurt block-engine — pick the closest
+/// region to where this binary actually runs (FR co-locates with our
+/// central-service deployment).
+const JITO_BUNDLE_URL: &str =
+    "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
+/// Jito Block Engine API key. Sent via the `x-jito-auth` header on
+/// every sendBundle call. Required for authenticated endpoints.
+const JITO_AUTH_KEY: &str = "6ovsLNZTPpSGd9Q5uz7kbUoMMeXME6Aksc4zYx8YmvJQ";
 const SWAP_IN_LAMPORTS: u64 = 121_335;             // 0.0001213357 SOL — 10× smaller per ask
 const CU_LIMIT_CEILING: u32 = 400_000;             // high enough to never bite
 const CU_PRICE: u64 = 1_000_000;                   // microlamports/CU → ~$0.04 priority
@@ -93,7 +114,14 @@ async fn main() -> anyhow::Result<()> {
     // and re-fetch on each iter (the advance_nonce ix advances it on the
     // chain too).
     let nonce_pk = Pubkey::from_str(BUY_NONCE)?;
-    let tip_to = Pubkey::from_str(TIP_RECIPIENT)?;
+    // Tip pubkey is picked per-iteration inside `measure_one` (rotates
+    // through JITO_TIP_ACCOUNTS to spread load). The shared HTTP client
+    // is built here once and reused.
+    let http = reqwest::Client::builder()
+        .pool_max_idle_per_host(4)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build http client")?;
     let sysvar_recent_blockhashes = Pubkey::from_str(SVRECENT_BLOCKHASHES)?;
 
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
@@ -169,9 +197,12 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        // Rotate through Jito's 8 tip accounts so we don't hammer one.
+        let tip_pk = Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?;
         let prefix = format!("[{}/{}] pool={}", idx + 1, pools.len(), pool_doc.pool);
         match measure_one(
             &rpc,
+            &http,
             &repo,
             &wallet_kp,
             wallet_pk,
@@ -179,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
             &pdas,
             nonce_pk,
             sysvar_recent_blockhashes,
-            tip_to,
+            tip_pk,
             pool_pk,
             pump,
         )
@@ -221,6 +252,7 @@ enum MeasureOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn measure_one(
     rpc: &RpcClient,
+    http: &reqwest::Client,
     repo: &Repo,
     wallet_kp: &Keypair,
     wallet_pk: Pubkey,
@@ -318,9 +350,43 @@ async fn measure_one(
     let mut tx = Transaction::new_unsigned(message);
     tx.sign(&[wallet_kp], nonce_blockhash);
 
-    // 6. Send + poll.
-    let sig: Signature = rpc.send_transaction(&tx).await.context("send_transaction")?;
-    tracing::debug!(sig = %sig, "sent");
+    // 6. Send via Jito sendBundle. Single-tx bundle: the bot's prod
+    //    sender path uses sendBundle for guaranteed leader-forwarding;
+    //    matching that here keeps the measurement infrastructure
+    //    consistent. The tip ix already lives in the tx (slot 1), so
+    //    Jito picks it up as the auction bid. After sending we still
+    //    poll by sig — each tx in a bundle keeps its own signature.
+    let sig: Signature = tx.signatures[0];
+    let tx_bytes = bincode::serialize(&tx).context("serialize tx for bundle")?;
+    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendBundle",
+        "params": [[tx_b64], {"encoding": "base64"}],
+    });
+    let resp = http
+        .post(JITO_BUNDLE_URL)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("x-jito-auth", JITO_AUTH_KEY)
+        .body(body.to_string())
+        .send()
+        .await
+        .context("jito sendBundle http")?;
+    let status = resp.status();
+    let resp_text = resp.text().await.context("jito sendBundle body")?;
+    if !status.is_success() {
+        return Err(anyhow!("jito sendBundle non-2xx: status={status} body={resp_text}"));
+    }
+    // Body is JSON like `{"jsonrpc":"2.0","result":"<bundleId>","id":1}`
+    // We don't need the bundleId — confirmation flows through the
+    // tx sig poll below — but verify a result was returned.
+    let parsed: serde_json::Value = serde_json::from_str(&resp_text)
+        .context("jito sendBundle parse body")?;
+    if let Some(err) = parsed.get("error") {
+        return Err(anyhow!("jito sendBundle rpc-level error: {err}"));
+    }
+    tracing::debug!(sig = %sig, bundle = ?parsed.get("result"), "sent via jito");
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
