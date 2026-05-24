@@ -406,7 +406,11 @@ async fn measure_one(
         if let Some(err) = parsed.get("error") {
             return Err(anyhow!("jito sendBundle rpc-level error: {err}"));
         }
-        tracing::debug!(sig = %sig, bundle = ?parsed.get("result"), "sent via jito");
+        let bundle_id = parsed
+            .get("result")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("jito sendBundle: missing/invalid result field: {parsed}"))?;
+        tracing::info!(sig = %sig, bundle_id = %bundle_id, "sent via jito");
     }
 
     let start = std::time::Instant::now();
