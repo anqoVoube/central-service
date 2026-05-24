@@ -144,8 +144,13 @@ async fn main() -> anyhow::Result<()> {
     //   --force / --all  Ignore the cu_measured_at recency filter and
     //                    re-measure every pump-fun pool. Useful after a
     //                    tx-layout change invalidates prior CU values.
+    //   --rpc            Send via standard RPC `sendTransaction` instead
+    //                    of Jito's sendBundle. Useful when the Jito
+    //                    endpoint is degraded or for the Helius mainnet
+    //                    fallback path.
     let args: Vec<String> = std::env::args().collect();
     let force = args.iter().any(|a| a == "--force" || a == "--all");
+    let use_rpc_send = args.iter().any(|a| a == "--rpc");
     let pool_filter: Option<String> = args
         .iter()
         .position(|a| a == "--pool")
@@ -210,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
             tip_pk,
             pool_pk,
             pump,
+            use_rpc_send,
         )
         .await
         {
@@ -260,6 +266,7 @@ async fn measure_one(
     tip_to: Pubkey,
     pool_pk: Pubkey,
     pump: &central_service::pool::PumpFunAccounts,
+    use_rpc_send: bool,
 ) -> anyhow::Result<MeasureOutcome> {
     let base_mint = Pubkey::from_str(&pump.base_mint)?;
     let pool_base_vault = Pubkey::from_str(&pump.pool_base_token_account)?;
@@ -347,42 +354,45 @@ async fn measure_one(
     let mut tx = Transaction::new_unsigned(message);
     tx.sign(&[wallet_kp], nonce_blockhash);
 
-    // 6. Send via Jito sendBundle. Single-tx bundle: the bot's prod
-    //    sender path uses sendBundle for guaranteed leader-forwarding;
-    //    matching that here keeps the measurement infrastructure
-    //    consistent. The tip ix already lives in the tx (slot 1), so
-    //    Jito picks it up as the auction bid. After sending we still
-    //    poll by sig — each tx in a bundle keeps its own signature.
+    // 6. Send. Default path: Jito sendBundle (matches bot's production
+    //    sender mix). With `--rpc`: fall back to standard JSON-RPC
+    //    `sendTransaction` against the Helius mainnet endpoint.
     let sig: Signature = tx.signatures[0];
-    let tx_bytes = bincode::serialize(&tx).context("serialize tx for bundle")?;
-    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "sendBundle",
-        "params": [[tx_b64], {"encoding": "base64"}],
-    });
-    let resp = http
-        .post(JITO_BUNDLE_URL)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .context("jito sendBundle http")?;
-    let status = resp.status();
-    let resp_text = resp.text().await.context("jito sendBundle body")?;
-    if !status.is_success() {
-        return Err(anyhow!("jito sendBundle non-2xx: status={status} body={resp_text}"));
+    if use_rpc_send {
+        let sent_sig = rpc
+            .send_transaction(&tx)
+            .await
+            .context("rpc send_transaction")?;
+        debug_assert_eq!(sent_sig, sig);
+        tracing::debug!(sig = %sig, "sent via rpc");
+    } else {
+        let tx_bytes = bincode::serialize(&tx).context("serialize tx for bundle")?;
+        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [[tx_b64], {"encoding": "base64"}],
+        });
+        let resp = http
+            .post(JITO_BUNDLE_URL)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .context("jito sendBundle http")?;
+        let status = resp.status();
+        let resp_text = resp.text().await.context("jito sendBundle body")?;
+        if !status.is_success() {
+            return Err(anyhow!("jito sendBundle non-2xx: status={status} body={resp_text}"));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&resp_text)
+            .context("jito sendBundle parse body")?;
+        if let Some(err) = parsed.get("error") {
+            return Err(anyhow!("jito sendBundle rpc-level error: {err}"));
+        }
+        tracing::debug!(sig = %sig, bundle = ?parsed.get("result"), "sent via jito");
     }
-    // Body is JSON like `{"jsonrpc":"2.0","result":"<bundleId>","id":1}`
-    // We don't need the bundleId — confirmation flows through the
-    // tx sig poll below — but verify a result was returned.
-    let parsed: serde_json::Value = serde_json::from_str(&resp_text)
-        .context("jito sendBundle parse body")?;
-    if let Some(err) = parsed.get("error") {
-        return Err(anyhow!("jito sendBundle rpc-level error: {err}"));
-    }
-    tracing::debug!(sig = %sig, bundle = ?parsed.get("result"), "sent via jito");
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
