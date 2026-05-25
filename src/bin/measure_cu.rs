@@ -30,7 +30,8 @@
 //! `MONGO_DB`.
 
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use base64::Engine;
@@ -104,12 +105,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let wallet_kp = Keypair::from_base58_string(&cfg.wallet_keypair_b58);
+    // Arc so the same keypair can be shared with the Harmonic submitter (which
+    // needs an owned, Send handle for its per-region auth tasks).
+    let wallet_kp = Arc::new(Keypair::from_base58_string(&cfg.wallet_keypair_b58));
     let wallet_pk = wallet_kp.pubkey();
-    // x-jito-auth token for the Frankfurt block-engine. Required on the
-    // sendBundle path; the --rpc fallback ignores it.
-    let jito_auth = std::env::var("X_JITO_AUTH")
-        .context("X_JITO_AUTH not set (required for Jito sendBundle; set in .env)")?;
+    // x-jito-auth token for the Frankfurt block-engine. Required only on the
+    // default Jito sendBundle path; the --rpc and --harmonic paths ignore it
+    // (validated against the parsed flags below).
+    let jito_auth = std::env::var("X_JITO_AUTH").ok();
     tracing::info!(wallet = %wallet_pk, "starting measure_cu");
 
     let repo = Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?;
@@ -157,9 +160,39 @@ async fn main() -> anyhow::Result<()> {
     //                    of Jito's sendBundle. Useful when the Jito
     //                    endpoint is degraded or for the Helius mainnet
     //                    fallback path.
+    //   --harmonic       Send via Harmonic's gRPC bundle path (fan-out to all
+    //                    regions). Harmonic tips are priority fees, so the
+    //                    in-tx Jito tip transfer is dropped on this path.
+    //   --advance        Use the durable nonce: prepend advance_nonce and sign
+    //                    against the nonce's stored blockhash. Without it, a
+    //                    fresh recent blockhash is used and advance_nonce is
+    //                    omitted.
+    //   --random         Corrupt the buy ix by replacing one random non-signer
+    //                    account with a freshly generated pubkey. Diagnostic:
+    //                    observe whether the tx lands as a failed on-chain tx
+    //                    or never appears at all. Never persists CU.
     let args: Vec<String> = std::env::args().collect();
     let force = args.iter().any(|a| a == "--force" || a == "--all");
     let use_rpc_send = args.iter().any(|a| a == "--rpc");
+    let use_harmonic = args.iter().any(|a| a == "--harmonic");
+    let advance = args.iter().any(|a| a == "--advance");
+    let randomize = args.iter().any(|a| a == "--random");
+    if use_rpc_send && use_harmonic {
+        anyhow::bail!("--rpc and --harmonic are mutually exclusive");
+    }
+    // The Jito sendBundle path (default: neither --rpc nor --harmonic) needs
+    // the auth token. The other paths don't.
+    let use_jito_send = !use_rpc_send && !use_harmonic;
+    if use_jito_send && jito_auth.is_none() {
+        anyhow::bail!("X_JITO_AUTH not set (required for Jito sendBundle; set in .env, or use --rpc / --harmonic)");
+    }
+    let jito_auth = jito_auth.unwrap_or_default();
+    tracing::info!(
+        send_path = if use_harmonic { "harmonic" } else if use_rpc_send { "rpc" } else { "jito" },
+        advance,
+        randomize,
+        "send configuration"
+    );
     let pool_filter: Option<String> = args
         .iter()
         .position(|a| a == "--pool")
@@ -218,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
             &http,
             &repo,
             &wallet_kp,
+            wallet_kp.clone(),
             wallet_pk,
             wallet_wsol_ata,
             &pdas,
@@ -228,6 +262,9 @@ async fn main() -> anyhow::Result<()> {
             pool_pk,
             pump,
             use_rpc_send,
+            use_harmonic,
+            advance,
+            randomize,
         )
         .await
         {
@@ -270,6 +307,7 @@ async fn measure_one(
     http: &reqwest::Client,
     repo: &Repo,
     wallet_kp: &Keypair,
+    wallet_arc: Arc<Keypair>,
     wallet_pk: Pubkey,
     wallet_wsol_ata: Pubkey,
     pdas: &PumpStaticPdas,
@@ -280,6 +318,9 @@ async fn measure_one(
     pool_pk: Pubkey,
     pump: &central_service::pool::PumpFunAccounts,
     use_rpc_send: bool,
+    use_harmonic: bool,
+    advance: bool,
+    randomize: bool,
 ) -> anyhow::Result<MeasureOutcome> {
     let base_mint = Pubkey::from_str(&pump.base_mint)?;
     let pool_base_vault = Pubkey::from_str(&pump.pool_base_token_account)?;
@@ -306,7 +347,7 @@ async fn measure_one(
         u64::from_le_bytes(quote_vault_acct.data[64..72].try_into().unwrap());
 
     // 3. Build the swap ix matching the bot's prod layout.
-    let swap_ix = build_pump_fun_buy_ix(
+    let mut swap_ix = build_pump_fun_buy_ix(
         &pool_pk,
         &base_mint,
         &pool_base_vault,
@@ -324,55 +365,103 @@ async fn measure_one(
         SLIPPAGE_BPS,
     );
 
-    // 4. Read the nonce's stored blockhash. Used as the tx's
-    //    recent_blockhash; the advance_nonce ix rotates it on land so each
-    //    iteration sees a fresh hash.
-    let nonce_acct = rpc.get_account(&nonce_pk).await.context("get nonce account")?;
-    if nonce_acct.data.len() < 72 {
-        anyhow::bail!("nonce account data too short");
+    // 3b. --random: replace one random non-signer account in the buy ix with a
+    //     freshly generated pubkey. The tx stays validly signed (the signature
+    //     covers the mutated message), so this is a deliberate probe — does the
+    //     tx land as a *failed* on-chain tx (program rejects the bogus account)
+    //     or never appear at all (dropped before inclusion)? CU is never
+    //     persisted on this path.
+    if randomize {
+        let candidates: Vec<usize> = swap_ix
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.is_signer)
+            .map(|(i, _)| i)
+            .collect();
+        // Dependency-free pick: nanosecond clock modulo candidate count.
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as usize;
+        let pick = candidates[seed % candidates.len()];
+        let old_pk = swap_ix.accounts[pick].pubkey;
+        let new_pk = Keypair::new().pubkey();
+        swap_ix.accounts[pick].pubkey = new_pk;
+        tracing::warn!(
+            ix_account_index = pick,
+            old = %old_pk,
+            new = %new_pk,
+            "--random: corrupted one buy-ix account (expecting failed/absent landing)"
+        );
     }
-    let nonce_hash_bytes: [u8; 32] = nonce_acct.data[40..72]
-        .try_into()
-        .context("slice nonce blockhash")?;
-    let nonce_blockhash = Hash::new_from_array(nonce_hash_bytes);
 
-    // 5. Compose the tx. advance_nonce + transfer + compute-budget + swap.
-    let advance_nonce_ix = Instruction {
-        program_id: system_program_pk(),
-        accounts: vec![
-            AccountMeta::new(nonce_pk, false),
-            AccountMeta::new_readonly(sysvar_recent_blockhashes, false),
-            AccountMeta::new_readonly(wallet_pk, true),
-        ],
-        data: vec![4, 0, 0, 0],  // SystemInstruction::AdvanceNonceAccount = 4
+    // 4. Pick the recent_blockhash.
+    //    --advance: read the durable nonce's stored hash (the advance_nonce ix
+    //               rotates it on land so each iteration sees a fresh hash).
+    //    otherwise: a normal recent blockhash from the RPC.
+    let blockhash = if advance {
+        let nonce_acct = rpc.get_account(&nonce_pk).await.context("get nonce account")?;
+        if nonce_acct.data.len() < 72 {
+            anyhow::bail!("nonce account data too short");
+        }
+        let nonce_hash_bytes: [u8; 32] = nonce_acct.data[40..72]
+            .try_into()
+            .context("slice nonce blockhash")?;
+        Hash::new_from_array(nonce_hash_bytes)
+    } else {
+        rpc.get_latest_blockhash()
+            .await
+            .context("get_latest_blockhash")?
     };
+
+    // 5. Compose the instruction list:
+    //      [advance_nonce?] cu_limit, cu_price, data_size, swap, [jito_tip?]
+    //    - advance_nonce only with --advance.
+    //    - the in-tx Jito tip transfer is kept on the Jito and RPC paths (so
+    //      the measured CU matches the bot's prod layout). Harmonic tips are
+    //      priority fees (cu_price above), so the transfer ix is dropped there.
     let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT_CEILING);
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let data_size_ix =
         ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT);
-    let jito_tip_ix =
-        system_instruction::transfer(&wallet_pk, &jito_tip_to, BUNDLE_TIP_LAMPORTS);
 
-    let message = Message::new_with_blockhash(
-        &[
-            advance_nonce_ix,
-            cu_limit_ix,
-            cu_price_ix,
-            data_size_ix,
-            swap_ix,
-            jito_tip_ix,
-        ],
-        Some(&wallet_pk),
-        &nonce_blockhash,
-    );
+    let mut ixs: Vec<Instruction> = Vec::with_capacity(6);
+    if advance {
+        ixs.push(Instruction {
+            program_id: system_program_pk(),
+            accounts: vec![
+                AccountMeta::new(nonce_pk, false),
+                AccountMeta::new_readonly(sysvar_recent_blockhashes, false),
+                AccountMeta::new_readonly(wallet_pk, true),
+            ],
+            data: vec![4, 0, 0, 0], // SystemInstruction::AdvanceNonceAccount = 4
+        });
+    }
+    ixs.push(cu_limit_ix);
+    ixs.push(cu_price_ix);
+    ixs.push(data_size_ix);
+    ixs.push(swap_ix);
+    if !use_harmonic {
+        ixs.push(system_instruction::transfer(
+            &wallet_pk,
+            &jito_tip_to,
+            BUNDLE_TIP_LAMPORTS,
+        ));
+    }
+
+    let message = Message::new_with_blockhash(&ixs, Some(&wallet_pk), &blockhash);
     let mut tx = Transaction::new_unsigned(message);
-    tx.sign(&[wallet_kp], nonce_blockhash);
+    tx.sign(&[wallet_kp], blockhash);
 
     // 6. Send. Default path: Jito sendBundle (matches bot's production
-    //    sender mix). With `--rpc`: fall back to standard JSON-RPC
-    //    `sendTransaction` against the Helius mainnet endpoint.
+    //    sender mix). With `--harmonic`: Harmonic gRPC bundle fan-out. With
+    //    `--rpc`: standard JSON-RPC `sendTransaction` against Helius mainnet.
     let sig: Signature = tx.signatures[0];
-    if use_rpc_send {
+    if use_harmonic {
+        let tx_bytes = bincode::serialize(&tx).context("serialize buy tx for harmonic")?;
+        let uuid = central_service::harmonic::submit_bundle(wallet_arc, tx_bytes)
+            .await
+            .context("harmonic submit_bundle")?;
+        tracing::info!(sig = %sig, bundle_uuid = %uuid, "sent via harmonic");
+    } else if use_rpc_send {
         let sent_sig = rpc
             .send_transaction(&tx)
             .await

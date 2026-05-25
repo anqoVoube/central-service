@@ -9,6 +9,7 @@ pub mod bans;
 pub mod block_detail;
 pub mod config;
 pub mod discover;
+pub mod harmonic;
 pub mod lanes;
 pub mod leaders;
 pub mod measure;
