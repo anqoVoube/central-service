@@ -242,6 +242,7 @@ pub async fn serve(
         .route("/time/:time", get(serve_time_search))
         .route("/block-detail/:opp_sig", get(serve_block_detail))
         .route("/ban", post(serve_ban_pool))
+        .route("/banned", get(serve_banned_pools))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -362,6 +363,24 @@ async fn serve_ban_pool(
     let _ = state.tx.send(ServerMsg::PoolDisabled { pool: pool.clone() });
     println!("[ban] pool={pool} disabled + broadcast");
     (StatusCode::OK, "banned").into_response()
+}
+
+/// JSON array of currently-banned pool pubkeys. The dashboard fetches
+/// this to gray-out banned rows in the history view. IP-whitelisted.
+async fn serve_banned_pools(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    match state.repo.load_disabled_pool_keys().await {
+        Ok(keys) => Json(keys).into_response(),
+        Err(e) => {
+            tracing::error!("load_disabled_pool_keys failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "mongo query failed").into_response()
+        }
+    }
 }
 
 /// Wholesale ban-list snapshot for bot startup. Bots fetch once, then receive

@@ -45,6 +45,19 @@ impl Repo {
             .await?)
     }
 
+    /// Pool pubkeys currently flagged `disabled: true`. Used by the
+    /// dashboard's `GET /banned` proxy to gray-out banned rows in the
+    /// history view. Banned pools are few, so loading full docs is fine.
+    pub async fn load_disabled_pool_keys(&self) -> anyhow::Result<Vec<String>> {
+        let docs: Vec<PoolDoc> = self
+            .pools
+            .find(doc! { "disabled": true })
+            .await?
+            .try_collect()
+            .await?;
+        Ok(docs.into_iter().map(|d| d.pool).collect())
+    }
+
     /// Permanently ban a pool: set `disabled: true`. Bots are told to
     /// drop it via the `pool_disabled` WS broadcast; future init loads
     /// and discovery/poll queries skip it. No un-ban path.
