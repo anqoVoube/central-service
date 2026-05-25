@@ -75,4 +75,12 @@ pub struct PoolDoc {
     /// `#[serde(default)]` for missing fields) → age filter applies.
     #[serde(default)]
     pub is_unique: bool,
+    /// Permanent ban flag. Set `true` via the dashboard BAN button
+    /// (`POST /ban` → `set_pool_disabled`). Disabled pools are never
+    /// shipped to bots on init, never re-broadcast on discovery/poll,
+    /// and a `pool_disabled` WS broadcast tells live bots to drop them
+    /// from their in-memory `Pools`. No un-ban path — clear the field
+    /// manually in Mongo to reverse.
+    #[serde(default)]
+    pub disabled: bool,
 }

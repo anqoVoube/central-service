@@ -35,12 +35,28 @@ impl Repo {
     }
 
     pub async fn load_all_confirmed(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        // `disabled: { $ne: true }` excludes banned pools — they never
+        // ship to bots on init. Matches both missing field and `false`.
         Ok(self
             .pools
-            .find(doc! { "ata_status": "confirmed" })
+            .find(doc! { "ata_status": "confirmed", "disabled": { "$ne": true } })
             .await?
             .try_collect()
             .await?)
+    }
+
+    /// Permanently ban a pool: set `disabled: true`. Bots are told to
+    /// drop it via the `pool_disabled` WS broadcast; future init loads
+    /// and discovery/poll queries skip it. No un-ban path.
+    pub async fn set_pool_disabled(&self, pool: &str) -> anyhow::Result<()> {
+        self.pools
+            .update_one(
+                doc! { "pool": pool },
+                doc! { "$set": { "disabled": true, "updated_at": DateTime::now() } },
+            )
+            .await
+            .context("set_pool_disabled")?;
+        Ok(())
     }
 
     pub async fn load_pump_fun_confirmed(&self) -> anyhow::Result<Vec<PoolDoc>> {
@@ -66,6 +82,7 @@ impl Repo {
         let filter = doc! {
             "pool_type": "pump_fun",
             "ata_status": "confirmed",
+            "disabled": { "$ne": true },
             "$or": [
                 { "is_unique": true },
                 { "pair_created_at_ms": { "$gt": stale_cutoff_ms } },

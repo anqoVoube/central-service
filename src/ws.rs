@@ -8,7 +8,7 @@ use axum::{
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
@@ -153,6 +153,14 @@ pub enum ServerMsg {
         #[serde(default)]
         process_us: u32,
     },
+    /// Broadcast after the dashboard bans a pool (`POST /ban`). Every
+    /// location drops the pool from its in-memory `Pools` + prebuild
+    /// store, so it stops trading immediately. Mongo's `disabled` flag
+    /// keeps it out of future inits. Serializes as
+    /// `{"type":"pool_disabled","pool":"<pubkey>"}`.
+    PoolDisabled {
+        pool: String,
+    },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
@@ -233,6 +241,7 @@ pub async fn serve(
         .route("/sig/:sig", get(serve_sig_search))
         .route("/time/:time", get(serve_time_search))
         .route("/block-detail/:opp_sig", get(serve_block_detail))
+        .route("/ban", post(serve_ban_pool))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -317,6 +326,42 @@ async fn serve_alts_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build alts body")
+}
+
+#[derive(Deserialize)]
+struct BanPoolReq {
+    pool: String,
+}
+
+/// Permanently ban a pool. Triggered by the dashboard BAN button (relayed
+/// to this endpoint). Sets Mongo `disabled: true` then broadcasts
+/// `pool_disabled` so every connected bot drops it from its in-memory
+/// `Pools` immediately. IP-whitelisted — same list as the WS upgrade.
+async fn serve_ban_pool(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<BanPoolReq>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /ban from non-whitelisted ip {ip}");
+        println!("[whitelist] reject POST /ban from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let pool = req.pool.trim().to_owned();
+    if pool.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing pool").into_response();
+    }
+    if let Err(e) = state.repo.set_pool_disabled(&pool).await {
+        tracing::error!("set_pool_disabled({pool}) failed: {e:#}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "mongo update failed").into_response();
+    }
+    // Broadcast to every connected bot. `send` errs only when there are
+    // no live receivers — harmless (the Mongo flag still keeps it out of
+    // future inits).
+    let _ = state.tx.send(ServerMsg::PoolDisabled { pool: pool.clone() });
+    println!("[ban] pool={pool} disabled + broadcast");
+    (StatusCode::OK, "banned").into_response()
 }
 
 /// Wholesale ban-list snapshot for bot startup. Bots fetch once, then receive
@@ -724,6 +769,11 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
     let pools: Vec<PoolDoc> = pools
         .into_iter()
         .filter(|p| {
+            // Banned pools are never shipped (defensive — load_all_confirmed
+            // already excludes them, but guard here too).
+            if p.disabled {
+                return false;
+            }
             if p.is_unique {
                 return true;
             }

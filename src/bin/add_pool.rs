@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         compute_unit_limit: None,
         cu_measured_at: None,
         is_unique,
+        disabled: false,
     };
 
     pools_coll
