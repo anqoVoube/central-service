@@ -80,6 +80,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.block_details_db_path.display()
     );
 
+    let tip_priority =
+        central_service::tip_priority::TipPriorityStore::open(
+            &cfg.tip_priority_db_path,
+            broadcast_tx.clone(),
+        )?;
+    tracing::info!(
+        "tip_priority db opened at {}",
+        cfg.tip_priority_db_path.display()
+    );
+
     {
         let repo = Arc::clone(&repo);
         let tx = broadcast_tx.clone();
@@ -133,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         lanes,
         leaders,
         block_details,
+        tip_priority,
     )
     .await
 }

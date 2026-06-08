@@ -18,5 +18,6 @@ pub mod poll;
 pub mod pool;
 pub mod positions;
 pub mod swap_pump_fun;
+pub mod tip_priority;
 pub mod validators;
 pub mod ws;

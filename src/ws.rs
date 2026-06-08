@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::{IpAddr, SocketAddr}, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, net::{IpAddr, SocketAddr}, path::PathBuf, str::FromStr, sync::Arc};
 
 use axum::{
     body::Body,
@@ -111,6 +111,14 @@ pub enum ServerMsg {
         banned_until_ms: u64,
         reason: String,
     },
+    /// Broadcast after an operator flips a validator's tip-priority status
+    /// via the dashboard CHANGE button. Locations update their in-memory
+    /// `Arc<ArcSwap<HashSet<Pubkey>>>` and rebuild the leader-schedule
+    /// bitmap so subsequent fires use the new routing.
+    TipPriorityChanged {
+        pubkey: String,
+        is_priority: bool,
+    },
     /// Late-arriving leader info for a `position_opened` whose leader RPC
     /// took longer than the bot's open→close cycle (or any time after the
     /// open). Bots merge this into the matching `central_positions` entry
@@ -202,6 +210,7 @@ struct AppState {
     lanes: LaneStore,
     leaders: LeaderStore,
     block_details: BlockDetailStore,
+    tip_priority: crate::tip_priority::TipPriorityStore,
 }
 
 pub async fn serve(
@@ -217,6 +226,7 @@ pub async fn serve(
     lanes: LaneStore,
     leaders: LeaderStore,
     block_details: BlockDetailStore,
+    tip_priority: crate::tip_priority::TipPriorityStore,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -230,6 +240,7 @@ pub async fn serve(
         lanes,
         leaders,
         block_details,
+        tip_priority,
     };
     let app = Router::new()
         .route("/", get(serve_sig_ui))
@@ -243,6 +254,8 @@ pub async fn serve(
         .route("/block-detail/:opp_sig", get(serve_block_detail))
         .route("/ban", post(serve_ban_pool))
         .route("/banned", get(serve_banned_pools))
+        .route("/tip-priority", post(serve_tip_priority_set))
+        .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -363,6 +376,79 @@ async fn serve_ban_pool(
     let _ = state.tx.send(ServerMsg::PoolDisabled { pool: pool.clone() });
     println!("[ban] pool={pool} disabled + broadcast");
     (StatusCode::OK, "banned").into_response()
+}
+
+#[derive(Deserialize)]
+struct TipPrioritySetReq {
+    pubkey: String,
+    /// "tip_priority" or "default"
+    status: String,
+}
+
+/// Flip a validator's tip-priority status. Dashboard's CHANGE button
+/// relays here. Persists to sled + broadcasts `TipPriorityChanged` so
+/// every connected bot updates immediately. IP-whitelisted.
+async fn serve_tip_priority_set(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<TipPrioritySetReq>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /tip-priority from non-whitelisted ip {ip}");
+        println!("[whitelist] reject POST /tip-priority from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let pk = match solana_sdk::pubkey::Pubkey::from_str(req.pubkey.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid pubkey: {e}"))
+                .into_response();
+        }
+    };
+    let is_priority = match req.status.trim() {
+        "tip_priority" => true,
+        "default" => false,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("status must be \"tip_priority\" or \"default\", got {other:?}"),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = state.tip_priority.set(pk, is_priority) {
+        tracing::error!("tip_priority.set({pk}, {is_priority}) failed: {e:#}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "sled write failed")
+            .into_response();
+    }
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// Bincode `Vec<Pubkey>` snapshot of the current tip-priority set.
+/// Bots fetch at startup + on WS reconnect to refresh in-memory state.
+async fn serve_tip_priority_snapshot(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting tip-priority.bin from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /tip-priority.bin from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let bytes = match state.tip_priority.snapshot_bincode() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("tip-priority snapshot build failed: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed")
+                .into_response();
+        }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes))
+        .expect("build tip-priority body")
 }
 
 /// JSON array of currently-banned pool pubkeys. The dashboard fetches
