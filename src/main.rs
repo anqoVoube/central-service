@@ -4,8 +4,8 @@ use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::broadcast;
 
 use central_service::{
-    alts, ata, backfill, bans, block_detail, config, discover, lanes, leaders, mongo, poll, pool,
-    positions, validators, ws,
+    alts, ata, backfill, bans, block_detail, config, discover, fee_config, lanes, leaders, mongo,
+    poll, pool, positions, validators, ws,
 };
 
 #[tokio::main]
@@ -90,6 +90,15 @@ async fn main() -> anyhow::Result<()> {
         cfg.tip_priority_db_path.display()
     );
 
+    let fee_config_store = fee_config::FeeConfigStore::open(
+        &cfg.fee_config_db_path,
+        broadcast_tx.clone(),
+    )?;
+    tracing::info!(
+        "fee_config db opened at {}",
+        cfg.fee_config_db_path.display()
+    );
+
     {
         let repo = Arc::clone(&repo);
         let tx = broadcast_tx.clone();
@@ -144,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         leaders,
         block_details,
         tip_priority,
+        fee_config_store,
     )
     .await
 }
