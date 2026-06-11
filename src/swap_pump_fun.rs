@@ -228,3 +228,95 @@ pub fn build_pump_fun_buy_ix(
         data,
     }
 }
+
+// =============================================================================
+// BuyExactIn (exact-input) ix builder
+// =============================================================================
+
+/// Build a PumpFun pAMM `BuyExactQuoteIn` ix. Mirrors `build_pump_fun_buy_ix`'s
+/// signature for drop-in callsites; differs only in the ix `data` layout:
+///   * disc = `PUMP_FUN_PREFIX_BUY_EXACT_IN`
+///   * `quote_amount_in` = exact SOL the program is allowed to debit
+///     (no slippage cap on the input side)
+///   * `min_base_amount_out` = constant-product output × (1 - slippage_bps)
+///     — slippage floor on tokens received
+///
+/// CU consumption is ~3k higher than the ordinary `Buy` op (per the
+/// upstream-code note at `PUMP_FUN_PREFIX_BUY`'s doc-comment). Use this
+/// builder when the caller wants exact-SOL-in semantics (e.g. CU
+/// measurement against a fixed input size); use `build_pump_fun_buy_ix`
+/// when the dump-trigger path wants `max_quote_amount_in` to act as the
+/// fake-dump revert gate.
+#[allow(clippy::too_many_arguments)]
+pub fn build_pump_fun_buy_exact_in_ix(
+    pool_pk: &Pubkey,
+    base_mint: &Pubkey,
+    pool_base_token_account: &Pubkey,
+    pool_quote_token_account: &Pubkey,
+    coin_creator: &Pubkey,
+    owner_program: &Pubkey,    // base mint's token program (Token vs Token-2022)
+    is_cashback: bool,
+    base_reserves: u64,
+    quote_reserves: u64,
+    wallet_pk: &Pubkey,
+    wallet_wsol_ata: &Pubkey,
+    wallet_token_ata: &Pubkey,
+    static_pdas: &PumpStaticPdas,
+    sol_in: u64,
+    slippage_bps: u32,
+) -> Instruction {
+    let base_amount_out = constant_product_out(sol_in, quote_reserves, base_reserves);
+    let min_base_amount_out = apply_slippage_floor(base_amount_out, slippage_bps);
+
+    let (coin_creator_vault_authority, coin_creator_vault_ata) = creator_vault(coin_creator);
+    let pool_v2 = pool_v2_pda(base_mint);
+
+    let pump = pump_fun_pk();
+    let mut accounts = vec![
+        AccountMeta::new(*pool_pk, false),
+        AccountMeta::new(*wallet_pk, true),
+        AccountMeta::new_readonly(pump_global_config_pk(), false),
+        AccountMeta::new_readonly(*base_mint, false),
+        AccountMeta::new_readonly(wsol_pk(), false),
+        AccountMeta::new(*wallet_token_ata, false),
+        AccountMeta::new(*wallet_wsol_ata, false),
+        AccountMeta::new(*pool_base_token_account, false),
+        AccountMeta::new(*pool_quote_token_account, false),
+        AccountMeta::new_readonly(pump_protocol_fee_recipient_pk(), false),
+        AccountMeta::new(static_pdas.protocol_fee_recipient_ata, false),
+        AccountMeta::new_readonly(*owner_program, false),
+        AccountMeta::new_readonly(token_program_pk(), false),
+        AccountMeta::new_readonly(system_program_pk(), false),
+        AccountMeta::new_readonly(ata_program_pk(), false),
+        AccountMeta::new_readonly(static_pdas.event_authority, false),
+        AccountMeta::new_readonly(pump, false),
+        AccountMeta::new(coin_creator_vault_ata, false),
+        AccountMeta::new_readonly(coin_creator_vault_authority, false),
+        AccountMeta::new(static_pdas.global_volume_accumulator, false),
+        AccountMeta::new(static_pdas.user_volume_accumulator, false),
+        AccountMeta::new_readonly(static_pdas.fee_config, false),
+        AccountMeta::new_readonly(pump_fee_program_pk(), false),
+    ];
+    if is_cashback {
+        accounts.push(AccountMeta::new(
+            static_pdas.user_volume_accumulator_wsol_ata,
+            false,
+        ));
+    }
+    accounts.push(AccountMeta::new_readonly(pool_v2, false));
+    accounts.push(AccountMeta::new_readonly(static_pdas.amm_fee_recipient, false));
+    accounts.push(AccountMeta::new(static_pdas.amm_fee_recipient_wsol_ata, false));
+
+    // data = [disc(8), quote_amount_in(8), min_base_amount_out(8), track_volume=Some(true)]
+    let mut data = Vec::with_capacity(26);
+    data.extend_from_slice(&PUMP_FUN_PREFIX_BUY_EXACT_IN);
+    data.extend_from_slice(&sol_in.to_le_bytes());
+    data.extend_from_slice(&min_base_amount_out.to_le_bytes());
+    data.push(1); // OptionBool::Some
+    data.push(1); // true (track_volume)
+    Instruction {
+        program_id: pump,
+        accounts,
+        data,
+    }
+}

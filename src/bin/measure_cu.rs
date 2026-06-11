@@ -13,10 +13,10 @@
 //!   TX1 — buy, signed by `wallet_kp`, durable nonce:
 //!     ix[0] advance_nonce_account
 //!     ix[1] set_compute_unit_limit(400_000)             ← high ceiling
-//!     ix[2] set_compute_unit_price(1_000_000)           ← ~$0.04 priority
+//!     ix[2] set_compute_unit_price(10_000)              ← ~$0.0004 priority
 //!     ix[3] set_loaded_accounts_data_size_limit(13_500_000)
-//!     ix[4] swap_buy_ix                                 ← 0.0001 SOL in
-//!     ix[5] system::transfer(0.001 SOL → rotating Jito tip account)
+//!     ix[4] BuyExactQuoteIn swap_buy_ix                 ← 0.0001 SOL in
+//!     ix[5] system::transfer(0.0001 SOL → rotating Jito tip account)
 //!
 //! With `--rpc` the same tx is sent via standard `sendTransaction`.
 //!
@@ -56,7 +56,7 @@ use central_service::{
     mongo::Repo,
     pool::PoolAccounts,
     swap_pump_fun::{
-        build_pump_fun_buy_ix, system_program_pk, wsol_pk, PumpStaticPdas, find_ata,
+        build_pump_fun_buy_exact_in_ix, system_program_pk, wsol_pk, PumpStaticPdas, find_ata,
         token_program_pk,
     },
 };
@@ -68,7 +68,7 @@ const SVRECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111"
 /// Recipient of the 0.002 SOL transfer embedded in TX1. Sits in the slot
 /// the prior Jito tip used; replacing the tip moves auction-eligibility
 /// to TX2 (whose transfer goes to a real Jito tip account).
-const BUNDLE_TIP_LAMPORTS: u64 = 1_000_000;        // 0.001 SOL — direct in-tx Jito tip
+const BUNDLE_TIP_LAMPORTS: u64 = 100_000;          // 0.0001 SOL — direct in-tx Jito tip
 /// Jito tip accounts (8 published pubkeys, random pick per send). All
 /// tips on Jito's sendBundle path MUST go to one of these to be
 /// auction-eligible. See <https://docs.jito.wtf/lowlatencytxnsend/>.
@@ -89,7 +89,7 @@ const JITO_BUNDLE_URL: &str =
     "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
 const SWAP_IN_LAMPORTS: u64 = 121_335;             // 0.0001213357 SOL — 10× smaller per ask
 const CU_LIMIT_CEILING: u32 = 400_000;             // high enough to never bite
-const CU_PRICE: u64 = 1_000_000;                   // microlamports/CU → ~$0.04 priority
+const CU_PRICE: u64 = 10_000;                      // microlamports/CU — ~$0.0004 priority at 400k CU
 const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;    // matches bot's prod constant
 const SLIPPAGE_BPS: u32 = 5_000;                   // 50% — generous, we just want it to land
 
@@ -346,8 +346,11 @@ async fn measure_one(
     let quote_reserves =
         u64::from_le_bytes(quote_vault_acct.data[64..72].try_into().unwrap());
 
-    // 3. Build the swap ix matching the bot's prod layout.
-    let mut swap_ix = build_pump_fun_buy_ix(
+    // 3. Build the swap ix using the BuyExactQuoteIn discriminator
+    //    (exact SOL in, slippage floor on tokens out). Matches the bot's
+    //    prebuilt-rung shape, which always uses BuyExactIn; CU measured
+    //    here is what the bot's hot path actually pays at fire time.
+    let mut swap_ix = build_pump_fun_buy_exact_in_ix(
         &pool_pk,
         &base_mint,
         &pool_base_vault,
