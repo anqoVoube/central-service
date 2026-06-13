@@ -28,7 +28,7 @@ use crate::ws::ServerMsg;
 const FEE_CONFIG_TREE: &str = "fee_config";
 const FEE_CONFIG_KEY: &[u8] = b"current";
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeeBucket {
     /// Upper bound (EXCLUSIVE) of this bucket in lamports. `fee_bps`
     /// applies when `quote_amount_in < max_sol_lamports`. Exclusive
@@ -40,11 +40,16 @@ pub struct FeeBucket {
     pub fee_bps: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FeeConfig {
     /// Sorted ascending by `max_sol_lamports`. Lookup is linear (fixed
     /// at ~5 entries per operator spec).
     pub fee_table: Vec<FeeBucket>,
+    /// Minimum liquidity-dump fraction we act on (0..1). Mirrors the
+    /// bot's `MIN_LIQ_DUMP` const that was hardcoded at client.rs.
+    /// Default seeds at 0.05 (5%). Operator edits via the dashboard's
+    /// /config page; bot reads via `FEE_CONFIG_HANDLE.load()`.
+    pub min_liq_dump_pct: f64,
 }
 
 /// Defaults seeded into sled on first boot. Mirrors what the bot's
@@ -59,6 +64,7 @@ pub fn default_fee_config() -> FeeConfig {
             FeeBucket { max_sol_lamports: 10_000_000_000, fee_bps: 200 },
             FeeBucket { max_sol_lamports: 20_000_000_000, fee_bps: 300 },
         ],
+        min_liq_dump_pct: 0.05,
     }
 }
 
@@ -87,6 +93,15 @@ fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
             );
         }
         prev = b.max_sol_lamports;
+    }
+    if !cfg.min_liq_dump_pct.is_finite() {
+        anyhow::bail!("min_liq_dump_pct must be finite");
+    }
+    if cfg.min_liq_dump_pct <= 0.0 || cfg.min_liq_dump_pct >= 0.5 {
+        anyhow::bail!(
+            "min_liq_dump_pct = {} must be in (0, 0.5) — 0 disables, 0.5+ would clamp every gate",
+            cfg.min_liq_dump_pct
+        );
     }
     Ok(())
 }
