@@ -119,13 +119,6 @@ pub enum ServerMsg {
         pubkey: String,
         is_priority: bool,
     },
-    /// Broadcast after an operator edits the buy-side fee table via the
-    /// dashboard `/config` page. Locations replace their in-memory
-    /// `Arc<ArcSwap<FeeConfig>>` and signal a full prebuild rebuild so
-    /// the next dispatch fires rungs with the new fee budget baked in.
-    FeeConfigChanged {
-        config: crate::fee_config::FeeConfig,
-    },
     /// Late-arriving leader info for a `position_opened` whose leader RPC
     /// took longer than the bot's open→close cycle (or any time after the
     /// open). Bots merge this into the matching `central_positions` entry
@@ -218,7 +211,7 @@ struct AppState {
     leaders: LeaderStore,
     block_details: BlockDetailStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
-    fee_config: crate::fee_config::FeeConfigStore,
+    fee_config_file: crate::fee_config::FeeConfigFile,
 }
 
 pub async fn serve(
@@ -235,7 +228,7 @@ pub async fn serve(
     leaders: LeaderStore,
     block_details: BlockDetailStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
-    fee_config: crate::fee_config::FeeConfigStore,
+    fee_config_file: crate::fee_config::FeeConfigFile,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -250,7 +243,7 @@ pub async fn serve(
         leaders,
         block_details,
         tip_priority,
-        fee_config,
+        fee_config_file,
     };
     let app = Router::new()
         .route("/", get(serve_sig_ui))
@@ -266,8 +259,7 @@ pub async fn serve(
         .route("/banned", get(serve_banned_pools))
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
-        .route("/fee-config", post(serve_fee_config_set))
-        .route("/fee-config.bin", get(serve_fee_config_snapshot))
+        .route("/fee-config.json", get(serve_fee_config_json))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -463,52 +455,34 @@ async fn serve_tip_priority_snapshot(
         .expect("build tip-priority body")
 }
 
-/// Replace the current buy-side fee table. Dashboard's `/config` page
-/// relays here. Persists to sled + broadcasts `FeeConfigChanged` so every
-/// connected bot updates its `FEE_CONFIG_HANDLE` and signals a prebuild
-/// rebuild. IP-whitelisted.
-async fn serve_fee_config_set(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Json(cfg): Json<crate::fee_config::FeeConfig>,
-) -> Response {
-    if !state.whitelist.contains(&addr.ip()) {
-        let ip = addr.ip();
-        tracing::warn!("rejecting POST /fee-config from non-whitelisted ip {ip}");
-        println!("[whitelist] reject POST /fee-config from {ip}");
-        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
-    }
-    if let Err(e) = state.fee_config.set(cfg) {
-        tracing::error!("fee_config.set failed: {e:#}");
-        return (StatusCode::BAD_REQUEST, format!("invalid fee_config: {e}")).into_response();
-    }
-    (StatusCode::OK, "ok").into_response()
-}
-
-/// Bincode `FeeConfig` snapshot of the current fee table. Bots fetch
-/// at startup + on WS reconnect to refresh in-memory state.
-async fn serve_fee_config_snapshot(
+/// Serve the fee-config JSON file. Bots fetch this once at startup
+/// and treat the result as static — there's no broadcast / re-fetch
+/// mechanism. To roll out an edit: change the file on central, then
+/// `systemctl restart bot` on every location. IP-whitelisted (same
+/// list as `/alts.bin`, `/positions.jsonl`, etc.).
+async fn serve_fee_config_json(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> Response {
     if !state.whitelist.contains(&addr.ip()) {
         let ip = addr.ip();
-        tracing::warn!("rejecting fee-config.bin from non-whitelisted ip {ip}");
-        println!("[whitelist] reject GET /fee-config.bin from {ip}");
+        tracing::warn!("rejecting fee-config.json from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /fee-config.json from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
-    let bytes = match state.fee_config.snapshot_bincode() {
-        Ok(b) => b,
+    match state.fee_config_file.read_bytes() {
+        Ok(bytes) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .body(Body::from(bytes))
+            .expect("build fee-config response"),
         Err(e) => {
-            tracing::error!("fee-config snapshot build failed: {e:#}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed")
-                .into_response();
+            tracing::error!(
+                "fee-config read failed (path={:?}): {e}",
+                state.fee_config_file.path()
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, "fee-config read failed").into_response()
         }
-    };
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(bytes))
-        .expect("build fee-config body")
+    }
 }
 
 /// JSON array of currently-banned pool pubkeys. The dashboard fetches

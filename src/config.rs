@@ -23,7 +23,10 @@ pub struct Config {
     pub leaders_db_path: PathBuf,
     pub block_details_db_path: PathBuf,
     pub tip_priority_db_path: PathBuf,
-    pub fee_config_db_path: PathBuf,
+    /// Path to the fee-config JSON file that central auto-seeds on
+    /// startup and serves to bots via `GET /fee-config.json`. Defaults
+    /// to `./fee_config.json`.
+    pub fee_config_path: PathBuf,
     /// URL of the Solana validators CSV. Defaults to the iGroza upstream
     /// repo's raw file; override with `VALIDATORS_CSV_URL` to pin a mirror.
     pub validators_csv_url: String,
@@ -75,8 +78,8 @@ impl Config {
         let tip_priority_db_path = std::env::var("TIP_PRIORITY_DB_PATH")
             .unwrap_or_else(|_| "tip_priority.db".into())
             .into();
-        let fee_config_db_path = std::env::var("FEE_CONFIG_DB_PATH")
-            .unwrap_or_else(|_| "fee_config.db".into())
+        let fee_config_path = std::env::var("FEE_CONFIG_PATH")
+            .unwrap_or_else(|_| "fee_config.json".into())
             .into();
         let validators_csv_url = std::env::var("VALIDATORS_CSV_URL").unwrap_or_else(|_| {
             "https://raw.githubusercontent.com/iGroza/Solana-Validator-IP-Geolocation/main/solana_validators.csv".into()
@@ -96,7 +99,7 @@ impl Config {
             leaders_db_path,
             block_details_db_path,
             tip_priority_db_path,
-            fee_config_db_path,
+            fee_config_path,
             validators_csv_url,
         })
     }

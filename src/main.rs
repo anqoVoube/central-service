@@ -90,14 +90,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.tip_priority_db_path.display()
     );
 
-    let fee_config_store = fee_config::FeeConfigStore::open(
-        &cfg.fee_config_db_path,
-        broadcast_tx.clone(),
-    )?;
-    tracing::info!(
-        "fee_config db opened at {}",
-        cfg.fee_config_db_path.display()
-    );
+    let fee_config_file = fee_config::FeeConfigFile::open(&cfg.fee_config_path)?;
 
     {
         let repo = Arc::clone(&repo);
@@ -153,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         leaders,
         block_details,
         tip_priority,
-        fee_config_store,
+        fee_config_file,
     )
     .await
 }
