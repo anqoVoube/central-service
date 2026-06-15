@@ -50,41 +50,44 @@ pub struct FeeConfig {
     /// Default seeds at 0.05 (5%). Operator edits via the dashboard's
     /// /config page; bot reads via `FEE_CONFIG_HANDLE.load()`.
     pub min_liq_dump_pct: f64,
-    /// Dynamic per-sender tunings for Jito + Harmonic. Each carries a
-    /// budget multiplier and up to 2 slot definitions; each slot may
-    /// fire on default leaders, TP leaders, both, or neither (via
-    /// `Option<FeeTipSplit>`). Other senders (helius_rpc / jet /
-    /// paid / band-1) stay compile-time; their TP routing flows through
-    /// the static `TIP_PRIORITY_VARIANTS`.
-    pub jito: SenderTuning,
-    pub harmonic: SenderTuning,
+    /// Dynamic fire profiles for Jito + Harmonic. Both senders share
+    /// the same profiles — when a dump's slot leader is TP, both fire
+    /// every variation in `tp`; otherwise both fire every variation
+    /// in `def`. Other senders (helius_rpc / jet / paid / band-1) stay
+    /// compile-time.
+    pub fire_profiles: FireProfiles,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SenderTuning {
+pub struct FireProfiles {
     /// Budget multiplier × 10. `30` = ×3.0. Replaces the prior
-    /// hard-coded `budget_tenths` constant for Jito + Harmonic (was
-    /// `20` = ×2.0).
+    /// hard-coded `budget_tenths = 20` for Jito + Harmonic. Applies
+    /// to BOTH `tp` and `def` profiles.
     pub multiplier_x10: u32,
-    /// Up to 2 slot definitions. Each slot = up to 2 pre-baked txs (one
-    /// for default leaders, one for TP). Missing entries (None) skip
-    /// that slot on that leader class. Worker pool spawns a fixed 2
-    /// tokio tasks per fire for these senders; tasks for None slots
-    /// no-op.
-    pub slots: Vec<SlotTuning>,
-    /// Per-tx ceiling on `fee + tip` in lamports. `None` → fall back to
-    /// the bot's compile-time `HARMONIC_JITO_TOTAL_LAMPORTS_PER_TX`
-    /// const (~$33 at SOL=$66). `Some(n)` → use `n` directly. Acts as
-    /// the sum cap inside `dynamic_split_for_slot`; raising it lets a
-    /// 30/200 split scale up before the proportional clamp kicks in.
+    /// Per-tx ceiling on `fee + tip` in lamports. `None` → bot falls
+    /// back to its compile-time `HARMONIC_JITO_TOTAL_LAMPORTS_PER_TX`
+    /// const (~$33 at SOL=$66). Acts as the sum cap inside
+    /// `dynamic_split_for_slot`; raising it lets a 30/200 split scale
+    /// up before the proportional clamp kicks in.
     #[serde(default)]
     pub per_tx_cap_lamports: Option<u64>,
+    /// TP-leader profile — fires when the dump's leader is in the
+    /// tip-priority validator set.
+    pub tp: ProfileVariations,
+    /// Default profile — fires on all other leaders.
+    pub def: ProfileVariations,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SlotTuning {
-    pub default: Option<FeeTipSplit>,
-    pub tp_leader: Option<FeeTipSplit>,
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileVariations {
+    /// Operator-defined (fee%, tip%) variations. Each entry = one
+    /// pre-baked tx fired per sender per dump. Dynamic count, capped at
+    /// `MAX_DYNAMIC_SLOTS - 1` (one slot reserved for the FeeOnly
+    /// variation when `fee_only = true`).
+    pub splits: Vec<FeeTipSplit>,
+    /// When true, an additional FeeOnly (100% fee, 0% tip) variation
+    /// is appended to `splits` at prebuild time.
+    pub fee_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,28 +98,15 @@ pub struct FeeTipSplit {
     pub tip_pct: u32,
 }
 
+/// Maximum number of dynamic slots per sender. Used both as the
+/// validator's upper bound and as the bot's `VARIANTS_DYNAMIC` slice
+/// size. `splits.len() + (fee_only ? 1 : 0) ≤ MAX_DYNAMIC_SLOTS`.
+pub const MAX_DYNAMIC_SLOTS: usize = 8;
+
 /// Defaults seeded into sled on first boot. Mirrors what the bot's
 /// `statics::default_fee_config()` returns — keep these in sync. Sled is
 /// authoritative once populated; this is only the bootstrap.
 pub fn default_fee_config() -> FeeConfig {
-    let jito_harmonic = SenderTuning {
-        multiplier_x10: 30,
-        slots: vec![
-            // Slot 0 — default: FeeOnly (100% fee, 0% tip). TP: off.
-            SlotTuning {
-                default: Some(FeeTipSplit { fee_pct: 100, tip_pct: 0 }),
-                tp_leader: None,
-            },
-            // Slot 1 — default: Fee100Tip200; TP: Fee30Tip200.
-            SlotTuning {
-                default: Some(FeeTipSplit { fee_pct: 100, tip_pct: 200 }),
-                tp_leader: Some(FeeTipSplit { fee_pct: 30, tip_pct: 200 }),
-            },
-        ],
-        // None → bot falls back to HARMONIC_JITO_TOTAL_LAMPORTS_PER_TX
-        // (~$33). Operator can override per-sender via the dashboard.
-        per_tx_cap_lamports: None,
-    };
     FeeConfig {
         fee_table: vec![
             FeeBucket { max_sol_lamports: 3_000_000_000, fee_bps: 100 },
@@ -126,8 +116,28 @@ pub fn default_fee_config() -> FeeConfig {
             FeeBucket { max_sol_lamports: 20_000_000_000, fee_bps: 300 },
         ],
         min_liq_dump_pct: 0.05,
-        jito: jito_harmonic.clone(),
-        harmonic: jito_harmonic,
+        fire_profiles: FireProfiles {
+            multiplier_x10: 30,
+            per_tx_cap_lamports: None,
+            tp: ProfileVariations {
+                // Per operator default: TP profile = [80/20, 0/100],
+                // fee_only disabled.
+                splits: vec![
+                    FeeTipSplit { fee_pct: 80, tip_pct: 20 },
+                    FeeTipSplit { fee_pct: 0, tip_pct: 100 },
+                ],
+                fee_only: false,
+            },
+            def: ProfileVariations {
+                // Per operator default: DEF profile = [20/80, 80/20],
+                // fee_only enabled.
+                splits: vec![
+                    FeeTipSplit { fee_pct: 20, tip_pct: 80 },
+                    FeeTipSplit { fee_pct: 80, tip_pct: 20 },
+                ],
+                fee_only: true,
+            },
+        },
     }
 }
 
@@ -166,57 +176,64 @@ fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
             cfg.min_liq_dump_pct
         );
     }
-    validate_sender_tuning("jito", &cfg.jito)?;
-    validate_sender_tuning("harmonic", &cfg.harmonic)?;
+    validate_fire_profiles(&cfg.fire_profiles)?;
     Ok(())
 }
 
-/// Per-sender tuning sanity. Multiplier in [×0.1, ×10.0]; up to 2 slots;
-/// each split's fee_pct ≤ 500 (5×), tip_pct ≤ 500. Total per-slot
-/// (fee+tip) up to 1000 — the sum cap downstream still clamps the
-/// landed cost in lamports.
-fn validate_sender_tuning(label: &str, t: &SenderTuning) -> anyhow::Result<()> {
-    if t.multiplier_x10 == 0 || t.multiplier_x10 > 100 {
+fn validate_fire_profiles(fp: &FireProfiles) -> anyhow::Result<()> {
+    if fp.multiplier_x10 == 0 || fp.multiplier_x10 > 100 {
         anyhow::bail!(
-            "{label}.multiplier_x10 = {} must be in (0, 100]",
-            t.multiplier_x10
+            "fire_profiles.multiplier_x10 = {} must be in (0, 100]",
+            fp.multiplier_x10
         );
     }
-    if t.slots.is_empty() || t.slots.len() > 2 {
-        anyhow::bail!("{label}.slots must have 1 or 2 entries (got {})", t.slots.len());
-    }
-    for (i, slot) in t.slots.iter().enumerate() {
-        for (which, split) in [("default", slot.default), ("tp_leader", slot.tp_leader)] {
-            if let Some(s) = split {
-                if s.fee_pct > 500 || s.tip_pct > 500 {
-                    anyhow::bail!(
-                        "{label}.slots[{i}].{which}: fee_pct/tip_pct ≤ 500 (got fee={} tip={})",
-                        s.fee_pct,
-                        s.tip_pct
-                    );
-                }
-                if s.fee_pct == 0 && s.tip_pct == 0 {
-                    anyhow::bail!(
-                        "{label}.slots[{i}].{which}: fee_pct and tip_pct both 0 — use None to skip"
-                    );
-                }
-            }
-        }
-        if slot.default.is_none() && slot.tp_leader.is_none() {
-            anyhow::bail!(
-                "{label}.slots[{i}]: both default and tp_leader are None — remove the slot"
-            );
-        }
-    }
-    // Per-tx cap bound: 0 disables (we'd never fire); >5_000_000_000
-    // (5 SOL ≈ $330 at SOL=$66) is almost certainly a typo.
-    if let Some(cap) = t.per_tx_cap_lamports {
+    if let Some(cap) = fp.per_tx_cap_lamports {
         if cap == 0 {
-            anyhow::bail!("{label}.per_tx_cap_lamports = 0 — would gate every fire");
+            anyhow::bail!("fire_profiles.per_tx_cap_lamports = 0 — would gate every fire");
         }
         if cap > 5_000_000_000 {
             anyhow::bail!(
-                "{label}.per_tx_cap_lamports = {cap} lamports (>5 SOL) looks like a typo"
+                "fire_profiles.per_tx_cap_lamports = {cap} lamports (>5 SOL) looks like a typo"
+            );
+        }
+    }
+    validate_variations("fire_profiles.tp", &fp.tp)?;
+    validate_variations("fire_profiles.def", &fp.def)?;
+    // At least ONE leader class must have at least one variation that
+    // actually fires (splits or fee_only). Otherwise Jito + Harmonic
+    // become silent.
+    let tp_count = fp.tp.splits.len() + (fp.tp.fee_only as usize);
+    let def_count = fp.def.splits.len() + (fp.def.fee_only as usize);
+    if tp_count == 0 && def_count == 0 {
+        anyhow::bail!(
+            "fire_profiles: both tp and def have zero variations — Jito + Harmonic would be silent"
+        );
+    }
+    Ok(())
+}
+
+fn validate_variations(label: &str, p: &ProfileVariations) -> anyhow::Result<()> {
+    // Reserve one slot for fee_only when enabled.
+    let max_splits = MAX_DYNAMIC_SLOTS - (p.fee_only as usize);
+    if p.splits.len() > max_splits {
+        anyhow::bail!(
+            "{label}.splits has {} entries — max {} when fee_only={}",
+            p.splits.len(),
+            max_splits,
+            p.fee_only
+        );
+    }
+    for (i, s) in p.splits.iter().enumerate() {
+        if s.fee_pct > 500 || s.tip_pct > 500 {
+            anyhow::bail!(
+                "{label}.splits[{i}]: fee_pct/tip_pct ≤ 500 (got fee={} tip={})",
+                s.fee_pct,
+                s.tip_pct
+            );
+        }
+        if s.fee_pct == 0 && s.tip_pct == 0 {
+            anyhow::bail!(
+                "{label}.splits[{i}]: fee_pct and tip_pct both 0 — remove the entry instead"
             );
         }
     }
