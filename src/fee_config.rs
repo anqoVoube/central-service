@@ -7,6 +7,7 @@
 
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -138,5 +139,40 @@ impl FeeConfigFile {
     /// staleness during a save is bounded to the next bot restart.
     pub fn read_bytes(&self) -> std::io::Result<Vec<u8>> {
         fs::read(&self.path)
+    }
+
+    /// Atomically replace the config file. Writes to `<path>.tmp` first,
+    /// fsyncs, then renames over the original. A central kill mid-write
+    /// leaves the original file intact (the rename is atomic on POSIX
+    /// filesystems). Used by `POST /fee-config.json`.
+    pub fn write_atomic(&self, cfg: &FeeConfig) -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(cfg)
+            .context("serialize fee_config")?;
+        let tmp = self.path.with_extension("json.tmp");
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("create tmp {tmp:?}"))?;
+            f.write_all(json.as_bytes())
+                .with_context(|| format!("write tmp {tmp:?}"))?;
+            // sync_all on the file forces the data to disk before we
+            // rename — without it, a kernel crash could leave the new
+            // file empty while the rename succeeded.
+            f.sync_all().with_context(|| format!("sync tmp {tmp:?}"))?;
+        }
+        fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {tmp:?} -> {:?}", self.path))?;
+        // Best-effort sync the parent dir so the rename itself is
+        // durable across power loss. Ignore errors — not all FS
+        // (notably tmpfs) support fsync on a directory.
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     }
 }

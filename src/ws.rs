@@ -119,6 +119,13 @@ pub enum ServerMsg {
         pubkey: String,
         is_priority: bool,
     },
+    /// Broadcast after operator POSTs new fee config to
+    /// `/fee-config.json`. Each connected bot logs and calls
+    /// `std::process::exit(0)` so systemd auto-restarts it with the
+    /// fresh config. No payload — the file is the source of truth and
+    /// the bot re-fetches it on its next startup. Serializes as
+    /// `{"type":"fee_config_reload"}`.
+    FeeConfigReload,
     /// Late-arriving leader info for a `position_opened` whose leader RPC
     /// took longer than the bot's open→close cycle (or any time after the
     /// open). Bots merge this into the matching `central_positions` entry
@@ -259,7 +266,10 @@ pub async fn serve(
         .route("/banned", get(serve_banned_pools))
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
-        .route("/fee-config.json", get(serve_fee_config_json))
+        .route(
+            "/fee-config.json",
+            get(serve_fee_config_json).post(serve_fee_config_set),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -453,6 +463,40 @@ async fn serve_tip_priority_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build tip-priority body")
+}
+
+/// Replace the fee-config JSON file + broadcast a reload signal so
+/// every connected bot restarts (via `std::process::exit(0)` →
+/// systemd). Dashboard's `/api/config` POSTs here. Validates the body
+/// parses as `FeeConfig` (serde catches schema bugs), then writes
+/// atomically (tempfile + rename) before broadcasting. IP-whitelisted.
+async fn serve_fee_config_set(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(cfg): Json<crate::fee_config::FeeConfig>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /fee-config.json from non-whitelisted ip {ip}");
+        println!("[whitelist] reject POST /fee-config.json from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    if let Err(e) = state.fee_config_file.write_atomic(&cfg) {
+        tracing::error!("fee_config_file.write_atomic failed: {e:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write failed: {e}"),
+        )
+            .into_response();
+    }
+    // Broadcast last — if write fails, nothing has changed and we
+    // don't want bots to restart with stale config.
+    let subs = state.tx.send(ServerMsg::FeeConfigReload).unwrap_or(0);
+    println!(
+        "[fee-config] updated {} + broadcast fee_config_reload (subscribers={subs})",
+        state.fee_config_file.path().display()
+    );
+    (StatusCode::OK, "ok").into_response()
 }
 
 /// Serve the fee-config JSON file. Bots fetch this once at startup
