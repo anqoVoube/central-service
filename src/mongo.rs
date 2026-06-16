@@ -230,15 +230,18 @@ impl Repo {
     }
 
     /// Age gate identical to `pools_for_remeasurement`; additionally
-    /// requires the pool to be unmeasured or stale (so re-runs are
-    /// idempotent for already-recent values).
+    /// requires the pool to be unmeasured (so default re-runs are
+    /// idempotent — any pool with a persisted `compute_unit_limit`
+    /// is skipped, regardless of how old the measurement is).
+    /// Use `--force` / `pools_for_remeasurement` to re-measure pools
+    /// that already have a value (e.g. after a tx-layout change
+    /// invalidates earlier CU values).
     pub async fn pools_for_cu_measurement(&self) -> anyhow::Result<Vec<PoolDoc>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let stale_cutoff_ms = now_ms - crate::config::POOL_MAX_AGE_MS;
-        let stale_cutoff = DateTime::from_millis(stale_cutoff_ms);
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
@@ -251,8 +254,8 @@ impl Repo {
                 },
                 {
                     "$or": [
-                        { "cu_measured_at": null },
-                        { "cu_measured_at": { "$lt": stale_cutoff } },
+                        { "compute_unit_limit": null },
+                        { "compute_unit_limit": { "$exists": false } },
                     ]
                 },
             ],
