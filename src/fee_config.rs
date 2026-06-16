@@ -50,6 +50,82 @@ pub struct FeeTipSplit {
     pub tip_pct: u32,
 }
 
+/// Mirrors `statics::MAX_DYNAMIC_SLOTS` in the bot. Each profile may
+/// configure up to 8 explicit splits; the bot's prebuild allocates
+/// exactly 8 worker slots per dynamic sender, so anything past this is
+/// silently dropped at fire time. Validate at central so operators get
+/// a 400 instead of mystery missing slots.
+pub const MAX_DYNAMIC_SLOTS: usize = 8;
+
+/// Reject configs that would silently misbehave at the bot. Called from
+/// `FeeConfigFile::open` (catches hand-edited files at central startup)
+/// AND from the dashboard POST path (rejects bad dashboard input with
+/// 400 before persisting).
+pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
+    if cfg.fire_profiles.multiplier_x10 == 0 {
+        anyhow::bail!("multiplier_x10 must be > 0 (0 zeroes every dynamic budget)");
+    }
+    if cfg.fire_profiles.multiplier_x10 > 1000 {
+        anyhow::bail!(
+            "multiplier_x10={} is absurdly high (cap: 1000 = 100×); refusing",
+            cfg.fire_profiles.multiplier_x10
+        );
+    }
+    if cfg.fee_table.is_empty() {
+        anyhow::bail!("fee_table must have at least one bucket");
+    }
+    let mut prev_max: u64 = 0;
+    for (i, b) in cfg.fee_table.iter().enumerate() {
+        if b.max_sol_lamports <= prev_max {
+            anyhow::bail!(
+                "fee_table[{i}].max_sol_lamports={} is not strictly increasing (prev={})",
+                b.max_sol_lamports,
+                prev_max
+            );
+        }
+        if b.fee_bps > 10_000 {
+            anyhow::bail!(
+                "fee_table[{i}].fee_bps={} exceeds 10000 (100%)",
+                b.fee_bps
+            );
+        }
+        prev_max = b.max_sol_lamports;
+    }
+    for (name, p) in [("tp", &cfg.fire_profiles.tp), ("def", &cfg.fire_profiles.def)]
+    {
+        let effective = p.splits.len() + (p.fee_only as usize);
+        if effective == 0 {
+            anyhow::bail!(
+                "fire_profiles.{name}: profile is empty (no splits and fee_only=false) — sender would never fire"
+            );
+        }
+        if effective > MAX_DYNAMIC_SLOTS {
+            anyhow::bail!(
+                "fire_profiles.{name}: effective slots ({}) exceeds MAX_DYNAMIC_SLOTS ({MAX_DYNAMIC_SLOTS}). \
+                 splits.len()={} + fee_only={}",
+                effective,
+                p.splits.len(),
+                p.fee_only as u8,
+            );
+        }
+        for (i, s) in p.splits.iter().enumerate() {
+            if s.fee_pct > 200 || s.tip_pct > 200 {
+                anyhow::bail!(
+                    "fire_profiles.{name}.splits[{i}]: fee_pct={} tip_pct={} — each must be in [0, 200]",
+                    s.fee_pct,
+                    s.tip_pct
+                );
+            }
+            if s.fee_pct == 0 && s.tip_pct == 0 {
+                anyhow::bail!(
+                    "fire_profiles.{name}.splits[{i}]: both fee_pct and tip_pct are 0 — slot is a no-op"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn default_fee_config() -> FeeConfig {
     FeeConfig {
         fee_table: vec![
@@ -99,6 +175,10 @@ impl FeeConfigFile {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
             let cfg = default_fee_config();
+            // Sanity-check the built-in defaults — guards against a
+            // future edit to `default_fee_config` slipping in a config
+            // that the bot would silently reject.
+            validate(&cfg).context("default fee_config failed validation")?;
             let json = serde_json::to_string_pretty(&cfg)
                 .context("serialize default fee_config")?;
             fs::write(&path, &json)
@@ -118,6 +198,9 @@ impl FeeConfigFile {
                 .with_context(|| format!("read existing fee_config at {path:?}"))?;
             let cfg: FeeConfig = serde_json::from_slice(&bytes).with_context(|| {
                 format!("existing fee_config at {path:?} is not valid JSON")
+            })?;
+            validate(&cfg).with_context(|| {
+                format!("existing fee_config at {path:?} failed semantic validation")
             })?;
             println!(
                 "[fee-config] using existing {path:?} ({} buckets, mult_x10={}, tp.splits={}, def.splits={})",
@@ -146,6 +229,9 @@ impl FeeConfigFile {
     /// leaves the original file intact (the rename is atomic on POSIX
     /// filesystems). Used by `POST /fee-config.json`.
     pub fn write_atomic(&self, cfg: &FeeConfig) -> anyhow::Result<()> {
+        // Reject silently-broken configs at the operator boundary (POST)
+        // rather than letting them land on disk + propagate to bots.
+        validate(cfg).context("fee_config failed validation; refusing to persist")?;
         let json = serde_json::to_string_pretty(cfg)
             .context("serialize fee_config")?;
         let tmp = self.path.with_extension("json.tmp");
