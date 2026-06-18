@@ -34,17 +34,11 @@ use solana_sdk::{
 };
 use solana_transaction_status_client_types::TransactionConfirmationStatus;
 
-/// Astralane Frankfurt submission endpoint. The api-key in the URL is
+/// Astralane Frankfurt shred-pay endpoint. The api-key in the URL is
 /// operator-issued via portal.astralane.io. Hardcoded here per operator
 /// request — rotate by editing this constant.
-///
-/// We submit via `/iris` (the same path the bot uses for regular tx
-/// submission) because `/shred-pay` empirically returns an empty-body
-/// 400 for vanilla JSON-RPC requests. Astralane aggregates 24h tips by
-/// recipient address — the tx still counts toward the shred tier as
-/// long as the transfer goes to one of the `ASTZ…` addresses below.
 const ASTRALANE_SHRED_PAY_URL: &str =
-    "http://fr.gateway.astralane.io/iris?api-key=magdamoIsDGDc8KVNBjdNcLgHDyLRNNbwBUc0w2Exy9pewMO6lRz4uobPPydUvNC";
+    "http://fr.gateway.astralane.io/shred-pay?api-key=lsd19O5gQJjwDiv2EaesM7g7pcOASZyyBE810zQKK5BFoLBkTeeMPt4ys2bTk0DX";
 
 /// First of Astralane's published tip addresses (4 total). Astralane
 /// aggregates tips per-sender across the whole set, so any one works;
@@ -55,9 +49,10 @@ const ASTRALANE_TIP_RECIPIENT: &str = "ASTZHptaMgYVMX6DAocDr1vVXLran5PpfKfQtVTSW
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 
-/// 0.1 SOL = 100M lamports. Five back-to-back runs in 24h reach the
-/// tier-2 threshold (0.5 SOL).
-const TIP_LAMPORTS: u64 = 100_000_000;
+/// 0.01 SOL = 10M lamports. Conservative starter amount while we
+/// confirm the wire format; 20 back-to-back runs in 24h would reach
+/// tier-1 (0.2 SOL), 50 would reach tier-2 (0.5 SOL).
+const TIP_LAMPORTS: u64 = 10_000_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
