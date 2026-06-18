@@ -27,6 +27,16 @@ pub struct FeeConfig {
     pub fee_table: Vec<FeeBucket>,
     pub min_liq_dump_pct: f64,
     pub fire_profiles: FireProfiles,
+    /// Prebuilt buy slippage as a fraction of the observed dump, in
+    /// basis points. Mirrors `statics::FeeConfig::buy_slip_pct_of_dump_bps`.
+    /// Default 1667 = 16.67% of dump (matches the prior fixed divisor=6).
+    /// Hot path: `slip_bps = drop_bps × this / 10_000`, clamped at 2000.
+    #[serde(default = "default_buy_slip_pct_of_dump_bps")]
+    pub buy_slip_pct_of_dump_bps: u32,
+}
+
+pub fn default_buy_slip_pct_of_dump_bps() -> u32 {
+    1667
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +74,17 @@ pub const MAX_DYNAMIC_SLOTS: usize = 8;
 pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
     if cfg.fire_profiles.multiplier_x10 == 0 {
         anyhow::bail!("multiplier_x10 must be > 0 (0 zeroes every dynamic budget)");
+    }
+    if cfg.buy_slip_pct_of_dump_bps == 0 {
+        anyhow::bail!(
+            "buy_slip_pct_of_dump_bps must be > 0 (0 = zero slippage, every buy reverts)"
+        );
+    }
+    if cfg.buy_slip_pct_of_dump_bps > 10_000 {
+        anyhow::bail!(
+            "buy_slip_pct_of_dump_bps={} exceeds 10000 (100% of dump); refusing",
+            cfg.buy_slip_pct_of_dump_bps
+        );
     }
     if cfg.fire_profiles.multiplier_x10 > 1000 {
         anyhow::bail!(
@@ -154,6 +175,7 @@ pub fn default_fee_config() -> FeeConfig {
                 fee_only: true,
             },
         },
+        buy_slip_pct_of_dump_bps: default_buy_slip_pct_of_dump_bps(),
     }
 }
 
