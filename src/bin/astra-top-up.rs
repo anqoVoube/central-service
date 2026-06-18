@@ -34,16 +34,11 @@ use solana_sdk::{
 };
 use solana_transaction_status_client_types::TransactionConfirmationStatus;
 
-/// Astralane Frankfurt submission endpoint. The api-key in the URL is
+/// Astralane Frankfurt shred-pay endpoint. The api-key in the URL is
 /// operator-issued via portal.astralane.io. Hardcoded here per operator
 /// request — rotate by editing this constant.
-///
-/// Uses `/iris` (the same path the bot already uses for regular tx
-/// submission). Astralane aggregates 24h tips by recipient address, so
-/// a transfer to one of the `ASTZ…` tip pubkeys counts toward the
-/// shred tier regardless of submission endpoint.
 const ASTRALANE_SHRED_PAY_URL: &str =
-    "http://fr.gateway.astralane.io/iris?api-key=lsd19O5gQJjwDiv2EaesM7g7pcOASZyyBE810zQKK5BFoLBkTeeMPt4ys2bTk0DX";
+    "http://fr.gateway.astralane.io/shred-pay?api-key=lsd19O5gQJjwDiv2EaesM7g7pcOASZyyBE810zQKK5BFoLBkTeeMPt4ys2bTk0DX";
 
 /// First of Astralane's published tip addresses (4 total). Astralane
 /// aggregates tips per-sender across the whole set, so any one works;
@@ -125,17 +120,58 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(15))
         .build()
         .context("build reqwest client")?;
+    let body_str = serde_json::to_string(&body).context("serialize request body")?;
     let resp = http
         .post(ASTRALANE_SHRED_PAY_URL)
-        .json(&body)
+        .header("Content-Type", "application/json")
+        .body(body_str.clone())
         .send()
         .await
         .context("POST to Astralane shred-pay")?;
     let status = resp.status();
-    let resp_text = resp.text().await.unwrap_or_default();
+    let resp_version = resp.version();
+    // Capture headers BEFORE consuming the body.
+    let headers_dump: String = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "    {}: {}",
+                k.as_str(),
+                v.to_str().unwrap_or("<non-utf8>")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let resp_bytes = resp.bytes().await.unwrap_or_default();
+    let resp_text = String::from_utf8_lossy(&resp_bytes).to_string();
     if !status.is_success() {
+        // Dump everything we know so we can see exactly why the gateway
+        // is rejecting us — Astralane sometimes returns empty 400 bodies.
+        eprintln!("=== Astralane request failed ===");
+        eprintln!("URL: {}", ASTRALANE_SHRED_PAY_URL);
+        eprintln!("Request method: POST");
+        eprintln!("Request Content-Type: application/json");
+        eprintln!("Request body ({} bytes):", body_str.len());
+        eprintln!("    {}", body_str);
+        eprintln!("Response HTTP version: {:?}", resp_version);
+        eprintln!("Response status: {}", status);
+        eprintln!("Response headers:");
+        eprintln!("{}", headers_dump);
+        eprintln!(
+            "Response body ({} bytes, utf8-lossy):",
+            resp_bytes.len()
+        );
+        eprintln!("    {:?}", resp_text);
+        eprintln!(
+            "Response body hex ({} bytes):",
+            resp_bytes.len()
+        );
+        eprintln!("    {}", hex_dump(&resp_bytes));
+        eprintln!("================================");
         return Err(anyhow!(
-            "Astralane shred-pay HTTP {status}: {resp_text}"
+            "Astralane shred-pay HTTP {status} (body={} bytes, see stderr dump above)",
+            resp_bytes.len()
         ));
     }
     let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
@@ -189,4 +225,23 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Hex-dump bytes as `XX XX XX …` grouped 16 per line. Helpful when the
+/// response body is non-UTF8 / has invisible chars / is truly empty (the
+/// hex dump makes the difference obvious).
+fn hex_dump(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "<empty>".to_owned();
+    }
+    let mut out = String::with_capacity(bytes.len() * 3 + bytes.len() / 16);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && i % 16 == 0 {
+            out.push_str("\n    ");
+        } else if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
