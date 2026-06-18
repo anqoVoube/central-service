@@ -149,9 +149,13 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
             );
         }
         for (i, s) in p.splits.iter().enumerate() {
-            if s.fee_pct > 200 || s.tip_pct > 200 {
+            // Per-slot percentages multiply the budget — a 300 here means
+            // "3× total_budget for this component before per_tx_cap clamps it".
+            // Cap at 1000% (10×) per component as an absurd-high guard;
+            // operator values ≤ 500 are routine.
+            if s.fee_pct > 1000 || s.tip_pct > 1000 {
                 anyhow::bail!(
-                    "fire_profiles.{name}.splits[{i}]: fee_pct={} tip_pct={} — each must be in [0, 200]",
+                    "fire_profiles.{name}.splits[{i}]: fee_pct={} tip_pct={} — each must be in [0, 1000]",
                     s.fee_pct,
                     s.tip_pct
                 );
