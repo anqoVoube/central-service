@@ -34,11 +34,17 @@ use solana_sdk::{
 };
 use solana_transaction_status_client_types::TransactionConfirmationStatus;
 
-/// Astralane Frankfurt shred-pay endpoint. The api-key in the URL is
+/// Astralane Frankfurt submission endpoint. The api-key in the URL is
 /// operator-issued via portal.astralane.io. Hardcoded here per operator
 /// request — rotate by editing this constant.
+///
+/// We submit via `/iris` (the same path the bot uses for regular tx
+/// submission) because `/shred-pay` empirically returns an empty-body
+/// 400 for vanilla JSON-RPC requests. Astralane aggregates 24h tips by
+/// recipient address — the tx still counts toward the shred tier as
+/// long as the transfer goes to one of the `ASTZ…` addresses below.
 const ASTRALANE_SHRED_PAY_URL: &str =
-    "http://fr.gateway.astralane.io/shred-pay?api-key=magdamoIsDGDc8KVNBjdNcLgHDyLRNNbwBUc0w2Exy9pewMO6lRz4uobPPydUvNC";
+    "http://fr.gateway.astralane.io/iris?api-key=magdamoIsDGDc8KVNBjdNcLgHDyLRNNbwBUc0w2Exy9pewMO6lRz4uobPPydUvNC";
 
 /// First of Astralane's published tip addresses (4 total). Astralane
 /// aggregates tips per-sender across the whole set, so any one works;
