@@ -37,6 +37,10 @@ pub struct FeeConfig {
     /// `statics::FeeConfig::buy_size_tiers`.
     #[serde(default = "default_buy_size_tiers")]
     pub buy_size_tiers: Vec<BuySizeTier>,
+    /// Per-rung minimum buy size (lamports). Dashboard surfaces this
+    /// as a "min sol" input on fee_table tier 1. Default 225M (0.225 SOL ~ $20).
+    #[serde(default = "default_rung_min_sol_lamports")]
+    pub rung_min_sol_lamports: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -56,6 +60,11 @@ pub fn default_buy_size_tiers() -> Vec<BuySizeTier> {
         BuySizeTier { min_liq_dump_pct: 0.06, buy_size_bps: 3000 },
         BuySizeTier { min_liq_dump_pct: 0.25, buy_size_bps: 5000 },
     ]
+}
+
+/// Default rung floor — 0.225 SOL (~$20 at $89/SOL).
+pub fn default_rung_min_sol_lamports() -> u64 {
+    225_000_000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +122,21 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
     }
     if cfg.fee_table.is_empty() {
         anyhow::bail!("fee_table must have at least one bucket");
+    }
+    if cfg.rung_min_sol_lamports == 0 {
+        anyhow::bail!("rung_min_sol_lamports must be > 0");
+    }
+    let last_max = cfg
+        .fee_table
+        .last()
+        .map(|b| b.max_sol_lamports)
+        .unwrap_or(0);
+    if cfg.rung_min_sol_lamports >= last_max {
+        anyhow::bail!(
+            "rung_min_sol_lamports ({}) must be strictly less than fee_table's last bucket's max_sol_lamports ({}); otherwise every buy clamps to a single value",
+            cfg.rung_min_sol_lamports,
+            last_max
+        );
     }
     let mut prev_max: u64 = 0;
     for (i, b) in cfg.fee_table.iter().enumerate() {
@@ -235,6 +259,7 @@ pub fn default_fee_config() -> FeeConfig {
         },
         buy_slip_pct_of_dump_bps: default_buy_slip_pct_of_dump_bps(),
         buy_size_tiers: default_buy_size_tiers(),
+        rung_min_sol_lamports: default_rung_min_sol_lamports(),
     }
 }
 
