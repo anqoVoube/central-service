@@ -25,18 +25,37 @@ pub struct FeeBucket {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FeeConfig {
     pub fee_table: Vec<FeeBucket>,
-    pub min_liq_dump_pct: f64,
     pub fire_profiles: FireProfiles,
     /// Prebuilt buy slippage as a fraction of the observed dump, in
     /// basis points. Mirrors `statics::FeeConfig::buy_slip_pct_of_dump_bps`.
-    /// Default 1667 = 16.67% of dump (matches the prior fixed divisor=6).
-    /// Hot path: `slip_bps = drop_bps × this / 10_000`, clamped at 2000.
     #[serde(default = "default_buy_slip_pct_of_dump_bps")]
     pub buy_slip_pct_of_dump_bps: u32,
+    /// Buy-size tier table keyed on the observed liquidity-dump
+    /// fraction. Sorted ascending by `min_liq_dump_pct`. The lowest
+    /// tier's threshold IS the bot-wide min-liq-dump floor (replaces
+    /// the prior `min_liq_dump_pct` field). Mirrors
+    /// `statics::FeeConfig::buy_size_tiers`.
+    #[serde(default = "default_buy_size_tiers")]
+    pub buy_size_tiers: Vec<BuySizeTier>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BuySizeTier {
+    pub min_liq_dump_pct: f64,
+    pub buy_size_bps: u32,
 }
 
 pub fn default_buy_slip_pct_of_dump_bps() -> u32 {
     1667
+}
+
+/// Three-tier default: 3%→15%, 6%→30%, 25%→50%. Below 3% no fire.
+pub fn default_buy_size_tiers() -> Vec<BuySizeTier> {
+    vec![
+        BuySizeTier { min_liq_dump_pct: 0.03, buy_size_bps: 1500 },
+        BuySizeTier { min_liq_dump_pct: 0.06, buy_size_bps: 3000 },
+        BuySizeTier { min_liq_dump_pct: 0.25, buy_size_bps: 5000 },
+    ]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +163,42 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
             }
         }
     }
+    if cfg.buy_size_tiers.is_empty() {
+        anyhow::bail!(
+            "buy_size_tiers is empty — the lowest tier is the bot-wide min-liq-dump floor; with no tiers no fire ever happens"
+        );
+    }
+    let mut prev_threshold: f64 = -1.0;
+    for (i, t) in cfg.buy_size_tiers.iter().enumerate() {
+        if !t.min_liq_dump_pct.is_finite()
+            || t.min_liq_dump_pct <= 0.0
+            || t.min_liq_dump_pct > 0.5
+        {
+            anyhow::bail!(
+                "buy_size_tiers[{i}].min_liq_dump_pct={} must be in (0.0, 0.5]",
+                t.min_liq_dump_pct
+            );
+        }
+        if t.min_liq_dump_pct <= prev_threshold {
+            anyhow::bail!(
+                "buy_size_tiers[{i}].min_liq_dump_pct={} is not strictly increasing (prev={})",
+                t.min_liq_dump_pct,
+                prev_threshold
+            );
+        }
+        if t.buy_size_bps == 0 {
+            anyhow::bail!(
+                "buy_size_tiers[{i}].buy_size_bps=0 — tier would never buy anything"
+            );
+        }
+        if t.buy_size_bps > 10_000 {
+            anyhow::bail!(
+                "buy_size_tiers[{i}].buy_size_bps={} exceeds 10000 (100%); refusing",
+                t.buy_size_bps
+            );
+        }
+        prev_threshold = t.min_liq_dump_pct;
+    }
     Ok(())
 }
 
@@ -156,7 +211,6 @@ pub fn default_fee_config() -> FeeConfig {
             FeeBucket { max_sol_lamports: 10_000_000_000, fee_bps: 200 },
             FeeBucket { max_sol_lamports: 20_000_000_000, fee_bps: 300 },
         ],
-        min_liq_dump_pct: 0.05,
         fire_profiles: FireProfiles {
             multiplier_x10: 30,
             per_tx_cap_lamports: None,
@@ -176,6 +230,7 @@ pub fn default_fee_config() -> FeeConfig {
             },
         },
         buy_slip_pct_of_dump_bps: default_buy_slip_pct_of_dump_bps(),
+        buy_size_tiers: default_buy_size_tiers(),
     }
 }
 
