@@ -21,7 +21,8 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use base64::Engine;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -74,10 +75,6 @@ async fn main() -> anyhow::Result<()> {
         HELIUS_RPC.to_string(),
         CommitmentConfig::confirmed(),
     );
-    let astralane = RpcClient::new_with_commitment(
-        ASTRALANE_SHRED_PAY_URL.to_string(),
-        CommitmentConfig::confirmed(),
-    );
 
     let (recent_blockhash, _last_valid) = helius
         .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
@@ -93,17 +90,67 @@ async fn main() -> anyhow::Result<()> {
     let mut tx = Transaction::new_unsigned(msg);
     tx.sign(&[&wallet_kp], recent_blockhash);
 
+    // Astralane's shred-pay endpoint expects standard JSON-RPC
+    // `sendTransaction` with `encoding=base64`. `RpcClient::send_transaction`
+    // historically sends base58 which trips a 400 on `/shred-pay`; do the
+    // POST by hand to match the bot's known-working `/iris` body shape.
+    let tx_bytes = bincode::serialize(&tx).context("bincode serialize tx")?;
+    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            tx_b64,
+            { "encoding": "base64", "skipPreflight": true }
+        ]
+    });
+
+    let local_sig: Signature = tx.signatures[0];
     tracing::info!(
         wallet = %wallet_pk,
         recipient = %tip_to,
         lamports = TIP_LAMPORTS,
-        "submitting Astralane tip via FR shred-pay endpoint"
+        local_sig = %local_sig,
+        "POSTing Astralane tip to FR shred-pay endpoint"
     );
 
-    let sig: Signature = astralane
-        .send_transaction(&tx)
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build reqwest client")?;
+    let resp = http
+        .post(ASTRALANE_SHRED_PAY_URL)
+        .json(&body)
+        .send()
         .await
-        .context("astralane send_transaction")?;
+        .context("POST to Astralane shred-pay")?;
+    let status = resp.status();
+    let resp_text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Astralane shred-pay HTTP {status}: {resp_text}"
+        ));
+    }
+    let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
+        .with_context(|| format!("parse Astralane response: {resp_text}"))?;
+    if let Some(err) = resp_json.get("error") {
+        return Err(anyhow!("Astralane RPC error: {err}"));
+    }
+    let sig_str = resp_json
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("no `result` field in Astralane response: {resp_text}"))?;
+    let sig: Signature = sig_str
+        .parse()
+        .with_context(|| format!("parse returned signature {sig_str}"))?;
+    if sig != local_sig {
+        tracing::warn!(
+            local = %local_sig,
+            returned = %sig,
+            "Astralane returned a signature different from the one we signed"
+        );
+    }
     tracing::info!("submitted sig={sig}");
     println!("https://solscan.io/tx/{sig}");
 
