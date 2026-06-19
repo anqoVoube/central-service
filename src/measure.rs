@@ -74,6 +74,11 @@ pub enum MeasureOutcome {
     /// AccountNotInitialized. Caller (ata::create) should ensure ATA is
     /// created before calling. `bin/measure_cu` uses this to skip.
     SkipAtaMissing,
+    /// Pool's quote mint isn't WSOL (e.g. USDC-quoted PumpFun pool).
+    /// Our buy ix is hardcoded to spend WSOL, so the tx would revert
+    /// with `InvalidQuoteMint`. Skip silently — these pools aren't in
+    /// the bot's trading scope.
+    SkipNonWsolQuote,
 }
 
 /// Measure CU for a single PumpFun pool. Returns the raw on-chain
@@ -97,6 +102,12 @@ pub async fn measure_pool_cu(
         PoolAccounts::PumpFun(p) => p,
         _ => anyhow::bail!("measure_pool_cu: pool is not PumpFun"),
     };
+    // Skip non-WSOL-quoted PumpFun pools (e.g. USDC-quoted). Our buy ix
+    // hardcodes WSOL on the quote side, so any other quote mint trips
+    // `InvalidQuoteMint` (error 0x1779) and burns a real on-chain fee.
+    if pump.quote_mint != wsol_pk().to_string() {
+        return Ok(MeasureOutcome::SkipNonWsolQuote);
+    }
     let wallet_pk = wallet_kp.pubkey();
     let pdas = PumpStaticPdas::derive(&wallet_pk);
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());

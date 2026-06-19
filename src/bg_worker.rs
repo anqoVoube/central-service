@@ -197,6 +197,12 @@ async fn measure_missing_cu(
                 );
                 skipped += 1;
             }
+            Ok(measure::MeasureOutcome::SkipNonWsolQuote) => {
+                tracing::debug!(
+                    "[bg-worker] cu: pool={pool_for_log} skip (non-WSOL quote mint)"
+                );
+                skipped += 1;
+            }
             Err(e) => {
                 tracing::warn!("[bg-worker] cu: pool={pool_for_log} failed: {e:#}");
                 failed += 1;

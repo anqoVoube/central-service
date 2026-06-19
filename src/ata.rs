@@ -197,6 +197,15 @@ async fn measure_one(
                 );
                 return None;
             }
+            Ok(MeasureOutcome::SkipNonWsolQuote) => {
+                // Pool is quoted in something other than WSOL (e.g. USDC).
+                // Our buy ix is WSOL-only — the bot wouldn't trade it
+                // anyway. Broadcast without a CU value; no retry.
+                eprintln!(
+                    "[ata] {pool} cu probe skipped (non-WSOL quote mint) — broadcasting without cu"
+                );
+                return None;
+            }
             Err(e) => {
                 eprintln!(
                     "[ata] {pool} cu probe attempt {attempt}/3 failed: {e:#}"

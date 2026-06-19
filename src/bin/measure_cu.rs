@@ -180,15 +180,15 @@ async fn main() -> anyhow::Result<()> {
     if use_rpc_send && use_harmonic {
         anyhow::bail!("--rpc and --harmonic are mutually exclusive");
     }
-    // The Jito sendBundle path (default: neither --rpc nor --harmonic) needs
-    // the auth token. The other paths don't.
-    let use_jito_send = !use_rpc_send && !use_harmonic;
-    if use_jito_send && jito_auth.is_none() {
-        anyhow::bail!("X_JITO_AUTH not set (required for Jito sendBundle; set in .env, or use --rpc / --harmonic)");
-    }
+    // Default send path is now Zeroslot (replaces Jito sendBundle).
+    // `--rpc` and `--harmonic` remain as diagnostic alternatives.
+    let use_zeroslot_send = !use_rpc_send && !use_harmonic;
+    // jito_auth no longer required by the default path; unwrapped to
+    // an empty string so the function signature stays unchanged and
+    // the .env tolerates `X_JITO_AUTH` being unset.
     let jito_auth = jito_auth.unwrap_or_default();
     tracing::info!(
-        send_path = if use_harmonic { "harmonic" } else if use_rpc_send { "rpc" } else { "jito" },
+        send_path = if use_harmonic { "harmonic" } else if use_rpc_send { "rpc" } else { "zeroslot" },
         advance,
         randomize,
         "send configuration"
@@ -241,10 +241,12 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // TX2's Jito tip recipient rotates per pool to spread load across
-        // the 8 published accounts. Unused on the `--rpc` path (no TX2).
+        // Tip recipient — now Zeroslot's single tip account (replaces
+        // the prior rotating Jito tip pool). Function-arg name
+        // `jito_tip_pk` kept for minimal diff.
+        let _ = JITO_TIP_ACCOUNTS; // legacy const, no longer used
         let jito_tip_pk =
-            Pubkey::from_str(JITO_TIP_ACCOUNTS[idx % JITO_TIP_ACCOUNTS.len()])?;
+            Pubkey::from_str(central_service::zeroslot::ZEROSLOT_TIP_ACCOUNT)?;
         let prefix = format!("[{}/{}] pool={}", idx + 1, pools.len(), pool_doc.pool);
         match measure_one(
             &rpc,
@@ -454,9 +456,10 @@ async fn measure_one(
     let mut tx = Transaction::new_unsigned(message);
     tx.sign(&[wallet_kp], blockhash);
 
-    // 6. Send. Default path: Jito sendBundle (matches bot's production
-    //    sender mix). With `--harmonic`: Harmonic gRPC bundle fan-out. With
-    //    `--rpc`: standard JSON-RPC `sendTransaction` against Helius mainnet.
+    // 6. Send. Default path: Zeroslot `/iris` JSON-RPC sendTransaction
+    //    (replaces the prior Jito sendBundle default). With `--harmonic`:
+    //    Harmonic gRPC bundle fan-out. With `--rpc`: standard JSON-RPC
+    //    sendTransaction via Helius mainnet.
     let sig: Signature = tx.signatures[0];
     if use_harmonic {
         let tx_bytes = bincode::serialize(&tx).context("serialize buy tx for harmonic")?;
@@ -472,37 +475,12 @@ async fn measure_one(
         debug_assert_eq!(sent_sig, sig);
         tracing::debug!(sig = %sig, "sent via rpc");
     } else {
-        let tx_bytes = bincode::serialize(&tx).context("serialize buy tx for bundle")?;
-        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [[tx_b64], {"encoding": "base64"}],
-        });
-        let resp = http
-            .post(JITO_BUNDLE_URL)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("x-jito-auth", jito_auth)
-            .body(body.to_string())
-            .send()
+        // Zeroslot path — default for this bin.
+        let sent_sig = central_service::zeroslot::send_transaction(http, &tx)
             .await
-            .context("jito sendBundle http")?;
-        let status = resp.status();
-        let resp_text = resp.text().await.context("jito sendBundle body")?;
-        if !status.is_success() {
-            return Err(anyhow!("jito sendBundle non-2xx: status={status} body={resp_text}"));
-        }
-        let parsed: serde_json::Value = serde_json::from_str(&resp_text)
-            .context("jito sendBundle parse body")?;
-        if let Some(err) = parsed.get("error") {
-            return Err(anyhow!("jito sendBundle rpc-level error: {err}"));
-        }
-        let bundle_id = parsed
-            .get("result")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("jito sendBundle: missing/invalid result field: {parsed}"))?;
-        tracing::info!(sig = %sig, bundle_id = %bundle_id, "sent via jito");
+            .context("zeroslot send_transaction")?;
+        debug_assert_eq!(sent_sig, sig);
+        tracing::info!(sig = %sig, "sent via zeroslot");
     }
 
     let start = std::time::Instant::now();

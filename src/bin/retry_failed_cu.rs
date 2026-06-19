@@ -116,6 +116,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!("{prefix} wallet base-mint ATA missing — skipped");
                 skipped_ata += 1;
             }
+            Ok(MeasureOutcome::SkipNonWsolQuote) => {
+                tracing::info!("{prefix} non-WSOL quote mint — skipped");
+                skipped_ata += 1;
+            }
             Err(e) => {
                 tracing::warn!("{prefix} failed: {e:#}");
                 failed.push(pool_str.clone());

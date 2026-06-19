@@ -49,9 +49,11 @@ use central_service::{
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
 const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
-const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
+/// Zeroslot tip recipient.
+const TIP_RECIPIENT: &str = "Eb2KpSC8uMt9GmzyAEm5Eb1AAAgTjRaXWFjKyFXHZxF3";
 const SYSVAR_RECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
-const TIP_LAMPORTS: u64 = 1_213_357;          // 0.001213357 SOL — matches send / measure.rs
+/// 100_000 lamports — matches `crate::zeroslot::TIP_LAMPORTS`.
+const TIP_LAMPORTS: u64 = 100_000;
 const SWAP_IN_LAMPORTS: u64 = 1_213_357;      // 0.001213357 SOL
 const CU_LIMIT_CEILING: u32 = 400_000;
 const CU_PRICE: u64 = 1_000_000;
@@ -228,8 +230,13 @@ async fn run_probe(
     let mut tx = Transaction::new_unsigned(message);
     tx.sign(&[wallet_kp], nonce_blockhash);
 
-    let sig: Signature = rpc.send_transaction(&tx).await.context("send_transaction")?;
-    tracing::info!("sent sig={sig}");
+    // Send via Zeroslot (replaces public-RPC send_transaction).
+    let http = central_service::zeroslot::build_http_client()
+        .context("build zeroslot http client")?;
+    let sig: Signature = central_service::zeroslot::send_transaction(&http, &tx)
+        .await
+        .context("zeroslot send_transaction")?;
+    tracing::info!("sent sig={sig} via zeroslot");
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);

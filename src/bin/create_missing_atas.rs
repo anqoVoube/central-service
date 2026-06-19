@@ -27,6 +27,7 @@ use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    system_instruction,
     transaction::Transaction,
 };
 use solana_transaction_status_client_types::TransactionConfirmationStatus;
@@ -146,15 +147,29 @@ async fn create_ata(
     );
     let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT);
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
+    // Zeroslot priority lane requires an inline tip transfer.
+    let zs_tip_pk: Pubkey = central_service::zeroslot::ZEROSLOT_TIP_ACCOUNT
+        .parse()
+        .context("parse zeroslot tip account")?;
+    let tip_ix = system_instruction::transfer(
+        &wallet_pk,
+        &zs_tip_pk,
+        central_service::zeroslot::TIP_LAMPORTS,
+    );
 
     let blockhash = rpc.get_latest_blockhash().await.context("get_latest_blockhash")?;
     let mut tx = Transaction::new_with_payer(
-        &[cu_limit_ix, cu_price_ix, create_ix],
+        &[cu_limit_ix, cu_price_ix, create_ix, tip_ix],
         Some(&wallet_pk),
     );
     tx.sign(&[wallet_kp], blockhash);
 
-    let sig = rpc.send_transaction(&tx).await.context("send_transaction")?;
+    // Send via Zeroslot (replaces public-RPC send_transaction).
+    let http = central_service::zeroslot::build_http_client()
+        .context("build zeroslot http client")?;
+    let sig = central_service::zeroslot::send_transaction(&http, &tx)
+        .await
+        .context("zeroslot send_transaction")?;
 
     // Poll briefly. ATA create is fast — usually 1-2 slots.
     let start = std::time::Instant::now();
