@@ -210,8 +210,15 @@ async fn measure_inner(
     let mut tx = Transaction::new_unsigned(message);
     tx.sign(&[wallet_kp], nonce_blockhash);
 
-    // 5. Send + poll.
-    let sig: Signature = rpc.send_transaction(&tx).await.context("send_transaction")?;
+    // 5. Send via Astralane (replaces the prior public-RPC
+    // send_transaction call so central's outbound CU probes go through
+    // the operator's paid lane). Confirm via the regular RPC since
+    // Astralane doesn't surface getSignatureStatuses.
+    let http = crate::astralane::build_http_client()
+        .context("build astralane http client")?;
+    let sig: Signature = crate::astralane::send_transaction(&http, &tx)
+        .await
+        .context("astralane send_transaction")?;
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);

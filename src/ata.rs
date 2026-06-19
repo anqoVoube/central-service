@@ -8,10 +8,12 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
+use solana_transaction_status_client_types::TransactionConfirmationStatus;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 use tokio::sync::broadcast;
 
 use crate::{
+    astralane,
     measure::{measure_pool_cu, MeasureOutcome},
     mongo::Repo,
     pool::PoolDoc,
@@ -34,6 +36,13 @@ pub async fn create(
 ) {
     let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     let wallet_pk = wallet_kp.pubkey();
+    let http = match astralane::build_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ata] {pool} astralane client build failed: {e:#}");
+            return;
+        }
+    };
 
     let price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT);
@@ -63,30 +72,80 @@ pub async fn create(
             blockhash,
         );
 
-        match rpc.send_and_confirm_transaction_with_spinner(&tx).await {
-            Ok(_sig) => {
-                if let Err(e) = repo.mark_ata_confirmed(&pool).await {
-                    eprintln!("[ata] {pool} mark_ata_confirmed failed: {e:#}");
-                }
-                // Now that the ATA exists, fire a 0.001 SOL probe buy to
-                // record the pool's CU consumption. Result is persisted +
-                // included in the NewPool broadcast so bots see the value
-                // at first sight, not after a separate measurement pass.
-                let measured_cu = measure_one(&rpc, &wallet_kp, &doc, &repo, &pool).await;
-                let _ = broadcast.send(ServerMsg::NewPool {
-                    pool: doc.pool.clone(),
-                    accounts: doc.accounts.clone(),
-                    pair_created_at_ms: doc.pair_created_at_ms,
-                    compute_unit_limit: measured_cu,
-                });
-                return;
-            }
+        // Send via Astralane (replaces the prior public-RPC
+        // send_and_confirm). Confirm via the regular RPC because
+        // Astralane doesn't expose getSignatureStatuses.
+        let sig = match astralane::send_transaction(&http, &tx).await {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("[ata] {pool} attempt {attempt} failed: {e}");
+                eprintln!("[ata] {pool} attempt {attempt} astralane send failed: {e}");
                 if attempt < 3 {
                     tokio::time::sleep(Duration::from_secs(BACKOFF[attempt - 1])).await;
                 }
+                continue;
             }
+        };
+        // Poll for confirmation up to 60s. Identical pattern to
+        // `measure_inner` so failure semantics are uniform.
+        let confirm_start = std::time::Instant::now();
+        let confirm_timeout = Duration::from_secs(60);
+        let mut confirmed = false;
+        let mut on_chain_err: Option<String> = None;
+        while confirm_start.elapsed() < confirm_timeout {
+            match rpc.get_signature_statuses(&[sig]).await {
+                Ok(resp) => {
+                    if let Some(Some(status)) = resp.value.into_iter().next() {
+                        if let Some(conf) = &status.confirmation_status {
+                            if matches!(
+                                conf,
+                                TransactionConfirmationStatus::Confirmed
+                                    | TransactionConfirmationStatus::Finalized,
+                            ) {
+                                if let Some(err) = &status.err {
+                                    on_chain_err = Some(format!("{err:?}"));
+                                } else {
+                                    confirmed = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[ata] {pool} attempt {attempt} get_signature_statuses: {e}"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if confirmed {
+            if let Err(e) = repo.mark_ata_confirmed(&pool).await {
+                eprintln!("[ata] {pool} mark_ata_confirmed failed: {e:#}");
+            }
+            // Now that the ATA exists, fire a 0.001 SOL probe buy to
+            // record the pool's CU consumption. Result is persisted +
+            // included in the NewPool broadcast so bots see the value
+            // at first sight, not after a separate measurement pass.
+            let measured_cu = measure_one(&rpc, &wallet_kp, &doc, &repo, &pool).await;
+            let _ = broadcast.send(ServerMsg::NewPool {
+                pool: doc.pool.clone(),
+                accounts: doc.accounts.clone(),
+                pair_created_at_ms: doc.pair_created_at_ms,
+                compute_unit_limit: measured_cu,
+            });
+            return;
+        }
+        if let Some(err) = on_chain_err {
+            eprintln!("[ata] {pool} attempt {attempt} on-chain err: {err}");
+        } else {
+            eprintln!(
+                "[ata] {pool} attempt {attempt} confirm timeout sig={sig}"
+            );
+        }
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_secs(BACKOFF[attempt - 1])).await;
         }
     }
     eprintln!("[ata] {pool} exhausted all 3 attempts — row stays pending");
