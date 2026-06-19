@@ -3,8 +3,8 @@
 //! daemon; this just exposes its building blocks.
 
 pub mod alts;
-pub mod astralane;
 pub mod ata;
+pub mod zeroslot;
 pub mod backfill;
 pub mod bans;
 pub mod bg_worker;

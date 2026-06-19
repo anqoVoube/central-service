@@ -6,18 +6,20 @@ use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    system_instruction,
     transaction::Transaction,
 };
 use solana_transaction_status_client_types::TransactionConfirmationStatus;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
+use std::str::FromStr;
 use tokio::sync::broadcast;
 
 use crate::{
-    astralane,
     measure::{measure_pool_cu, MeasureOutcome},
     mongo::Repo,
     pool::PoolDoc,
     ws::ServerMsg,
+    zeroslot,
 };
 
 const CU_PRICE: u64 = 100_000;
@@ -36,10 +38,17 @@ pub async fn create(
 ) {
     let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     let wallet_pk = wallet_kp.pubkey();
-    let http = match astralane::build_http_client() {
+    let http = match zeroslot::build_http_client() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ata] {pool} astralane client build failed: {e:#}");
+            eprintln!("[ata] {pool} zeroslot client build failed: {e:#}");
+            return;
+        }
+    };
+    let zs_tip_pk = match Pubkey::from_str(zeroslot::ZEROSLOT_TIP_ACCOUNT) {
+        Ok(pk) => pk,
+        Err(e) => {
+            eprintln!("[ata] {pool} bad ZEROSLOT_TIP_ACCOUNT: {e}");
             return;
         }
     };
@@ -48,6 +57,9 @@ pub async fn create(
     let limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT);
     let ata_ix =
         create_associated_token_account_idempotent(&wallet_pk, &wallet_pk, &base_mint, &token_program);
+    // Zeroslot priority lane requires an inline tip transfer to its tip
+    // account. 100k lamports (~$0.01) matches `zeroslot::TIP_LAMPORTS`.
+    let tip_ix = system_instruction::transfer(&wallet_pk, &zs_tip_pk, zeroslot::TIP_LAMPORTS);
 
     for attempt in 1usize..=3 {
         if let Err(e) = repo.bump_ata_attempts(&pool).await {
@@ -66,19 +78,19 @@ pub async fn create(
         };
 
         let tx = Transaction::new_signed_with_payer(
-            &[price_ix.clone(), limit_ix.clone(), ata_ix.clone()],
+            &[price_ix.clone(), limit_ix.clone(), ata_ix.clone(), tip_ix.clone()],
             Some(&wallet_pk),
             &[&*wallet_kp],
             blockhash,
         );
 
-        // Send via Astralane (replaces the prior public-RPC
+        // Send via Zeroslot (replaces the prior public-RPC
         // send_and_confirm). Confirm via the regular RPC because
-        // Astralane doesn't expose getSignatureStatuses.
-        let sig = match astralane::send_transaction(&http, &tx).await {
+        // Zeroslot doesn't expose getSignatureStatuses.
+        let sig = match zeroslot::send_transaction(&http, &tx).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[ata] {pool} attempt {attempt} astralane send failed: {e}");
+                eprintln!("[ata] {pool} attempt {attempt} zeroslot send failed: {e}");
                 if attempt < 3 {
                     tokio::time::sleep(Duration::from_secs(BACKOFF[attempt - 1])).await;
                 }

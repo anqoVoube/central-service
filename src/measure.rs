@@ -46,10 +46,13 @@ use crate::swap_pump_fun::{
 };
 
 pub const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
-pub const TIP_RECIPIENT: &str = "SUPRAJhgwn1K3xMj9gwNAaDTrkfhZzeBgygtRG4jBHV";
-/// 0.001213357 SOL — matches the manual `send` binary so auto-measured
-/// CU values reflect the same conditions we test by hand.
-pub const TIP_LAMPORTS: u64 = 1_213_357;
+/// Tip recipient — Zeroslot's tip account. Replaces the prior SUPRA
+/// vault address (which was paired with the old public-RPC send).
+/// Mirrors `crate::zeroslot::ZEROSLOT_TIP_ACCOUNT`.
+pub const TIP_RECIPIENT: &str = "Eb2KpSC8uMt9GmzyAEm5Eb1AAAgTjRaXWFjKyFXHZxF3";
+/// 100_000 lamports (~$0.01) — Zeroslot's priority-lane tip. Mirrors
+/// `crate::zeroslot::TIP_LAMPORTS`.
+pub const TIP_LAMPORTS: u64 = 100_000;
 /// 0.0001213357 SOL — 10× smaller than `TIP_LAMPORTS`. Both
 /// `base_amount_out` and `max_quote_amount_in` derived inside the buy ix
 /// scale linearly with this for the small-amount-vs-reserves regime, so
@@ -210,15 +213,15 @@ async fn measure_inner(
     let mut tx = Transaction::new_unsigned(message);
     tx.sign(&[wallet_kp], nonce_blockhash);
 
-    // 5. Send via Astralane (replaces the prior public-RPC
+    // 5. Send via Zeroslot (replaces the prior public-RPC
     // send_transaction call so central's outbound CU probes go through
     // the operator's paid lane). Confirm via the regular RPC since
-    // Astralane doesn't surface getSignatureStatuses.
-    let http = crate::astralane::build_http_client()
-        .context("build astralane http client")?;
-    let sig: Signature = crate::astralane::send_transaction(&http, &tx)
+    // Zeroslot doesn't surface getSignatureStatuses.
+    let http = crate::zeroslot::build_http_client()
+        .context("build zeroslot http client")?;
+    let sig: Signature = crate::zeroslot::send_transaction(&http, &tx)
         .await
-        .context("astralane send_transaction")?;
+        .context("zeroslot send_transaction")?;
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
