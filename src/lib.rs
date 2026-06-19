@@ -6,6 +6,7 @@ pub mod alts;
 pub mod ata;
 pub mod backfill;
 pub mod bans;
+pub mod bg_worker;
 pub mod block_detail;
 pub mod config;
 pub mod discover;

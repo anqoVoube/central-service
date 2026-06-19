@@ -118,6 +118,23 @@ impl Repo {
         Ok(docs.into_iter().map(|d| d.pool).collect())
     }
 
+    /// Full `PoolDoc` rows for pools still pending an ATA and whose
+    /// `ata_attempts` is below `cap`. Used by the periodic
+    /// `bg_worker::run` to retry ATA creation without going through
+    /// `discover::handle_one` (which short-circuits on `exists()`).
+    /// Excludes `disabled: true` rows (matches `load_all_confirmed`).
+    pub async fn pools_pending_for_retry(
+        &self,
+        cap: i32,
+    ) -> anyhow::Result<Vec<PoolDoc>> {
+        let filter = doc! {
+            "ata_status": "pending",
+            "ata_attempts": { "$lt": cap },
+            "disabled": { "$ne": true },
+        };
+        Ok(self.pools.find(filter).await?.try_collect().await?)
+    }
+
     pub async fn exists(&self, pool: &str) -> anyhow::Result<bool> {
         Ok(self
             .pools

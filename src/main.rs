@@ -122,6 +122,24 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(discover::run(discover_rx, rpc_url, kp, repo, tx));
     }
 
+    // Periodic ATA + CU background worker. Every 10 minutes:
+    //   • Retry ATA creation for pools still pending (capped per pool
+    //     so structurally-broken rows don't hammer the chain forever).
+    //   • Measure CU for any confirmed pool missing `compute_unit_limit`.
+    // Sequential within each pass; errors logged + loop continues.
+    {
+        let repo = Arc::clone(&repo);
+        let rpc_url = cfg.rpc_url.clone();
+        let kp = Arc::clone(&wallet_kp);
+        let tx = broadcast_tx.clone();
+        let interval = Duration::from_secs(600); // 10 min
+        tokio::spawn(async move {
+            if let Err(e) = central_service::bg_worker::run(repo, rpc_url, kp, tx, interval).await {
+                tracing::error!("bg_worker task exited: {e:#}");
+            }
+        });
+    }
+
     // Replay pending pools through the discovery pipeline so the ATA
     // creator gets another shot at each. New rows reset their attempts
     // counter via the seed binary's `--retry-pending` flag before central
