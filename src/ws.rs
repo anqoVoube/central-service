@@ -119,6 +119,14 @@ pub enum ServerMsg {
         pubkey: String,
         is_priority: bool,
     },
+    /// Broadcast after an operator flips a validator's [G] guaranteed
+    /// marker via the dashboard G button. Pure UX flag — dashboards
+    /// re-render the [G] pill; bots ignore this message. Serializes as
+    /// `{"type":"guaranteed_changed", "pubkey":"...", "is_guaranteed":true|false}`.
+    GuaranteedChanged {
+        pubkey: String,
+        is_guaranteed: bool,
+    },
     /// Broadcast after operator POSTs new fee config to
     /// `/fee-config.json`. Each connected bot logs and calls
     /// `std::process::exit(0)` so systemd auto-restarts it with the
@@ -218,6 +226,7 @@ struct AppState {
     leaders: LeaderStore,
     block_details: BlockDetailStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
+    guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
 }
 
@@ -235,6 +244,7 @@ pub async fn serve(
     leaders: LeaderStore,
     block_details: BlockDetailStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
+    guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
 ) -> anyhow::Result<()> {
     let state = AppState {
@@ -250,6 +260,7 @@ pub async fn serve(
         leaders,
         block_details,
         tip_priority,
+        guaranteed,
         fee_config_file,
     };
     let app = Router::new()
@@ -266,6 +277,8 @@ pub async fn serve(
         .route("/banned", get(serve_banned_pools))
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
+        .route("/guaranteed", post(serve_guaranteed_set))
+        .route("/guaranteed.bin", get(serve_guaranteed_snapshot))
         .route(
             "/fee-config.json",
             get(serve_fee_config_json).post(serve_fee_config_set),
@@ -463,6 +476,68 @@ async fn serve_tip_priority_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build tip-priority body")
+}
+
+#[derive(Deserialize)]
+struct GuaranteedSetReq {
+    pubkey: String,
+    /// `true` adds the [G] marker, `false` removes it.
+    is_guaranteed: bool,
+}
+
+/// Flip a validator's [G] guaranteed marker. Dashboard's G button
+/// relays here. Persists to sled + broadcasts `GuaranteedChanged`.
+/// IP-whitelisted. Pure UX flag — no bot consumption.
+async fn serve_guaranteed_set(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<GuaranteedSetReq>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /guaranteed from non-whitelisted ip {ip}");
+        println!("[whitelist] reject POST /guaranteed from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let pk = match solana_sdk::pubkey::Pubkey::from_str(req.pubkey.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid pubkey: {e}"))
+                .into_response();
+        }
+    };
+    if let Err(e) = state.guaranteed.set(pk, req.is_guaranteed) {
+        tracing::error!("guaranteed.set({pk}, {}) failed: {e:#}", req.is_guaranteed);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "sled write failed")
+            .into_response();
+    }
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// Bincode `Vec<Pubkey>` snapshot of the current [G] set.
+/// Dashboards fetch at startup + on poll to refresh in-memory state.
+async fn serve_guaranteed_snapshot(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting guaranteed.bin from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /guaranteed.bin from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let bytes = match state.guaranteed.snapshot_bincode() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("guaranteed snapshot build failed: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed")
+                .into_response();
+        }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes))
+        .expect("build guaranteed body")
 }
 
 /// Replace the fee-config JSON file + broadcast a reload signal so

@@ -23,6 +23,9 @@ pub struct Config {
     pub leaders_db_path: PathBuf,
     pub block_details_db_path: PathBuf,
     pub tip_priority_db_path: PathBuf,
+    /// Sled DB for the dashboard's [G] guaranteed-leader marker set.
+    /// Pure UX flag; no bot consumption. Defaults to `./guaranteed.db`.
+    pub guaranteed_db_path: PathBuf,
     /// Path to the fee-config JSON file that central auto-seeds on
     /// startup and serves to bots via `GET /fee-config.json`. Defaults
     /// to `./fee_config.json`.
@@ -78,6 +81,9 @@ impl Config {
         let tip_priority_db_path = std::env::var("TIP_PRIORITY_DB_PATH")
             .unwrap_or_else(|_| "tip_priority.db".into())
             .into();
+        let guaranteed_db_path = std::env::var("GUARANTEED_DB_PATH")
+            .unwrap_or_else(|_| "guaranteed.db".into())
+            .into();
         let fee_config_path = std::env::var("FEE_CONFIG_PATH")
             .unwrap_or_else(|_| "fee_config.json".into())
             .into();
@@ -99,6 +105,7 @@ impl Config {
             leaders_db_path,
             block_details_db_path,
             tip_priority_db_path,
+            guaranteed_db_path,
             fee_config_path,
             validators_csv_url,
         })

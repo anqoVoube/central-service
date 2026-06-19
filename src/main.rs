@@ -90,6 +90,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.tip_priority_db_path.display()
     );
 
+    let guaranteed =
+        central_service::guaranteed::GuaranteedStore::open(
+            &cfg.guaranteed_db_path,
+            broadcast_tx.clone(),
+        )?;
+    tracing::info!(
+        "guaranteed db opened at {}",
+        cfg.guaranteed_db_path.display()
+    );
+
     let fee_config_file = fee_config::FeeConfigFile::open(&cfg.fee_config_path)?;
 
     {
@@ -146,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         leaders,
         block_details,
         tip_priority,
+        guaranteed,
         fee_config_file,
     )
     .await

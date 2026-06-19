@@ -10,6 +10,7 @@ pub mod block_detail;
 pub mod config;
 pub mod discover;
 pub mod fee_config;
+pub mod guaranteed;
 pub mod harmonic;
 pub mod lanes;
 pub mod leaders;
