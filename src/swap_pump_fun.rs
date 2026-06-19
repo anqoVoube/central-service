@@ -41,6 +41,38 @@ pub fn pump_fun_pk() -> Pubkey { Pubkey::from_str(PUMP_FUN).unwrap() }
 pub fn pump_fee_program_pk() -> Pubkey { Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap() }
 pub fn pump_global_config_pk() -> Pubkey { Pubkey::from_str(PUMP_GLOBAL_CONFIG).unwrap() }
 pub fn pump_protocol_fee_recipient_pk() -> Pubkey { Pubkey::from_str(PUMP_PROTOCOL_FEE_RECIPIENT).unwrap() }
+
+/// Fetch the currently-active protocol fee recipient from PumpFun's
+/// `GlobalConfig` account. PumpFun stores up to 8 recipient slots
+/// starting at byte offset 57 (32 bytes each). The hardcoded
+/// `PUMP_PROTOCOL_FEE_RECIPIENT` becomes stale whenever PumpFun rotates
+/// — every `measure_pool_cu` call should resolve fresh via this helper
+/// so we always send to a recipient the on-chain program accepts.
+/// Errors if GlobalConfig can't be read or every slot is `Pubkey::default()`.
+pub async fn fetch_active_protocol_fee_recipient(
+    rpc: &solana_client::nonblocking::rpc_client::RpcClient,
+) -> anyhow::Result<Pubkey> {
+    use anyhow::Context;
+    let gc = rpc
+        .get_account(&pump_global_config_pk())
+        .await
+        .context("rpc.get_account(pump global_config)")?;
+    if gc.data.len() < 57 + 8 * 32 {
+        anyhow::bail!(
+            "pump GlobalConfig data too short: {} bytes",
+            gc.data.len()
+        );
+    }
+    for i in 0..8usize {
+        let start = 57 + i * 32;
+        let pk = Pubkey::try_from(&gc.data[start..start + 32])
+            .context("decode protocol_fee_recipient slot")?;
+        if pk != Pubkey::default() {
+            return Ok(pk);
+        }
+    }
+    anyhow::bail!("no valid protocol_fee_recipient in pump GlobalConfig (all 8 slots empty)")
+}
 pub fn pump_amm_fee_recipient_pk() -> Pubkey { Pubkey::from_str(PUMP_AMM_FEE_RECIPIENT).unwrap() }
 pub fn wsol_pk() -> Pubkey { Pubkey::from_str(WSOL).unwrap() }
 pub fn token_program_pk() -> Pubkey { Pubkey::from_str(TOKEN_PROGRAM).unwrap() }
@@ -80,6 +112,12 @@ pub struct PumpStaticPdas {
     pub user_volume_accumulator: Pubkey,
     pub user_volume_accumulator_wsol_ata: Pubkey,
     pub fee_config: Pubkey,
+    /// Currently-active protocol fee recipient. Resolved live from
+    /// `GlobalConfig` via `fetch_active_protocol_fee_recipient` for hot
+    /// paths that need to survive PumpFun rotations. Falls back to the
+    /// hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` const for callers that
+    /// can't go async.
+    pub protocol_fee_recipient: Pubkey,
     pub protocol_fee_recipient_ata: Pubkey,
     pub amm_fee_recipient: Pubkey,
     pub amm_fee_recipient_wsol_ata: Pubkey,
@@ -87,6 +125,16 @@ pub struct PumpStaticPdas {
 
 impl PumpStaticPdas {
     pub fn derive(wallet_pk: &Pubkey) -> Self {
+        // Backwards-compat wrapper — uses the const recipient. Callers
+        // that can resolve the live recipient should use
+        // `derive_with_recipient` instead.
+        Self::derive_with_recipient(wallet_pk, pump_protocol_fee_recipient_pk())
+    }
+
+    pub fn derive_with_recipient(
+        wallet_pk: &Pubkey,
+        protocol_fee_recipient: Pubkey,
+    ) -> Self {
         let pump = pump_fun_pk();
         let fee_program = pump_fee_program_pk();
         let token_prog = token_program_pk();
@@ -105,7 +153,7 @@ impl PumpStaticPdas {
         let (fee_config, _) =
             Pubkey::find_program_address(&[b"fee_config", pump.as_ref()], &fee_program);
         let protocol_fee_recipient_ata =
-            find_ata(&pump_protocol_fee_recipient_pk(), &wsol, &token_prog);
+            find_ata(&protocol_fee_recipient, &wsol, &token_prog);
         let amm_fee_recipient = pump_amm_fee_recipient_pk();
         let amm_fee_recipient_wsol_ata = find_ata(&amm_fee_recipient, &wsol, &token_prog);
 
@@ -115,6 +163,7 @@ impl PumpStaticPdas {
             user_volume_accumulator,
             user_volume_accumulator_wsol_ata,
             fee_config,
+            protocol_fee_recipient,
             protocol_fee_recipient_ata,
             amm_fee_recipient,
             amm_fee_recipient_wsol_ata,
@@ -190,7 +239,7 @@ pub fn build_pump_fun_buy_ix(
         AccountMeta::new(*wallet_wsol_ata, false),                        // 6
         AccountMeta::new(*pool_base_token_account, false),                // 7
         AccountMeta::new(*pool_quote_token_account, false),               // 8
-        AccountMeta::new_readonly(pump_protocol_fee_recipient_pk(), false), // 9
+        AccountMeta::new_readonly(static_pdas.protocol_fee_recipient, false), // 9
         AccountMeta::new(static_pdas.protocol_fee_recipient_ata, false),  // 10
         AccountMeta::new_readonly(*owner_program, false),                 // 11
         AccountMeta::new_readonly(token_program_pk(), false),             // 12
@@ -282,7 +331,7 @@ pub fn build_pump_fun_buy_exact_in_ix(
         AccountMeta::new(*wallet_wsol_ata, false),
         AccountMeta::new(*pool_base_token_account, false),
         AccountMeta::new(*pool_quote_token_account, false),
-        AccountMeta::new_readonly(pump_protocol_fee_recipient_pk(), false),
+        AccountMeta::new_readonly(static_pdas.protocol_fee_recipient, false),
         AccountMeta::new(static_pdas.protocol_fee_recipient_ata, false),
         AccountMeta::new_readonly(*owner_program, false),
         AccountMeta::new_readonly(token_program_pk(), false),

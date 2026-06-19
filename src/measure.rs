@@ -109,7 +109,14 @@ pub async fn measure_pool_cu(
         return Ok(MeasureOutcome::SkipNonWsolQuote);
     }
     let wallet_pk = wallet_kp.pubkey();
-    let pdas = PumpStaticPdas::derive(&wallet_pk);
+    // Resolve the LIVE protocol fee recipient from PumpFun's
+    // GlobalConfig — the hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` stales
+    // whenever PumpFun rotates the recipient slot, tripping error 6013
+    // (InvalidProtocolFeeRecipient). One RPC call per probe is cheap
+    // given the 10-min bg-worker cadence.
+    let active_recipient =
+        crate::swap_pump_fun::fetch_active_protocol_fee_recipient(rpc).await?;
+    let pdas = PumpStaticPdas::derive_with_recipient(&wallet_pk, active_recipient);
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
     let nonce_pk = Pubkey::from_str(BUY_NONCE)?;
     let tip_to = Pubkey::from_str(TIP_RECIPIENT)?;
