@@ -12,14 +12,27 @@
 //! `TIP_PRIORITY_SEED_B58`. Once non-empty, the seed is ignored — sled
 //! is the source of truth.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
 use solana_sdk::pubkey::Pubkey;
-use std::str::FromStr;
 use tokio::sync::broadcast;
 
 use crate::ws::ServerMsg;
+
+/// Current unix time in whole seconds. Used for TTP (temporary
+/// tip-priority) expiry stamping and comparison.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Initial seed for `tip_priority.db` on first boot — mirror of the bot's
 /// `statics/mod.rs::TIP_PRIORITY_LEADERS_B58`. Keep in sync with bot edits
@@ -116,14 +129,103 @@ impl TipPriorityStore {
         Ok(())
     }
 
+    /// Mark `pk` as **temporary** tip-priority (TTP): it counts as
+    /// tip-priority (included in the snapshot, fires the TP variants) until
+    /// `expires_at` (unix secs), after which `prune_expired` removes it and
+    /// it reverts to default. Re-marking an active entry just overwrites the
+    /// expiry, so it extends the timer. Value encoding: temporary entries
+    /// store the 8-byte LE expiry as the sled value; permanent entries store
+    /// an empty value (so old rows stay valid).
+    pub fn set_temporary(&self, pk: Pubkey, expires_at: u64) -> anyhow::Result<()> {
+        self.inner
+            .db
+            .insert(pk.as_ref(), &expires_at.to_le_bytes())
+            .context("sled insert ttp")?;
+        self.inner.db.flush().context("sled flush ttp")?;
+        let _ = self.inner.bcast.send(ServerMsg::TipPriorityChanged {
+            pubkey: pk.to_string(),
+            is_priority: true,
+        });
+        let remaining = expires_at.saturating_sub(now_unix());
+        println!("[tip-priority] set TTP pubkey={pk} expires_in={remaining}s");
+        Ok(())
+    }
+
+    /// Remove temporary (TTP) entries whose expiry has passed, broadcasting
+    /// `TipPriorityChanged{is_priority:false}` for each so every bot reverts
+    /// it to default. Permanent entries (empty value) are never touched.
+    /// Returns the count pruned. Called periodically by the sweeper task.
+    pub fn prune_expired(&self) -> anyhow::Result<usize> {
+        let now = now_unix();
+        let mut expired: Vec<Pubkey> = Vec::new();
+        for kv in self.inner.db.iter() {
+            let (k, v) = kv.context("sled iter")?;
+            if k.len() != 32 || v.len() != 8 {
+                continue; // not a pubkey, or a permanent entry
+            }
+            let expiry = u64::from_le_bytes(v.as_ref().try_into().unwrap());
+            if expiry <= now {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&k);
+                expired.push(Pubkey::new_from_array(arr));
+            }
+        }
+        for pk in &expired {
+            self.inner
+                .db
+                .remove(pk.as_ref())
+                .context("sled remove expired ttp")?;
+            let _ = self.inner.bcast.send(ServerMsg::TipPriorityChanged {
+                pubkey: pk.to_string(),
+                is_priority: false,
+            });
+            println!("[tip-priority] TTP expired pubkey={pk} -> default");
+        }
+        if !expired.is_empty() {
+            self.inner.db.flush().context("sled flush prune")?;
+        }
+        Ok(expired.len())
+    }
+
+    /// Active temporary (TTP) entries as `(pubkey_b58, remaining_secs)`.
+    /// Permanent entries are omitted. Drives the dashboard [TTP] pill.
+    pub fn temporary_status(&self) -> anyhow::Result<Vec<(String, u64)>> {
+        let now = now_unix();
+        let mut out = Vec::new();
+        for kv in self.inner.db.iter() {
+            let (k, v) = kv.context("sled iter")?;
+            if k.len() != 32 || v.len() != 8 {
+                continue;
+            }
+            let expiry = u64::from_le_bytes(v.as_ref().try_into().unwrap());
+            if expiry > now {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&k);
+                out.push((Pubkey::new_from_array(arr).to_string(), expiry - now));
+            }
+        }
+        Ok(out)
+    }
+
     /// Returns `bincode::serialize(&Vec<Pubkey>)` for `GET /tip-priority.bin`.
     /// Bots decode this at startup + on WS reconnect to refresh the full set.
     pub fn snapshot_bincode(&self) -> anyhow::Result<Vec<u8>> {
+        let now = now_unix();
         let mut out: Vec<Pubkey> = Vec::new();
         for kv in self.inner.db.iter() {
-            let (k, _) = kv.context("sled iter")?;
+            let (k, v) = kv.context("sled iter")?;
             if k.len() != 32 {
                 continue;
+            }
+            // Temporary (TTP) entries carry an 8-byte LE expiry — exclude
+            // expired ones so the snapshot bots fetch already drops them
+            // even before the sweeper prunes. Permanent entries (empty
+            // value) are always included.
+            if v.len() == 8 {
+                let expiry = u64::from_le_bytes(v.as_ref().try_into().unwrap());
+                if expiry <= now {
+                    continue;
+                }
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&k);

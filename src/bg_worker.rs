@@ -48,6 +48,23 @@ pub async fn run(
     // replay on boot. Letting the first worker tick wait `interval`
     // avoids double-firing on every restart.
     ticker.tick().await;
+    // CU-probe loop shares the bot's `BUY_NONCE`. Each landed probe tx
+    // advances the on-chain nonce → bot's geyser nonce-sub fires →
+    // `rebuild_all_prebuilds` spawns → every incoming shred/geyser dump
+    // during the rebuild window returns `Stale` and silently no-ops.
+    // OPT IN ONLY via `ENABLE_CU_PROBES=1`. When off (default), only
+    // the ATA-retry pass runs (ATA creation uses get_latest_blockhash,
+    // not the nonce, so no collision). Operators can still run
+    // `cargo run --bin measure_cu` ad-hoc while the bot is paused.
+    let cu_probes_enabled = std::env::var("ENABLE_CU_PROBES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !cu_probes_enabled {
+        tracing::warn!(
+            "[bg-worker] CU probes DISABLED (ENABLE_CU_PROBES != 1). Only ATA retries will run. \
+             Run `bin/measure_cu` manually with bot paused if needed."
+        );
+    }
     loop {
         ticker.tick().await;
         if let Err(e) = retry_pending_atas(
@@ -60,14 +77,16 @@ pub async fn run(
         {
             tracing::error!("[bg-worker] ata retry pass failed: {e:#}");
         }
-        if let Err(e) = measure_missing_cu(
-            Arc::clone(&repo),
-            rpc_url.clone(),
-            Arc::clone(&wallet_kp),
-        )
-        .await
-        {
-            tracing::error!("[bg-worker] cu measure pass failed: {e:#}");
+        if cu_probes_enabled {
+            if let Err(e) = measure_missing_cu(
+                Arc::clone(&repo),
+                rpc_url.clone(),
+                Arc::clone(&wallet_kp),
+            )
+            .await
+            {
+                tracing::error!("[bg-worker] cu measure pass failed: {e:#}");
+            }
         }
     }
 }

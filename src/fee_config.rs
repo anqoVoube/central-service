@@ -41,6 +41,12 @@ pub struct FeeConfig {
     /// as a "min sol" input on fee_table tier 1. Default 225M (0.225 SOL ~ $20).
     #[serde(default = "default_rung_min_sol_lamports")]
     pub rung_min_sol_lamports: u64,
+    /// Temporary-tip-priority (TTP) lifetime in seconds. When an operator
+    /// marks a validator "ttp" on the dashboard, central treats it as
+    /// tip-priority for this many seconds, then auto-reverts it to default.
+    /// Dashboard-configurable; default 1800 (30 min).
+    #[serde(default = "default_ttp_ttl_secs")]
+    pub ttp_ttl_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -65,6 +71,11 @@ pub fn default_buy_size_tiers() -> Vec<BuySizeTier> {
 /// Default rung floor — 0.225 SOL (~$20 at $89/SOL).
 pub fn default_rung_min_sol_lamports() -> u64 {
     225_000_000
+}
+
+/// Default TTP (temporary tip-priority) lifetime — 30 minutes.
+pub fn default_ttp_ttl_secs() -> u64 {
+    1800
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +136,12 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
     }
     if cfg.rung_min_sol_lamports == 0 {
         anyhow::bail!("rung_min_sol_lamports must be > 0");
+    }
+    if cfg.ttp_ttl_secs < 60 || cfg.ttp_ttl_secs > 86_400 {
+        anyhow::bail!(
+            "ttp_ttl_secs={} must be in [60, 86400] (1 min .. 24 h)",
+            cfg.ttp_ttl_secs
+        );
     }
     let last_max = cfg
         .fee_table
@@ -260,6 +277,7 @@ pub fn default_fee_config() -> FeeConfig {
         buy_slip_pct_of_dump_bps: default_buy_slip_pct_of_dump_bps(),
         buy_size_tiers: default_buy_size_tiers(),
         rung_min_sol_lamports: default_rung_min_sol_lamports(),
+        ttp_ttl_secs: default_ttp_ttl_secs(),
     }
 }
 

@@ -263,6 +263,22 @@ pub async fn serve(
         guaranteed,
         fee_config_file,
     };
+    // TTP sweeper: every 5s, drop expired temporary tip-priority entries.
+    // `prune_expired` broadcasts `tip_priority_changed{is_priority:false}`
+    // per removed validator, so bots revert it to default within ~5s of
+    // expiry. Permanent entries are never touched.
+    {
+        let tp = state.tip_priority.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if let Err(e) = tp.prune_expired() {
+                    tracing::error!("ttp prune_expired failed: {e:#}");
+                }
+            }
+        });
+    }
     let app = Router::new()
         .route("/", get(serve_sig_ui))
         .route("/ws", get(upgrade))
@@ -277,6 +293,7 @@ pub async fn serve(
         .route("/banned", get(serve_banned_pools))
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
+        .route("/tip-priority-status", get(serve_tip_priority_status))
         .route("/guaranteed", post(serve_guaranteed_set))
         .route("/guaranteed.bin", get(serve_guaranteed_snapshot))
         .route(
@@ -433,23 +450,73 @@ async fn serve_tip_priority_set(
                 .into_response();
         }
     };
-    let is_priority = match req.status.trim() {
-        "tip_priority" => true,
-        "default" => false,
+    // "ttp" = temporary tip-priority: tip-priority now, auto-reverts to
+    // default after the operator-configured `ttp_ttl_secs` (from fee config).
+    let result = match req.status.trim() {
+        "tip_priority" => state.tip_priority.set(pk, true),
+        "default" => state.tip_priority.set(pk, false),
+        "ttp" => {
+            let ttl = ttp_ttl_secs(&state);
+            let expires_at = now_unix().saturating_add(ttl);
+            state.tip_priority.set_temporary(pk, expires_at)
+        }
         other => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("status must be \"tip_priority\" or \"default\", got {other:?}"),
+                format!(
+                    "status must be \"tip_priority\", \"ttp\", or \"default\", got {other:?}"
+                ),
             )
                 .into_response();
         }
     };
-    if let Err(e) = state.tip_priority.set(pk, is_priority) {
-        tracing::error!("tip_priority.set({pk}, {is_priority}) failed: {e:#}");
+    if let Err(e) = result {
+        tracing::error!("tip_priority set({pk}, {:?}) failed: {e:#}", req.status);
         return (StatusCode::INTERNAL_SERVER_ERROR, "sled write failed")
             .into_response();
     }
     (StatusCode::OK, "ok").into_response()
+}
+
+/// Current unix time in whole seconds.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read the operator-configured TTP lifetime (seconds) from the live fee
+/// config, falling back to the built-in default if it can't be read/parsed.
+fn ttp_ttl_secs(state: &AppState) -> u64 {
+    state
+        .fee_config_file
+        .read_bytes()
+        .ok()
+        .and_then(|b| serde_json::from_slice::<crate::fee_config::FeeConfig>(&b).ok())
+        .map(|c| c.ttp_ttl_secs)
+        .unwrap_or_else(crate::fee_config::default_ttp_ttl_secs)
+}
+
+/// JSON map `{ "<pubkey>": remaining_secs, ... }` of active temporary
+/// (TTP) entries. Dashboard polls this to render the [TTP] pill + countdown.
+async fn serve_tip_priority_status(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    match state.tip_priority.temporary_status() {
+        Ok(rows) => {
+            let map: std::collections::HashMap<String, u64> = rows.into_iter().collect();
+            Json(map).into_response()
+        }
+        Err(e) => {
+            tracing::error!("tip_priority temporary_status failed: {e:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "status failed").into_response()
+        }
+    }
 }
 
 /// Bincode `Vec<Pubkey>` snapshot of the current tip-priority set.
