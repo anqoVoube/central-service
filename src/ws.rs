@@ -184,6 +184,18 @@ pub enum ServerMsg {
     PoolDisabled {
         pool: String,
     },
+    /// Rebroadcast of a bot's fire sig prefix. Only FR2 subscribes to
+    /// the wallet-scoped `transactions_status` geyser filter, so every
+    /// location's failures stream through FR2 — but FR2's
+    /// `DISPATCHED_SIG_PREFIXES` only contains FR2's own fires unless
+    /// siblings actively broadcast theirs. Every bot's
+    /// `handle_runtime_msg` calls `intern_dispatched_sig(prefix)` on
+    /// this message so FR2 recognizes sibling fires when their failure
+    /// arrives via geyser. Serializes as
+    /// `{"type":"sig_dispatched","prefix":"<8 base58>"}`.
+    SigDispatched {
+        prefix: String,
+    },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
@@ -209,6 +221,13 @@ enum ClientMsg {
         dumper_pk: String,
         dumper_ata: String,
         amount_in: u64,
+    },
+    /// A bot just fired a tx — its 8-char sig prefix is echoed to
+    /// central for fan-out to every WS client. Closes the FR2-only
+    /// `transactions_status` cross-location gap (see
+    /// `ServerMsg::SigDispatched` for the design rationale).
+    SigDispatched {
+        prefix: String,
     },
 }
 
@@ -1239,6 +1258,25 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             (Err(e), _) => tracing::warn!("opp_check bad dumper_pk {dumper_pk}: {e}"),
                             (_, Err(e)) => tracing::warn!("opp_check bad dumper_ata {dumper_ata}: {e}"),
                         }
+                    }
+                    Ok(ClientMsg::SigDispatched { prefix }) => {
+                        // Sanity-bound to the 8-char base58 prefix the bot
+                        // emits. Anything else is malformed — drop silently
+                        // to avoid log spam from a bad actor or stale code.
+                        if prefix.len() != 8
+                            || !prefix.chars().all(|c| c.is_ascii_alphanumeric())
+                        {
+                            tracing::warn!("sig_dispatched malformed prefix: {prefix:?}");
+                            continue;
+                        }
+                        // Fan out to every connected bot. Each bot's
+                        // `handle_runtime_msg` calls `intern_dispatched_sig`
+                        // (non-broadcasting) so the inbound message doesn't
+                        // recursively echo. Includes the originating bot;
+                        // its local `record_dispatched_sig` already
+                        // inserted the prefix, so the re-insert is a
+                        // harmless no-op (HashMap idempotent on same value).
+                        let _ = state.tx.send(ServerMsg::SigDispatched { prefix });
                     }
                     Ok(ClientMsg::PositionClosed(r)) => {
                         tracing::info!(

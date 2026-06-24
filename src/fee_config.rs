@@ -81,8 +81,16 @@ pub fn default_ttp_ttl_secs() -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FireProfiles {
     pub multiplier_x10: u32,
+    /// Per-tx ceiling for DEFAULT senders (non-Jito, non-Harmonic).
+    /// `None` → bot falls back to `MAX_TOTAL_LAMPORTS_PER_TX` ($22).
+    /// Surfaced in dashboard as "max default sender fee ($)".
+    #[serde(default, alias = "per_tx_cap_lamports")]
+    pub per_tx_cap_lamports_default: Option<u64>,
+    /// Per-tx ceiling for Jito + Harmonic. `None` → bot falls back to
+    /// `HARMONIC_JITO_TOTAL_LAMPORTS_PER_TX` ($33). Surfaced in dashboard
+    /// as "max jito+harmonic fee ($)".
     #[serde(default)]
-    pub per_tx_cap_lamports: Option<u64>,
+    pub per_tx_cap_lamports_jito_harmonic: Option<u64>,
     pub tp: ProfileVariations,
     pub def: ProfileVariations,
 }
@@ -129,6 +137,18 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
         anyhow::bail!(
             "multiplier_x10={} is absurdly high (cap: 1000 = 100×); refusing",
             cfg.fire_profiles.multiplier_x10
+        );
+    }
+    // Per-tx cap sanity guards. None = "use compiled default" (bot side).
+    // Some(0) would silently zero every fire's budget — reject.
+    if let Some(0) = cfg.fire_profiles.per_tx_cap_lamports_default {
+        anyhow::bail!(
+            "per_tx_cap_lamports_default=0 disables every default-sender fire; refusing"
+        );
+    }
+    if let Some(0) = cfg.fire_profiles.per_tx_cap_lamports_jito_harmonic {
+        anyhow::bail!(
+            "per_tx_cap_lamports_jito_harmonic=0 disables every Jito/Harmonic fire; refusing"
         );
     }
     if cfg.fee_table.is_empty() {
@@ -258,7 +278,8 @@ pub fn default_fee_config() -> FeeConfig {
         ],
         fire_profiles: FireProfiles {
             multiplier_x10: 30,
-            per_tx_cap_lamports: None,
+            per_tx_cap_lamports_default: None,
+            per_tx_cap_lamports_jito_harmonic: None,
             tp: ProfileVariations {
                 splits: vec![
                     FeeTipSplit { fee_pct: 80, tip_pct: 20 },
