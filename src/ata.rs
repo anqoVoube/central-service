@@ -137,22 +137,15 @@ pub async fn create(
                 eprintln!("[ata] {pool} mark_ata_confirmed failed: {e:#}");
             }
             // Optionally fire a 0.001 SOL probe buy to record the pool's
-            // CU consumption. GATED behind `ENABLE_CU_PROBES=1` because
-            // the probe shares the bot's `BUY_NONCE` — advancing it
-            // triggers a bot-wide prebuild rebuild that silently drops
-            // any incoming dump during the rebuild window with
-            // `FirePrebuiltOutcome::Stale`. Default OFF; bots fall back
-            // to `PREBUILT_CU_LIMIT_FALLBACK = 130_000` for unmeasured
-            // pools. Run `bin/measure_cu` manually with bot paused to
-            // backfill.
-            let cu_probes_enabled = std::env::var("ENABLE_CU_PROBES")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let measured_cu = if cu_probes_enabled {
-                measure_one(&rpc, &wallet_kp, &doc, &repo, &pool).await
-            } else {
-                None
-            };
+            // CU consumption. The underlying `measure_pool_cu` now signs
+            // with `get_latest_blockhash()` (see measure.rs module doc),
+            // so there's no longer a BUY_NONCE collision with the bot
+            // and the prior `ENABLE_CU_PROBES` gate has been removed.
+            // The probe still costs ~226k lamports of real on-chain
+            // budget per pool (tip + base fee + WSOL swap-in) — fire
+            // unconditionally on every fresh pool so the first WS
+            // `new_pool` broadcast carries a measured CU value.
+            let measured_cu = measure_one(&rpc, &wallet_kp, &doc, &repo, &pool).await;
             let _ = broadcast.send(ServerMsg::NewPool {
                 pool: doc.pool.clone(),
                 accounts: doc.accounts.clone(),

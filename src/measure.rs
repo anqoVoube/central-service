@@ -2,19 +2,34 @@
 //!   - `bin/measure_cu.rs` (batch sweep over all unmeasured pools)
 //!   - `ata::create` (auto-measure each new pool right after its ATA lands,
 //!     before `NewPool` is broadcast to bots)
+//!   - `bg_worker::measure_missing_cu` (periodic 10-min sweep)
 //!
-//! The on-chain tx layout is identical to the bot's production buy:
-//!   ix[0] advance_nonce_account
-//!   ix[1] system::transfer(TIP_LAMPORTS → SUPRA tip vault)
-//!   ix[2] set_compute_unit_limit(CU_LIMIT_CEILING)
-//!   ix[3] set_compute_unit_price(CU_PRICE)
-//!   ix[4] set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT)
-//!   ix[5] pump_fun_buy_exact_in(sol_in = SWAP_IN_LAMPORTS)
+//! Tx layout (5 ixs):
+//!   ix[0] system::transfer(TIP_LAMPORTS → Zeroslot tip vault)
+//!   ix[1] set_compute_unit_limit(CU_LIMIT_CEILING)
+//!   ix[2] set_compute_unit_price(CU_PRICE)
+//!   ix[3] set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT)
+//!   ix[4] pump_fun_buy_exact_in(sol_in = SWAP_IN_LAMPORTS)
 //!
-//! Tip-at-slot-1 (vs the previous tip-at-end) drops measured CU by a few
-//! thousand units. Order must match the bot's production layout in
-//! `services::build_tx`, otherwise stored values don't reflect what the
-//! bot actually consumes.
+//! Signed with `get_latest_blockhash()` — NOT the bot's `BUY_NONCE`. The
+//! prior nonce-based signing advanced BUY_NONCE on every probe, which
+//! tripped the bot's geyser nonce-sub and triggered a fleet-wide
+//! `rebuild_all_prebuilds`, dropping any incoming dump during the
+//! rebuild window as `Stale`. The blockhash variant has zero
+//! interaction with the bot, so bg_worker and ata::create can both
+//! invoke it freely (no ENABLE_CU_PROBES gate needed).
+//!
+//! CU skew vs. bot's production buy: production buys carry a
+//! 6th ix (`advance_nonce_account`) costing ~3,000-5,000 CU. The
+//! measured value is therefore ~3-5k LOW relative to what the bot
+//! actually consumes. The bot's `BUY_CU_MARGIN_PCT` (≥5%) absorbs
+//! this delta; if you observe `ExceededMaxCUs` aborts on pools whose
+//! CU was bg-worker-measured, bump the bot-side margin.
+//!
+//! Tip-at-slot-1 (vs the previous tip-at-end) drops measured CU by a
+//! few thousand units. Order must match the bot's production layout in
+//! `services::build_tx`, otherwise stored values don't reflect what
+//! the bot actually consumes.
 //!
 //! Returns the raw `compute_units_consumed` from `meta`. The bot applies
 //! its `BUY_CU_MARGIN_PCT` at fire time — single source of truth in the bot.
@@ -27,8 +42,6 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
-    hash::Hash,
-    instruction::{AccountMeta, Instruction},
     message::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
@@ -41,10 +54,15 @@ use solana_transaction_status_client_types::{
 
 use crate::pool::{PoolAccounts, PoolDoc, PumpFunAccounts};
 use crate::swap_pump_fun::{
-    build_pump_fun_buy_ix, find_ata, system_program_pk, wsol_pk, PumpStaticPdas,
+    build_pump_fun_buy_ix, find_ata, wsol_pk, PumpStaticPdas,
     token_program_pk,
 };
 
+/// **Deprecated**: kept as a const so other crates / bins importing
+/// `measure::BUY_NONCE` don't break. `measure_pool_cu` no longer uses
+/// it — see the module doc-comment. Will be removed once no consumers
+/// reference it.
+#[deprecated(note = "measure_pool_cu now signs with get_latest_blockhash, this is no longer used")]
 pub const BUY_NONCE: &str = "RaL8vMu4CCapTZSsNkB4w5AqVi8xErYfMmakQXGDtJ4";
 /// Tip recipient — Zeroslot's tip account. Replaces the prior SUPRA
 /// vault address (which was paired with the old public-RPC send).
@@ -63,8 +81,6 @@ pub const CU_LIMIT_CEILING: u32 = 400_000;
 pub const CU_PRICE: u64 = 1_000_000;
 pub const LOADED_DATA_SIZE_LIMIT: u32 = 13_500_000;
 pub const SLIPPAGE_BPS: u32 = 5_000;  // 50% — we just want it to land
-
-const SYSVAR_RECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
 /// Outcome of a single measurement attempt.
 pub enum MeasureOutcome {
@@ -89,9 +105,10 @@ pub enum MeasureOutcome {
 ///   errors otherwise.
 /// - Wallet must have enough WSOL in its WSOL ATA to cover `SWAP_IN_LAMPORTS`
 ///   plus base fee. Caller doesn't pre-check; tx will fail if balance is low.
-/// - The bot's durable nonce (`BUY_NONCE`) must be intact. Concurrent use
-///   from the bot will collide; run only when the bot is paused or accept
-///   the occasional retry on nonce mismatch.
+///
+/// No nonce collision: signs with `get_latest_blockhash()`. Safe to run
+/// concurrently with the bot. See the module doc-comment for the ~3-5k
+/// CU underestimate this implies vs the bot's production buy.
 pub async fn measure_pool_cu(
     rpc: &RpcClient,
     wallet_kp: &Keypair,
@@ -105,6 +122,9 @@ pub async fn measure_pool_cu(
     // Skip non-WSOL-quoted PumpFun pools (e.g. USDC-quoted). Our buy ix
     // hardcodes WSOL on the quote side, so any other quote mint trips
     // `InvalidQuoteMint` (error 0x1779) and burns a real on-chain fee.
+    // Belt-and-suspenders: callers now also filter at the Mongo layer
+    // (mongo.rs::pools_*_for_*), so reaching this branch in production
+    // implies a stale row or a manual call from `bin/measure_cu`.
     if pump.quote_mint != wsol_pk().to_string() {
         return Ok(MeasureOutcome::SkipNonWsolQuote);
     }
@@ -118,9 +138,7 @@ pub async fn measure_pool_cu(
         crate::swap_pump_fun::fetch_active_protocol_fee_recipient(rpc).await?;
     let pdas = PumpStaticPdas::derive_with_recipient(&wallet_pk, active_recipient);
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
-    let nonce_pk = Pubkey::from_str(BUY_NONCE)?;
     let tip_to = Pubkey::from_str(TIP_RECIPIENT)?;
-    let sysvar_recent_blockhashes = Pubkey::from_str(SYSVAR_RECENT_BLOCKHASHES)?;
 
     measure_inner(
         rpc,
@@ -128,8 +146,6 @@ pub async fn measure_pool_cu(
         wallet_pk,
         wallet_wsol_ata,
         &pdas,
-        nonce_pk,
-        sysvar_recent_blockhashes,
         tip_to,
         pool_pk,
         pump,
@@ -144,8 +160,6 @@ async fn measure_inner(
     wallet_pk: Pubkey,
     wallet_wsol_ata: Pubkey,
     pdas: &PumpStaticPdas,
-    nonce_pk: Pubkey,
-    sysvar_recent_blockhashes: Pubkey,
     tip_to: Pubkey,
     pool_pk: Pubkey,
     pump: &PumpFunAccounts,
@@ -190,26 +204,16 @@ async fn measure_inner(
         SLIPPAGE_BPS,
     );
 
-    // 3. Nonce blockhash.
-    let nonce_acct = rpc.get_account(&nonce_pk).await.context("get nonce account")?;
-    if nonce_acct.data.len() < 72 {
-        anyhow::bail!("nonce account data too short");
-    }
-    let nonce_hash_bytes: [u8; 32] = nonce_acct.data[40..72]
-        .try_into()
-        .context("slice nonce blockhash")?;
-    let nonce_blockhash = Hash::new_from_array(nonce_hash_bytes);
+    // 3. Fresh blockhash (no nonce — see module doc).
+    let latest_blockhash = rpc
+        .get_latest_blockhash()
+        .await
+        .context("get_latest_blockhash")?;
 
-    // 4. Compose the tx — same layout as the bot's production buy.
-    let advance_nonce_ix = Instruction {
-        program_id: system_program_pk(),
-        accounts: vec![
-            AccountMeta::new(nonce_pk, false),
-            AccountMeta::new_readonly(sysvar_recent_blockhashes, false),
-            AccountMeta::new_readonly(wallet_pk, true),
-        ],
-        data: vec![4, 0, 0, 0],
-    };
+    // 4. Compose the tx — same layout as the bot's production buy MINUS
+    // the leading advance_nonce_ix. See module doc for the CU-skew
+    // caveat (advance_nonce ix costs ~3-5k CU on chain; production buys
+    // include it, so measured value is ~3-5k LOW).
     let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT_CEILING);
     let cu_price_ix = ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE);
     let data_size_ix =
@@ -218,18 +222,17 @@ async fn measure_inner(
 
     let message = Message::new_with_blockhash(
         &[
-            advance_nonce_ix,
-            tip_ix,            // slot 1 — empirically cheaper than slot N
+            tip_ix,            // slot 0 — empirically cheaper than slot N
             cu_limit_ix,
             cu_price_ix,
             data_size_ix,
             swap_ix,
         ],
         Some(&wallet_pk),
-        &nonce_blockhash,
+        &latest_blockhash,
     );
     let mut tx = Transaction::new_unsigned(message);
-    tx.sign(&[wallet_kp], nonce_blockhash);
+    tx.sign(&[wallet_kp], latest_blockhash);
 
     // 5. Send via Zeroslot (replaces the prior public-RPC
     // send_transaction call so central's outbound CU probes go through

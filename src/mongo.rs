@@ -127,10 +127,23 @@ impl Repo {
         &self,
         cap: i32,
     ) -> anyhow::Result<Vec<PoolDoc>> {
+        // Bg_worker only processes PumpFun rows + WSOL-quote pools (the
+        // bot's trading scope). Filter at the DB layer so:
+        //   (a) non-PumpFun pending rows don't waste a Mongo cursor +
+        //       Rust-side silent skip
+        //   (b) USDC- / other-quoted PumpFun pools are never retried —
+        //       our buy ix is WSOL-only and would revert with
+        //       `InvalidQuoteMint` anyway.
+        // PoolDoc serializes as `{pool_type, accounts: {...}}` via
+        // `#[serde(tag = "pool_type", content = "accounts")]`, so the
+        // Mongo path for PumpFun's `quote_mint` field is
+        // `accounts.quote_mint`.
         let filter = doc! {
             "ata_status": "pending",
             "ata_attempts": { "$lt": cap },
             "disabled": { "$ne": true },
+            "pool_type": "pump_fun",
+            "accounts.quote_mint": crate::swap_pump_fun::WSOL,
         };
         Ok(self.pools.find(filter).await?.try_collect().await?)
     }
@@ -235,9 +248,12 @@ impl Repo {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let stale_cutoff_ms = now_ms - crate::config::POOL_MAX_AGE_MS;
+        // WSOL-quote-only — same reasoning as pools_pending_for_retry +
+        // pools_for_cu_measurement: our buy ix is WSOL-only.
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
+            "accounts.quote_mint": crate::swap_pump_fun::WSOL,
             "$or": [
                 { "is_unique": true },
                 { "pair_created_at_ms": { "$gt": stale_cutoff_ms } },
@@ -262,6 +278,8 @@ impl Repo {
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
+            // WSOL-quote-only — our buy ix is WSOL-only.
+            "accounts.quote_mint": crate::swap_pump_fun::WSOL,
             "$and": [
                 {
                     "$or": [
