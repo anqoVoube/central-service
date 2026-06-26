@@ -44,11 +44,21 @@ pub fn pump_protocol_fee_recipient_pk() -> Pubkey { Pubkey::from_str(PUMP_PROTOC
 
 /// Fetch the currently-active protocol fee recipient from PumpFun's
 /// `GlobalConfig` account. PumpFun stores up to 8 recipient slots
-/// starting at byte offset 57 (32 bytes each). The hardcoded
-/// `PUMP_PROTOCOL_FEE_RECIPIENT` becomes stale whenever PumpFun rotates
-/// — every `measure_pool_cu` call should resolve fresh via this helper
-/// so we always send to a recipient the on-chain program accepts.
-/// Errors if GlobalConfig can't be read or every slot is `Pubkey::default()`.
+/// starting at byte offset 57 (32 bytes each).
+///
+/// Selection policy (avoids the InvalidProtocolFeeRecipient 6013 error
+/// when pump rotates slot 0 to a non-accepted value):
+///   1. PREFER the hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` if it appears
+///      in any of the 8 slots. The bot's production swap path uses this
+///      same const, so picking it keeps central + bot in lockstep — if
+///      the bot's fires are landing, the const is in the live set.
+///   2. FALL BACK to the first non-default slot if the preferred const
+///      has been rotated out entirely.
+///   3. Error only if every slot is `Pubkey::default()` or the account
+///      data is too short to contain all 8 slots.
+///
+/// Logs the chosen slot index so operators can diagnose rotations
+/// (slot N changing implies the next pump.fun upgrade rotated again).
 pub async fn fetch_active_protocol_fee_recipient(
     rpc: &solana_client::nonblocking::rpc_client::RpcClient,
 ) -> anyhow::Result<Pubkey> {
@@ -63,15 +73,50 @@ pub async fn fetch_active_protocol_fee_recipient(
             gc.data.len()
         );
     }
+    let preferred = pump_protocol_fee_recipient_pk();
+    let mut first_non_default: Option<(usize, Pubkey)> = None;
+    let mut all_slots: [Option<Pubkey>; 8] = [None; 8];
     for i in 0..8usize {
         let start = 57 + i * 32;
         let pk = Pubkey::try_from(&gc.data[start..start + 32])
             .context("decode protocol_fee_recipient slot")?;
-        if pk != Pubkey::default() {
+        if pk == Pubkey::default() {
+            continue;
+        }
+        all_slots[i] = Some(pk);
+        if pk == preferred {
+            tracing::debug!(
+                "[pump-recipient] using preferred (slot {i}): {pk}"
+            );
             return Ok(pk);
         }
+        if first_non_default.is_none() {
+            first_non_default = Some((i, pk));
+        }
     }
-    anyhow::bail!("no valid protocol_fee_recipient in pump GlobalConfig (all 8 slots empty)")
+    match first_non_default {
+        Some((idx, pk)) => {
+            // Preferred const rotated out — log loudly so operator can
+            // update `PUMP_PROTOCOL_FEE_RECIPIENT` (used by the bot's
+            // swap path) to match what's actually live.
+            let live_set: Vec<String> = all_slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.map(|pk| format!("[{i}]={pk}")))
+                .collect();
+            tracing::warn!(
+                "[pump-recipient] preferred const {preferred} NOT in GlobalConfig live set — \
+                 falling back to slot {idx}: {pk}. live={:?}. \
+                 Bot's hardcoded swap path will hit InvalidProtocolFeeRecipient too; \
+                 update statics::PUMP_PROTOCOL_FEE_RECIPIENT_PUBKEY to a live one ASAP.",
+                live_set
+            );
+            Ok(pk)
+        }
+        None => anyhow::bail!(
+            "no valid protocol_fee_recipient in pump GlobalConfig (all 8 slots empty)"
+        ),
+    }
 }
 pub fn pump_amm_fee_recipient_pk() -> Pubkey { Pubkey::from_str(PUMP_AMM_FEE_RECIPIENT).unwrap() }
 pub fn wsol_pk() -> Pubkey { Pubkey::from_str(WSOL).unwrap() }
