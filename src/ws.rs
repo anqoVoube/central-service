@@ -80,6 +80,10 @@ pub enum ServerMsg {
         /// legacy bots.
         #[serde(default)]
         liquidity_usd: f64,
+        /// Slot the bot read at fire time (see `OpenedReport::observed_slot`).
+        /// Surfaces on the dashboard's history/live page.
+        #[serde(default)]
+        observed_slot: u64,
     },
     /// Forwarded to all locations after the lander reports it. Each location
     /// uses this to clear `Holding::Empty`. `sell_price_sol` / `tokens_sold`
@@ -175,6 +179,9 @@ pub enum ServerMsg {
         /// Bot's local dispatch latency at fire time (µs). 0 for legacy bots.
         #[serde(default)]
         process_us: u32,
+        /// Slot the bot read at fire time (see `FailedReport::observed_slot`).
+        #[serde(default)]
+        observed_slot: u64,
     },
     /// Broadcast after the dashboard bans a pool (`POST /ban`). Every
     /// location drops the pool from its in-memory `Pools` + prebuild
@@ -1201,6 +1208,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             leader: None,
                             cost_lamports: r.cost_lamports,
                             liquidity_usd: r.liquidity_usd,
+                            observed_slot: r.observed_slot,
                         });
                         // Resolve leader async; emit a follow-up
                         // `leader_resolved` JSONL line + WS broadcast that
@@ -1361,6 +1369,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                                 leader: leader.clone(),
                                 liquidity_usd: r.liquidity_usd,
                                 process_us: r.process_us,
+                                observed_slot: r.observed_slot,
                             };
                             positions.record_failed(r, leader);
                             let _ = bcast.send(broadcast);

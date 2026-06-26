@@ -70,6 +70,9 @@ pub struct OpenPosition {
     /// trigger fired. 0 for legacy lines.
     #[serde(default)]
     pub liquidity_usd: f64,
+    /// Slot the bot read at fire time. Surfaces on the dashboard.
+    #[serde(default)]
+    pub observed_slot: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +101,13 @@ pub struct OpenedReport {
     /// See `OpenPosition::liquidity_usd`. 0 for legacy bots.
     #[serde(default)]
     pub liquidity_usd: f64,
+    /// The slot the bot read at fire time. The bot's leader-lookup gate
+    /// uses `observed_slot + 1` (see `is_apac` / `is_tip_priority`).
+    /// Surfaced to the dashboard so operators can see how stale the
+    /// bot's slot view was vs the opp tx's actual landing slot. 0 if
+    /// missing from the report (cold boot / UDP-turbine fallback).
+    #[serde(default)]
+    pub observed_slot: u64,
 }
 
 /// A buy attempt that landed on chain but reverted — the wallet paid the
@@ -147,6 +157,10 @@ pub struct FailedReport {
     /// legacy bots that didn't send it.
     #[serde(default)]
     pub process_us: u32,
+    /// Slot the bot read at fire time (same semantic as `OpenedReport`).
+    /// Surfaces on the dashboard. 0 if missing.
+    #[serde(default)]
+    pub observed_slot: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -214,6 +228,9 @@ enum LogEvent {
         /// See `OpenPosition::liquidity_usd`. 0 for legacy lines.
         #[serde(default)]
         liquidity_usd: f64,
+        /// Slot the bot read at fire time (see `OpenedReport::observed_slot`).
+        #[serde(default)]
+        observed_slot: u64,
     },
     Closed {
         ts_ms: u64,
@@ -268,6 +285,9 @@ enum LogEvent {
         /// `#[serde(default)]` so pre-patch lines deserialize as 0.
         #[serde(default)]
         process_us: u32,
+        /// Slot the bot read at fire time (see `FailedReport::observed_slot`).
+        #[serde(default)]
+        observed_slot: u64,
     },
     /// Late-arriving leader info, emitted after central's async resolve
     /// completes. Keyed by `opportunity_sig`. The dashboard merges this
@@ -338,6 +358,7 @@ impl Positions {
             leader: leader.clone(),
             cost_lamports: r.cost_lamports,
             liquidity_usd: r.liquidity_usd,
+            observed_slot: r.observed_slot,
         };
         self.inner.open.lock().expect("positions mutex poisoned")
             .insert(r.pool.clone(), pos);
@@ -357,6 +378,7 @@ impl Positions {
             leader,
             cost_lamports: r.cost_lamports,
             liquidity_usd: r.liquidity_usd,
+            observed_slot: r.observed_slot,
         });
     }
 
@@ -408,6 +430,7 @@ impl Positions {
             leader,
             liquidity_usd: r.liquidity_usd,
             process_us: r.process_us,
+            observed_slot: r.observed_slot,
         });
     }
 }
@@ -447,6 +470,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 leader,
                 cost_lamports,
                 liquidity_usd,
+                observed_slot,
             } => {
                 out.insert(
                     pool.clone(),
@@ -466,6 +490,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         leader,
                         cost_lamports,
                         liquidity_usd,
+                        observed_slot,
                     },
                 );
             }
