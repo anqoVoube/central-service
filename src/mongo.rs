@@ -250,9 +250,14 @@ impl Repo {
         let stale_cutoff_ms = now_ms - crate::config::POOL_MAX_AGE_MS;
         // WSOL-quote-only — same reasoning as pools_pending_for_retry +
         // pools_for_cu_measurement: our buy ix is WSOL-only.
+        // `disabled: { $ne: true }` excludes operator-banned pools so
+        // bg_worker's divergence-recovery pass can't resurrect them by
+        // recreating the ATA. Matches the exclusion in load_all_confirmed
+        // and pools_pending_for_retry.
         let filter = doc! {
             "ata_status": "confirmed",
             "pool_type": "pump_fun",
+            "disabled": { "$ne": true },
             "accounts.quote_mint": crate::swap_pump_fun::WSOL,
             "$or": [
                 { "is_unique": true },
