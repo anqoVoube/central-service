@@ -91,6 +91,17 @@ pub struct FireProfiles {
     /// as "max jito+harmonic fee ($)".
     #[serde(default)]
     pub per_tx_cap_lamports_jito_harmonic: Option<u64>,
+    /// Per-COMPONENT priority-fee ceiling for any single variant tx.
+    /// `None` → bot falls back to hardcoded `MAX_PRIORITY_FEE_LAMPORTS`
+    /// (0.333 SOL). Dashboard label: "max priority fee per tx ($)".
+    /// Jito + Harmonic bypass this (sum cap only for them).
+    #[serde(default)]
+    pub max_priority_fee_lamports: Option<u64>,
+    /// Per-COMPONENT tip ceiling for any single variant tx. `None` →
+    /// bot falls back to hardcoded `MAX_TIP_LAMPORTS` (0.333 SOL).
+    /// Dashboard label: "max tip per tx ($)". Jito + Harmonic bypass.
+    #[serde(default)]
+    pub max_tip_lamports: Option<u64>,
     pub tp: ProfileVariations,
     pub def: ProfileVariations,
 }
@@ -280,6 +291,8 @@ pub fn default_fee_config() -> FeeConfig {
             multiplier_x10: 30,
             per_tx_cap_lamports_default: None,
             per_tx_cap_lamports_jito_harmonic: None,
+            max_priority_fee_lamports: None,
+            max_tip_lamports: None,
             tp: ProfileVariations {
                 splits: vec![
                     FeeTipSplit { fee_pct: 80, tip_pct: 20 },
