@@ -9,7 +9,14 @@
 //!   ix[1] set_compute_unit_limit(CU_LIMIT_CEILING)
 //!   ix[2] set_compute_unit_price(CU_PRICE)
 //!   ix[3] set_loaded_accounts_data_size_limit(LOADED_DATA_SIZE_LIMIT)
-//!   ix[4] pump_fun_buy_exact_in(sol_in = SWAP_IN_LAMPORTS)
+//!   ix[4] pump_fun_buy_exact_in(quote_amount_in = SWAP_IN_LAMPORTS)
+//!
+//! Uses the `BuyExactIn` PumpFun variant (NOT ordinary `Buy`). The
+//! ordinary `Buy` ix was returning error 6013 (InvalidProtocolFeeRecipient)
+//! on the on-chain check even with the recipient resolved live from
+//! `GlobalConfig`. BuyExactIn is the SDK-recommended variant for
+//! fixed-input swaps and bypasses the failing path. CU consumption
+//! is ~3k higher than ordinary Buy.
 //!
 //! Signed with `get_latest_blockhash()` — NOT the bot's `BUY_NONCE`. The
 //! prior nonce-based signing advanced BUY_NONCE on every probe, which
@@ -54,7 +61,7 @@ use solana_transaction_status_client_types::{
 
 use crate::pool::{PoolAccounts, PoolDoc, PumpFunAccounts};
 use crate::swap_pump_fun::{
-    build_pump_fun_buy_ix, find_ata, wsol_pk, PumpStaticPdas,
+    build_pump_fun_buy_exact_in_ix, find_ata, wsol_pk, PumpStaticPdas,
     token_program_pk,
 };
 
@@ -186,7 +193,17 @@ async fn measure_inner(
     let quote_reserves =
         u64::from_le_bytes(quote_vault_acct.data[64..72].try_into().unwrap());
 
-    let swap_ix = build_pump_fun_buy_ix(
+    // Use the BuyExactIn variant (PUMP_FUN_PREFIX_BUY_EXACT_IN) instead
+    // of the ordinary Buy ix. The ordinary `Buy` variant was returning
+    // error 6013 (InvalidProtocolFeeRecipient) on the on-chain check at
+    // pump-amm/src/instructions/swap/mod.rs:160 despite the recipient
+    // being present in GlobalConfig's 8-slot recipient array. Switching
+    // to BuyExactIn — which is the SDK-recommended variant for fixed-
+    // input swaps anyway — bypasses the failing path. CU consumption is
+    // ~3k higher than ordinary Buy (per the upstream-code note at
+    // PUMP_FUN_PREFIX_BUY's doc); the bot's BUY_CU_MARGIN_PCT absorbs
+    // that delta.
+    let swap_ix = build_pump_fun_buy_exact_in_ix(
         &pool_pk,
         &base_mint,
         &pool_base_vault,
