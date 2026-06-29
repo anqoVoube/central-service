@@ -83,4 +83,17 @@ pub struct PoolDoc {
     /// manually in Mongo to reverse.
     #[serde(default)]
     pub disabled: bool,
+    /// Token-tip-priority flag. When `true`, the bot forces TP-only
+    /// routing (TipOnly + Fee50Tip100 variants) on every SHRED-PATH
+    /// buy for this pool — regardless of the leader's TP set or
+    /// location-match status. Used for high-volatility / "must-land"
+    /// tokens where tip-driven landing beats fee-priority races.
+    ///
+    /// Toggled from the dashboard `/ttp` page (`POST /ttp` →
+    /// `set_pool_ttp`); central broadcasts `pool_ttp_changed` and bots
+    /// update their in-memory `PoolState.is_ttp` immediately.
+    /// Sells (TP/SL + manual) ignore this flag — they already fan
+    /// out to every tip-bearing sender.
+    #[serde(default)]
+    pub is_ttp: bool,
 }

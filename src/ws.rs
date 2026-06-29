@@ -191,6 +191,16 @@ pub enum ServerMsg {
     PoolDisabled {
         pool: String,
     },
+    /// Broadcast after the dashboard `/ttp` page toggles a pool's
+    /// token-tip-priority flag (`POST /ttp`). Every bot updates its
+    /// in-memory `PoolState.is_ttp` immediately so the next shred-path
+    /// buy on that pool respects the new flag without restart. Mongo's
+    /// `is_ttp` flag is the source of truth for the next init.
+    /// Serializes as `{"type":"pool_ttp_changed","pool":"<pubkey>","is_ttp":<bool>}`.
+    PoolTtpChanged {
+        pool: String,
+        is_ttp: bool,
+    },
     /// Rebroadcast of a bot's fire sig prefix. Only FR2 subscribes to
     /// the wallet-scoped `transactions_status` geyser filter, so every
     /// location's failures stream through FR2 — but FR2's
@@ -317,6 +327,8 @@ pub async fn serve(
         .route("/block-detail/:opp_sig", get(serve_block_detail))
         .route("/ban", post(serve_ban_pool))
         .route("/banned", get(serve_banned_pools))
+        .route("/ttp", post(serve_set_pool_ttp))
+        .route("/ttp/list", get(serve_pool_ttp_view))
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
         .route("/tip-priority-status", get(serve_tip_priority_status))
@@ -446,6 +458,81 @@ async fn serve_ban_pool(
     let _ = state.tx.send(ServerMsg::PoolDisabled { pool: pool.clone() });
     println!("[ban] pool={pool} disabled + broadcast");
     (StatusCode::OK, "banned").into_response()
+}
+
+#[derive(Deserialize)]
+struct SetPoolTtpReq {
+    pool: String,
+    is_ttp: bool,
+}
+
+/// Toggle a pool's `is_ttp` flag (token-tip-priority). Dashboard's
+/// `/ttp` page CHANGE button relays here. Persists to Mongo +
+/// broadcasts `PoolTtpChanged` so every bot updates its in-memory
+/// `PoolState.is_ttp` for the next shred-path fire. IP-whitelisted.
+async fn serve_set_pool_ttp(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<SetPoolTtpReq>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /ttp from non-whitelisted ip {ip}");
+        println!("[whitelist] reject POST /ttp from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let pool = req.pool.trim().to_owned();
+    if pool.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing pool").into_response();
+    }
+    if let Err(e) = state.repo.set_pool_ttp(&pool, req.is_ttp).await {
+        tracing::error!("set_pool_ttp({pool}, {}) failed: {e:#}", req.is_ttp);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "mongo update failed").into_response();
+    }
+    let _ = state.tx.send(ServerMsg::PoolTtpChanged {
+        pool: pool.clone(),
+        is_ttp: req.is_ttp,
+    });
+    println!("[ttp] pool={pool} is_ttp={} broadcast", req.is_ttp);
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// Dashboard `/ttp` page list endpoint. Returns all confirmed PumpFun
+/// WSOL pools with their `is_ttp` flag + token meta. IP-whitelisted.
+async fn serve_pool_ttp_view(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting GET /ttp/list from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let pools = match state.repo.pools_for_ttp_view().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("pools_for_ttp_view failed: {e:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mongo query failed",
+            )
+                .into_response();
+        }
+    };
+    let rows: Vec<serde_json::Value> = pools
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "pool": p.pool,
+                "token_name": p.token_name,
+                "token_symbol": p.token_symbol,
+                "pair_created_at_ms": p.pair_created_at_ms,
+                "is_ttp": p.is_ttp,
+                "is_unique": p.is_unique,
+            })
+        })
+        .collect();
+    axum::Json(rows).into_response()
 }
 
 #[derive(Deserialize)]

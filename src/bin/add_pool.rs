@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         cu_measured_at: None,
         is_unique,
         disabled: false,
+        is_ttp: false,
     };
 
     pools_coll

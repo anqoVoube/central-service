@@ -61,6 +61,35 @@ impl Repo {
     /// Permanently ban a pool: set `disabled: true`. Bots are told to
     /// drop it via the `pool_disabled` WS broadcast; future init loads
     /// and discovery/poll queries skip it. No un-ban path.
+    /// Toggle the per-pool token-tip-priority flag. Triggered by the
+    /// dashboard `/ttp` page (`POST /ttp` → broadcast `pool_ttp_changed`).
+    /// When set, the bot forces TP-only routing on every shred-path
+    /// buy for this pool regardless of the leader's TP/loc match.
+    pub async fn set_pool_ttp(&self, pool: &str, is_ttp: bool) -> anyhow::Result<()> {
+        self.pools
+            .update_one(
+                doc! { "pool": pool },
+                doc! { "$set": { "is_ttp": is_ttp, "updated_at": DateTime::now() } },
+            )
+            .await
+            .context("set_pool_ttp")?;
+        Ok(())
+    }
+
+    /// Full pool list for the dashboard `/ttp` page. Same filter as
+    /// `load_all_confirmed` (confirmed + non-disabled + pump_fun + WSOL)
+    /// but returns the entire `PoolDoc` so the dashboard can render
+    /// token name/symbol, current `is_ttp`, and creation age.
+    pub async fn pools_for_ttp_view(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        let filter = doc! {
+            "ata_status": "confirmed",
+            "disabled": { "$ne": true },
+            "pool_type": "pump_fun",
+            "accounts.quote_mint": crate::swap_pump_fun::WSOL,
+        };
+        Ok(self.pools.find(filter).await?.try_collect().await?)
+    }
+
     pub async fn set_pool_disabled(&self, pool: &str) -> anyhow::Result<()> {
         self.pools
             .update_one(
