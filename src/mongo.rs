@@ -192,6 +192,23 @@ impl Repo {
         Ok(())
     }
 
+    /// Counterpart to `bump_ata_attempts`. Called by `bg_worker`'s
+    /// divergence-recovery pass when it observes the on-chain ATA exists
+    /// — clears any failed-attempt accounting accumulated by prior ticks
+    /// so a future divergence on the same pool gets a fresh
+    /// `RECOVER_ATTEMPTS_CAP` budget. Without this, a pool that hit the
+    /// cap once (e.g. during a Helius outage) stays permanently locked
+    /// out of bg_worker even after a successful manual recovery.
+    pub async fn reset_ata_attempts(&self, pool: &str) -> anyhow::Result<()> {
+        self.pools
+            .update_one(
+                doc! { "pool": pool },
+                doc! { "$set": { "ata_attempts": 0, "updated_at": DateTime::now() } },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Set `pair_created_at_ms` for a pool. Called by the startup backfill
     /// once it resolves a missing age from Dexscreener — never overwrites
     /// an existing value, the caller pre-filters by `is_none()`.

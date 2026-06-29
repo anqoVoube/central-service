@@ -65,9 +65,12 @@ const RECOVER_CU_PRICE: u64 = 100_000;
 /// row has been touched this many times by recovery, stop retrying
 /// even if `get_account` still says missing — protects against an
 /// edge case where the same row keeps "going divergent" tick after
-/// tick (some unidentified upstream bug). 6 = 1 RPC + ~5 ticks of
-/// recovery effort before we give up and require operator intervention.
-const RECOVER_ATTEMPTS_CAP: i32 = 6;
+/// tick (some unidentified upstream bug). 100 ≈ 16h of 10-min ticks —
+/// enough to ride out a Helius/zeroslot outage, still bounded for
+/// truly-broken rows. The counter is reset to 0 whenever the ATA is
+/// observed to exist on chain (see `reset_ata_attempts` callsite),
+/// so the cap only applies to a single continuous failure streak.
+const RECOVER_ATTEMPTS_CAP: i32 = 100;
 
 /// True iff the error from `RpcClient::get_account` actually means the
 /// account is missing on chain (vs. a transient RPC failure — timeout,
@@ -105,6 +108,9 @@ pub async fn run(
     // there's no bot-side collision — the gate is gone.
     loop {
         ticker.tick().await;
+        tracing::info!(
+            "[bg-worker] tick start — ata_retry + ata_recover + cu_measure passes"
+        );
         // Pass 1: ata_status=pending rows. These are rows that
         // discovery flagged as needing an ATA but the create hasn't
         // landed yet (or exhausted its 3-attempt budget). Filter
@@ -323,9 +329,23 @@ async fn recover_divergent_atas(
         let ata = find_ata(&wallet_pk, &base_mint, &owner_program);
         checked += 1;
         match rpc.get_account(&ata).await {
-            // (2) ATA exists → no divergence.
+            // (2) ATA exists → no divergence. Clear any stale
+            // attempt-counter accumulation so a future divergence
+            // (e.g. ATA closed on chain) starts with a fresh
+            // RECOVER_ATTEMPTS_CAP budget. Without this, pools that
+            // previously hit the cap during an RPC outage stay locked
+            // out forever even after a manual create_missing_atas run
+            // recovered them.
             Ok(_) => {
                 already_exists += 1;
+                if doc.ata_attempts > 0 {
+                    if let Err(e) = repo.reset_ata_attempts(&doc.pool).await {
+                        tracing::warn!(
+                            "[bg-worker] ata-recover: pool={} reset_ata_attempts failed: {e:#}",
+                            doc.pool
+                        );
+                    }
+                }
             }
             // ATA truly absent on chain.
             Err(e) if is_account_not_found(&e) => {
