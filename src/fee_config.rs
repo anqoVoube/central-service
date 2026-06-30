@@ -47,6 +47,85 @@ pub struct FeeConfig {
     /// Dashboard-configurable; default 1800 (30 min).
     #[serde(default = "default_ttp_ttl_secs")]
     pub ttp_ttl_secs: u64,
+    /// Partial-sell tiers (Usual / Fast schedules per buy-size bucket).
+    /// Mirrors `statics::FeeConfig::partial_sell_tiers`. Tiers must be
+    /// sorted ascending by `max_sol_lamports`; last tier uses
+    /// `u64::MAX` as catch-all. See `PartialSellTier` for full semantics.
+    #[serde(default = "default_partial_sell_tiers")]
+    pub partial_sell_tiers: Vec<PartialSellTier>,
+}
+
+/// One Fast/Usual schedule pair for a buy-size tier.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartialSellTier {
+    /// Inclusive upper bound for this tier (lamports). Last tier
+    /// uses `u64::MAX` as catch-all.
+    pub max_sol_lamports: u64,
+    /// Fast-case trigger threshold: minimum % of buy size that the
+    /// pool's WSOL reserve must grow by during the next slot after
+    /// our buy lands. 0-100. Default 50.
+    pub fast_threshold_pct: u8,
+    pub usual: PartialSellSchedule,
+    pub fast: PartialSellSchedule,
+}
+
+/// A single partial-sell schedule. See bot-side `statics::PartialSellSchedule`
+/// for full semantics. Invariants validated in `validate()`:
+///   * `delays_ms.len() == portions_pct.len()`
+///   * `1 ≤ parts ≤ 8` (MAX_PARTIAL_PARTS on bot side)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartialSellSchedule {
+    pub delays_ms: Vec<u32>,
+    pub portions_pct: Vec<u8>,
+}
+
+pub fn default_partial_sell_tiers() -> Vec<PartialSellTier> {
+    let tier_1part = PartialSellSchedule {
+        delays_ms: vec![500],
+        portions_pct: vec![100],
+    };
+    let tier_2part = PartialSellSchedule {
+        delays_ms: vec![500, 500],
+        portions_pct: vec![50, 50],
+    };
+    let tier_3part = PartialSellSchedule {
+        delays_ms: vec![500, 1_000, 2_500],
+        portions_pct: vec![33, 33, 34],
+    };
+    let tier_5part = PartialSellSchedule {
+        delays_ms: vec![1_000, 1_000, 1_000, 1_000, 1_000],
+        portions_pct: vec![20, 20, 20, 20, 20],
+    };
+    vec![
+        PartialSellTier {
+            max_sol_lamports: 3_000_000_000,
+            fast_threshold_pct: 50,
+            usual: tier_1part.clone(),
+            fast: tier_1part,
+        },
+        PartialSellTier {
+            max_sol_lamports: 5_000_000_000,
+            fast_threshold_pct: 50,
+            usual: tier_2part.clone(),
+            fast: tier_2part,
+        },
+        PartialSellTier {
+            max_sol_lamports: 10_000_000_000,
+            fast_threshold_pct: 50,
+            usual: tier_3part.clone(),
+            fast: tier_3part,
+        },
+        PartialSellTier {
+            // Catch-all sentinel = 2^53 - 1 (JS Number.MAX_SAFE_INTEGER).
+            // See bot-side `default_partial_sell_tiers` for the rationale
+            // — the dashboard JS round-trips this via JS double precision
+            // and `u64::MAX` would lose precision.
+            max_sol_lamports: 9_007_199_254_740_991,
+            fast_threshold_pct: 50,
+            usual: tier_5part.clone(),
+            fast: tier_5part,
+        },
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -275,6 +354,86 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
         }
         prev_threshold = t.min_liq_dump_pct;
     }
+    // ── partial_sell_tiers validation ──
+    if cfg.partial_sell_tiers.is_empty() {
+        anyhow::bail!(
+            "partial_sell_tiers is empty — bots have no schedule to fire and would never exit any position"
+        );
+    }
+    const MAX_PARTS: usize = 8; // mirrors bot's MAX_PARTIAL_PARTS
+    let mut prev_tier_max: u64 = 0;
+    for (i, t) in cfg.partial_sell_tiers.iter().enumerate() {
+        if t.max_sol_lamports == 0 {
+            anyhow::bail!(
+                "partial_sell_tiers[{i}].max_sol_lamports=0 — tier matches nothing"
+            );
+        }
+        if t.max_sol_lamports <= prev_tier_max {
+            anyhow::bail!(
+                "partial_sell_tiers[{i}].max_sol_lamports={} is not strictly increasing (prev={})",
+                t.max_sol_lamports,
+                prev_tier_max
+            );
+        }
+        if t.fast_threshold_pct > 100 {
+            anyhow::bail!(
+                "partial_sell_tiers[{i}].fast_threshold_pct={} exceeds 100",
+                t.fast_threshold_pct
+            );
+        }
+        for (case_name, sched) in [("usual", &t.usual), ("fast", &t.fast)] {
+            if sched.delays_ms.len() != sched.portions_pct.len() {
+                anyhow::bail!(
+                    "partial_sell_tiers[{i}].{case_name}: delays_ms.len()={} != portions_pct.len()={}",
+                    sched.delays_ms.len(),
+                    sched.portions_pct.len()
+                );
+            }
+            if sched.delays_ms.is_empty() {
+                anyhow::bail!(
+                    "partial_sell_tiers[{i}].{case_name}: schedule is empty (no parts)"
+                );
+            }
+            if sched.delays_ms.len() > MAX_PARTS {
+                anyhow::bail!(
+                    "partial_sell_tiers[{i}].{case_name}: parts ({}) exceeds MAX_PARTIAL_PARTS ({MAX_PARTS})",
+                    sched.delays_ms.len()
+                );
+            }
+            for (j, &d) in sched.delays_ms.iter().enumerate() {
+                if d == 0 {
+                    anyhow::bail!(
+                        "partial_sell_tiers[{i}].{case_name}.delays_ms[{j}]=0 — would fire immediately, breaking the schedule semantics"
+                    );
+                }
+            }
+            let portion_sum: u32 = sched.portions_pct.iter().map(|&p| p as u32).sum();
+            // Allow a small ±5% slack since the final part is rebased to
+            // pos.token_amount at fire time anyway. Reject obvious typos.
+            if portion_sum < 95 || portion_sum > 105 {
+                anyhow::bail!(
+                    "partial_sell_tiers[{i}].{case_name}.portions_pct sums to {} — expected ~100",
+                    portion_sum
+                );
+            }
+        }
+        prev_tier_max = t.max_sol_lamports;
+    }
+    // Last tier must be the catch-all sentinel (2^53 - 1). Anything
+    // smaller leaves a "no tier matches" gap for very large buys; the
+    // bot defensively falls back to `last()` in that case, but the
+    // operator's intent (hard cap) would silently differ.
+    const PARTIAL_SELL_CATCHALL_SENTINEL: u64 = 9_007_199_254_740_991;
+    let last_max = cfg
+        .partial_sell_tiers
+        .last()
+        .map(|t| t.max_sol_lamports)
+        .unwrap_or(0);
+    if last_max != PARTIAL_SELL_CATCHALL_SENTINEL {
+        anyhow::bail!(
+            "partial_sell_tiers: last tier's max_sol_lamports ({last_max}) must equal the catch-all sentinel {PARTIAL_SELL_CATCHALL_SENTINEL} (2^53-1). Add a final tier with max_sol_lamports = {PARTIAL_SELL_CATCHALL_SENTINEL}."
+        );
+    }
     Ok(())
 }
 
@@ -312,6 +471,7 @@ pub fn default_fee_config() -> FeeConfig {
         buy_size_tiers: default_buy_size_tiers(),
         rung_min_sol_lamports: default_rung_min_sol_lamports(),
         ttp_ttl_secs: default_ttp_ttl_secs(),
+        partial_sell_tiers: default_partial_sell_tiers(),
     }
 }
 
