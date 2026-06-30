@@ -65,6 +65,13 @@ pub struct OpenPosition {
     /// legacy lines; dashboard then falls back to its estimate.
     #[serde(default)]
     pub cost_lamports: u64,
+    /// Pure on-chain WSOL spent on the swap (no native fee/tip/rent
+    /// overhead). Drives `partial_sell_tier_for` at bot-side restart-seed
+    /// so a position re-loaded from `positions.jsonl` classifies into
+    /// the SAME tier the live lander did. 0 for legacy lines that predate
+    /// this field; bot falls back to `cost_lamports`.
+    #[serde(default)]
+    pub buy_size_lamports: u64,
     /// Pool USD liquidity at buy fire time (2 × WSOL_reserves × SOL_PRICE_USD).
     /// Captured bot-side from current reserves at the moment the dump
     /// trigger fired. 0 for legacy lines.
@@ -98,6 +105,9 @@ pub struct OpenedReport {
     /// See `OpenPosition::cost_lamports`. 0 for legacy bots.
     #[serde(default)]
     pub cost_lamports: u64,
+    /// See `OpenPosition::buy_size_lamports`. 0 for legacy bots.
+    #[serde(default)]
+    pub buy_size_lamports: u64,
     /// See `OpenPosition::liquidity_usd`. 0 for legacy bots.
     #[serde(default)]
     pub liquidity_usd: f64,
@@ -225,6 +235,9 @@ enum LogEvent {
         /// See `OpenPosition::cost_lamports`. 0 for legacy lines.
         #[serde(default)]
         cost_lamports: u64,
+        /// See `OpenPosition::buy_size_lamports`. 0 for legacy lines.
+        #[serde(default)]
+        buy_size_lamports: u64,
         /// See `OpenPosition::liquidity_usd`. 0 for legacy lines.
         #[serde(default)]
         liquidity_usd: f64,
@@ -357,6 +370,7 @@ impl Positions {
             process_us: r.process_us,
             leader: leader.clone(),
             cost_lamports: r.cost_lamports,
+            buy_size_lamports: r.buy_size_lamports,
             liquidity_usd: r.liquidity_usd,
             observed_slot: r.observed_slot,
         };
@@ -377,6 +391,7 @@ impl Positions {
             process_us: r.process_us,
             leader,
             cost_lamports: r.cost_lamports,
+            buy_size_lamports: r.buy_size_lamports,
             liquidity_usd: r.liquidity_usd,
             observed_slot: r.observed_slot,
         });
@@ -469,6 +484,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                 process_us,
                 leader,
                 cost_lamports,
+                buy_size_lamports,
                 liquidity_usd,
                 observed_slot,
             } => {
@@ -489,6 +505,7 @@ fn replay(path: &Path) -> HashMap<String, OpenPosition> {
                         process_us,
                         leader,
                         cost_lamports,
+                        buy_size_lamports,
                         liquidity_usd,
                         observed_slot,
                     },

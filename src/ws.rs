@@ -76,6 +76,11 @@ pub enum ServerMsg {
         /// delta. 0 for legacy bots — receivers fall back to local estimate.
         #[serde(default)]
         cost_lamports: u64,
+        /// Pure on-chain WSOL spent on the swap (no fee/tip/rent). Drives
+        /// partial-sell tier classification at bot-side restart-seed. 0
+        /// for legacy bots; receivers fall back to `cost_lamports`.
+        #[serde(default)]
+        buy_size_lamports: u64,
         /// Pool USD liquidity at fire time, snapshotted bot-side. 0 for
         /// legacy bots.
         #[serde(default)]
@@ -1294,6 +1299,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             process_us: r.process_us,
                             leader: None,
                             cost_lamports: r.cost_lamports,
+                            buy_size_lamports: r.buy_size_lamports,
                             liquidity_usd: r.liquidity_usd,
                             observed_slot: r.observed_slot,
                         });

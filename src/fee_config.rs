@@ -400,13 +400,11 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
                     sched.delays_ms.len()
                 );
             }
-            for (j, &d) in sched.delays_ms.iter().enumerate() {
-                if d == 0 {
-                    anyhow::bail!(
-                        "partial_sell_tiers[{i}].{case_name}.delays_ms[{j}]=0 — would fire immediately, breaking the schedule semantics"
-                    );
-                }
-            }
+            // 0ms delays are allowed — Fast variation may want to fire
+            // its first part the instant the case is decided. The bot
+            // handles 0ms cleanly (sleep(0) is a no-op, sweeper fires
+            // on the next tick).
+            let _ = sched.delays_ms.iter();
             let portion_sum: u32 = sched.portions_pct.iter().map(|&p| p as u32).sum();
             // Allow a small ±5% slack since the final part is rebased to
             // pos.token_amount at fire time anyway. Reject obvious typos.
