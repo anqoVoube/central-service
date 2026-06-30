@@ -136,14 +136,16 @@ pub async fn measure_pool_cu(
         return Ok(MeasureOutcome::SkipNonWsolQuote);
     }
     let wallet_pk = wallet_kp.pubkey();
-    // Resolve the LIVE protocol fee recipient from PumpFun's
-    // GlobalConfig — the hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` stales
-    // whenever PumpFun rotates the recipient slot, tripping error 6013
-    // (InvalidProtocolFeeRecipient). One RPC call per probe is cheap
-    // given the 10-min bg-worker cadence.
-    let active_recipient =
-        crate::swap_pump_fun::fetch_active_protocol_fee_recipient(rpc).await?;
-    let pdas = PumpStaticPdas::derive_with_recipient(&wallet_pk, active_recipient);
+    // Use the hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` const — same as the
+    // bot's prebuild path. The earlier "fetch live from GlobalConfig"
+    // approach trips 6013 (InvalidProtocolFeeRecipient): GlobalConfig's
+    // 8-slot recipient array is NOT the same set the on-chain pAMM
+    // program validates against, so when the hardcoded recipient isn't
+    // found in GlobalConfig (PumpFun rotated layout / slot) and the
+    // fallback returns e.g. "Protocol Fee 7", the on-chain check rejects
+    // it. The bot proves the hardcoded const is still accepted by the
+    // program — keep them in lockstep.
+    let pdas = PumpStaticPdas::derive(&wallet_pk);
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
     let tip_to = Pubkey::from_str(TIP_RECIPIENT)?;
 
