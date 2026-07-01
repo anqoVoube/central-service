@@ -20,7 +20,15 @@ use solana_sdk::{
 pub const PUMP_FUN: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 pub const PUMP_FEE_PROGRAM: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 pub const PUMP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
+// Non-mayhem protocol_fee_recipients[0]. Kept as the fallback for pools
+// where the live GlobalConfig resolver is bypassed (e.g. legacy callers).
+// Every callsite that has pool.is_mayhem_mode SHOULD resolve via
+// `fetch_pump_recipients` — this const is invalid for mayhem-mode pools.
 pub const PUMP_PROTOCOL_FEE_RECIPIENT: &str = "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV";
+// Non-mayhem fallback for the trailing buyback pair (slot 0 of
+// buyback_fee_recipients[8]). Preserved as the historical value that
+// landed in production; live callsites now resolve via `fetch_pump_recipients`
+// so we auto-degrade on rotations of any single slot.
 pub const PUMP_AMM_FEE_RECIPIENT: &str = "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD";
 
 pub const WSOL: &str = "So11111111111111111111111111111111111111112";
@@ -42,81 +50,101 @@ pub fn pump_fee_program_pk() -> Pubkey { Pubkey::from_str(PUMP_FEE_PROGRAM).unwr
 pub fn pump_global_config_pk() -> Pubkey { Pubkey::from_str(PUMP_GLOBAL_CONFIG).unwrap() }
 pub fn pump_protocol_fee_recipient_pk() -> Pubkey { Pubkey::from_str(PUMP_PROTOCOL_FEE_RECIPIENT).unwrap() }
 
-/// Fetch the currently-active protocol fee recipient from PumpFun's
-/// `GlobalConfig` account. PumpFun stores up to 8 recipient slots
-/// starting at byte offset 57 (32 bytes each).
+/// Live protocol + buyback fee recipient picks, sourced from `GlobalConfig`.
 ///
-/// Selection policy (avoids the InvalidProtocolFeeRecipient 6013 error
-/// when pump rotates slot 0 to a non-accepted value):
-///   1. PREFER the hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` if it appears
-///      in any of the 8 slots. The bot's production swap path uses this
-///      same const, so picking it keeps central + bot in lockstep — if
-///      the bot's fires are landing, the const is in the live set.
-///   2. FALL BACK to the first non-default slot if the preferred const
-///      has been rotated out entirely.
-///   3. Error only if every slot is `Pubkey::default()` or the account
-///      data is too short to contain all 8 slots.
+/// Both recipients are picked from 8-slot arrays that pump.fun rotates
+/// periodically. A single-slot hardcode is fragile against rotations
+/// (see the InvalidProtocolFeeRecipient 6013 postmortem). Picking a
+/// random slot per fire auto-degrades to 7/8 success on single-slot
+/// rotations rather than falling off a cliff on a specific rotation.
+#[derive(Debug, Clone, Copy)]
+pub struct PumpRecipients {
+    pub protocol_fee_recipient: Pubkey,
+    pub buyback_fee_recipient: Pubkey,
+}
+
+/// GlobalConfig field offsets (bytes). Layout comes from carbon /
+/// pump-swap-sdk IDL + the on-chain postmortem — see the "canonical
+/// resolution rule" in CLAUDE.md's aggregator-decoders section.
 ///
-/// Logs the chosen slot index so operators can diagnose rotations
-/// (slot N changing implies the next pump.fun upgrade rotated again).
-pub async fn fetch_active_protocol_fee_recipient(
+///   57..313   protocol_fee_recipients[8]        (non-mayhem)
+///   385..417  reserved_fee_recipient            (mayhem[0])
+///   418..642  reserved_fee_recipients[7]        (mayhem[1..8])
+///   643..899  buyback_fee_recipients[8]         (always; post Sept-1)
+const PUMP_GC_PROTOCOL_OFF: usize = 57;
+const PUMP_GC_RESERVED_OFF: usize = 385;
+const PUMP_GC_RESERVED_ARR_OFF: usize = 418;
+const PUMP_GC_BUYBACK_OFF: usize = 643;
+const PUMP_GC_MIN_LEN: usize = PUMP_GC_BUYBACK_OFF + 8 * 32;
+
+fn read_pubkey_slots<const N: usize>(
+    data: &[u8],
+    start: usize,
+    label: &str,
+) -> anyhow::Result<[Pubkey; N]> {
+    use anyhow::Context;
+    let mut out = [Pubkey::default(); N];
+    for i in 0..N {
+        let off = start + i * 32;
+        out[i] = Pubkey::try_from(&data[off..off + 32])
+            .with_context(|| format!("decode {label}[{i}] at off={off}"))?;
+    }
+    Ok(out)
+}
+
+/// Random-pick a slot index using nanos-of-second modulo N. Avoids
+/// pulling in the `rand` crate for a single call site; the entropy is
+/// good enough — GlobalConfig rotations happen on the order of days,
+/// nanos-modulo-8 varies over microseconds, so consecutive fires reliably
+/// see different slots.
+fn pick_slot_nanos<const N: usize>(slots: &[Pubkey; N]) -> Pubkey {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let idx = (nanos as usize) % N;
+    slots[idx]
+}
+
+/// Fetch GlobalConfig once, decode all three arrays, pick one recipient
+/// from each of the two lists that apply to this pool.
+///
+/// Live fetch every call (measure_cu runs ~1/10min, so RPC cost is
+/// negligible). No caching: any single-slot rotation is auto-absorbed by
+/// the random pick + next call re-reads the current arrays.
+pub async fn fetch_pump_recipients(
     rpc: &solana_client::nonblocking::rpc_client::RpcClient,
-) -> anyhow::Result<Pubkey> {
+    is_mayhem_mode: bool,
+) -> anyhow::Result<PumpRecipients> {
     use anyhow::Context;
     let gc = rpc
         .get_account(&pump_global_config_pk())
         .await
         .context("rpc.get_account(pump global_config)")?;
-    if gc.data.len() < 57 + 8 * 32 {
+    if gc.data.len() < PUMP_GC_MIN_LEN {
         anyhow::bail!(
-            "pump GlobalConfig data too short: {} bytes",
+            "pump GlobalConfig data too short: {} bytes (need >= {PUMP_GC_MIN_LEN})",
             gc.data.len()
         );
     }
-    let preferred = pump_protocol_fee_recipient_pk();
-    let mut first_non_default: Option<(usize, Pubkey)> = None;
-    let mut all_slots: [Option<Pubkey>; 8] = [None; 8];
-    for i in 0..8usize {
-        let start = 57 + i * 32;
-        let pk = Pubkey::try_from(&gc.data[start..start + 32])
-            .context("decode protocol_fee_recipient slot")?;
-        if pk == Pubkey::default() {
-            continue;
-        }
-        all_slots[i] = Some(pk);
-        if pk == preferred {
-            tracing::debug!(
-                "[pump-recipient] using preferred (slot {i}): {pk}"
-            );
-            return Ok(pk);
-        }
-        if first_non_default.is_none() {
-            first_non_default = Some((i, pk));
-        }
-    }
-    match first_non_default {
-        Some((idx, pk)) => {
-            // Preferred const rotated out — log loudly so operator can
-            // update `PUMP_PROTOCOL_FEE_RECIPIENT` (used by the bot's
-            // swap path) to match what's actually live.
-            let live_set: Vec<String> = all_slots
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| p.map(|pk| format!("[{i}]={pk}")))
-                .collect();
-            tracing::warn!(
-                "[pump-recipient] preferred const {preferred} NOT in GlobalConfig live set — \
-                 falling back to slot {idx}: {pk}. live={:?}. \
-                 Bot's hardcoded swap path will hit InvalidProtocolFeeRecipient too; \
-                 update statics::PUMP_PROTOCOL_FEE_RECIPIENT_PUBKEY to a live one ASAP.",
-                live_set
-            );
-            Ok(pk)
-        }
-        None => anyhow::bail!(
-            "no valid protocol_fee_recipient in pump GlobalConfig (all 8 slots empty)"
-        ),
-    }
+    let protocol_fee_recipient = if is_mayhem_mode {
+        // Mayhem set: reserved_fee_recipient + reserved_fee_recipients[7] = 8 entries.
+        let mut slots = [Pubkey::default(); 8];
+        slots[0] = Pubkey::try_from(&gc.data[PUMP_GC_RESERVED_OFF..PUMP_GC_RESERVED_OFF + 32])
+            .context("decode reserved_fee_recipient")?;
+        let tail: [Pubkey; 7] = read_pubkey_slots(&gc.data, PUMP_GC_RESERVED_ARR_OFF, "reserved_fee_recipients")?;
+        slots[1..].copy_from_slice(&tail);
+        pick_slot_nanos(&slots)
+    } else {
+        let slots: [Pubkey; 8] = read_pubkey_slots(&gc.data, PUMP_GC_PROTOCOL_OFF, "protocol_fee_recipients")?;
+        pick_slot_nanos(&slots)
+    };
+    let buyback_slots: [Pubkey; 8] = read_pubkey_slots(&gc.data, PUMP_GC_BUYBACK_OFF, "buyback_fee_recipients")?;
+    let buyback_fee_recipient = pick_slot_nanos(&buyback_slots);
+    tracing::debug!(
+        "[pump-recipient] is_mayhem={is_mayhem_mode} protocol={protocol_fee_recipient} buyback={buyback_fee_recipient}"
+    );
+    Ok(PumpRecipients { protocol_fee_recipient, buyback_fee_recipient })
 }
 pub fn pump_amm_fee_recipient_pk() -> Pubkey { Pubkey::from_str(PUMP_AMM_FEE_RECIPIENT).unwrap() }
 pub fn wsol_pk() -> Pubkey { Pubkey::from_str(WSOL).unwrap() }
@@ -158,10 +186,10 @@ pub struct PumpStaticPdas {
     pub user_volume_accumulator_wsol_ata: Pubkey,
     pub fee_config: Pubkey,
     /// Currently-active protocol fee recipient. Resolved live from
-    /// `GlobalConfig` via `fetch_active_protocol_fee_recipient` for hot
-    /// paths that need to survive PumpFun rotations. Falls back to the
-    /// hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` const for callers that
-    /// can't go async.
+    /// `GlobalConfig` via `fetch_pump_recipients` for hot paths that need
+    /// to survive PumpFun rotations. Falls back to the hardcoded
+    /// `PUMP_PROTOCOL_FEE_RECIPIENT` const for callers that can't go
+    /// async — but that const is INVALID for mayhem-mode pools.
     pub protocol_fee_recipient: Pubkey,
     pub protocol_fee_recipient_ata: Pubkey,
     pub amm_fee_recipient: Pubkey,
@@ -170,15 +198,21 @@ pub struct PumpStaticPdas {
 
 impl PumpStaticPdas {
     pub fn derive(wallet_pk: &Pubkey) -> Self {
-        // Backwards-compat wrapper — uses the const recipient. Callers
-        // that can resolve the live recipient should use
-        // `derive_with_recipient` instead.
-        Self::derive_with_recipient(wallet_pk, pump_protocol_fee_recipient_pk())
+        // Backwards-compat wrapper — uses the hardcoded constants.
+        // Callers that have a live `PumpRecipients` (from
+        // `fetch_pump_recipients`) should use `derive_with_recipients`.
+        Self::derive_with_recipients(
+            wallet_pk,
+            PumpRecipients {
+                protocol_fee_recipient: pump_protocol_fee_recipient_pk(),
+                buyback_fee_recipient: pump_amm_fee_recipient_pk(),
+            },
+        )
     }
 
-    pub fn derive_with_recipient(
+    pub fn derive_with_recipients(
         wallet_pk: &Pubkey,
-        protocol_fee_recipient: Pubkey,
+        recipients: PumpRecipients,
     ) -> Self {
         let pump = pump_fun_pk();
         let fee_program = pump_fee_program_pk();
@@ -198,9 +232,9 @@ impl PumpStaticPdas {
         let (fee_config, _) =
             Pubkey::find_program_address(&[b"fee_config", pump.as_ref()], &fee_program);
         let protocol_fee_recipient_ata =
-            find_ata(&protocol_fee_recipient, &wsol, &token_prog);
-        let amm_fee_recipient = pump_amm_fee_recipient_pk();
-        let amm_fee_recipient_wsol_ata = find_ata(&amm_fee_recipient, &wsol, &token_prog);
+            find_ata(&recipients.protocol_fee_recipient, &wsol, &token_prog);
+        let amm_fee_recipient_wsol_ata =
+            find_ata(&recipients.buyback_fee_recipient, &wsol, &token_prog);
 
         Self {
             event_authority,
@@ -208,9 +242,9 @@ impl PumpStaticPdas {
             user_volume_accumulator,
             user_volume_accumulator_wsol_ata,
             fee_config,
-            protocol_fee_recipient,
+            protocol_fee_recipient: recipients.protocol_fee_recipient,
             protocol_fee_recipient_ata,
-            amm_fee_recipient,
+            amm_fee_recipient: recipients.buyback_fee_recipient,
             amm_fee_recipient_wsol_ata,
         }
     }

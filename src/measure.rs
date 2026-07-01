@@ -61,7 +61,7 @@ use solana_transaction_status_client_types::{
 
 use crate::pool::{PoolAccounts, PoolDoc, PumpFunAccounts};
 use crate::swap_pump_fun::{
-    build_pump_fun_buy_exact_in_ix, find_ata, wsol_pk, PumpStaticPdas,
+    build_pump_fun_buy_exact_in_ix, fetch_pump_recipients, find_ata, wsol_pk, PumpStaticPdas,
     token_program_pk,
 };
 
@@ -136,16 +136,17 @@ pub async fn measure_pool_cu(
         return Ok(MeasureOutcome::SkipNonWsolQuote);
     }
     let wallet_pk = wallet_kp.pubkey();
-    // Use the hardcoded `PUMP_PROTOCOL_FEE_RECIPIENT` const — same as the
-    // bot's prebuild path. The earlier "fetch live from GlobalConfig"
-    // approach trips 6013 (InvalidProtocolFeeRecipient): GlobalConfig's
-    // 8-slot recipient array is NOT the same set the on-chain pAMM
-    // program validates against, so when the hardcoded recipient isn't
-    // found in GlobalConfig (PumpFun rotated layout / slot) and the
-    // fallback returns e.g. "Protocol Fee 7", the on-chain check rejects
-    // it. The bot proves the hardcoded const is still accepted by the
-    // program — keep them in lockstep.
-    let pdas = PumpStaticPdas::derive(&wallet_pk);
+    // Resolve LIVE from GlobalConfig. The pAMM program validates protocol
+    // + buyback recipients against two DIFFERENT lists depending on
+    // pool.is_mayhem_mode (byte 243). The previous "single hardcoded
+    // const" approach tripped 6013 InvalidProtocolFeeRecipient on
+    // mayhem pools (e.g. Bongo-WSOL) because 62qc2CN... is only in the
+    // non-mayhem set. Live-fetch + per-fire random pick makes us
+    // self-heal on single-slot rotations too.
+    let recipients = fetch_pump_recipients(rpc, pump.is_mayhem_mode)
+        .await
+        .context("fetch_pump_recipients")?;
+    let pdas = PumpStaticPdas::derive_with_recipients(&wallet_pk, recipients);
     let wallet_wsol_ata = find_ata(&wallet_pk, &wsol_pk(), &token_program_pk());
     let tip_to = Pubkey::from_str(TIP_RECIPIENT)?;
 

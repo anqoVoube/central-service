@@ -9,7 +9,18 @@ const QUOTE_MINT_OFF: usize = 75;
 const POOL_BASE_VAULT_OFF: usize = 139;
 const POOL_QUOTE_VAULT_OFF: usize = 171;
 const COIN_CREATOR_OFF: usize = 211;
-pub const POOL_DATA_MIN: usize = 243;
+// Minimum bytes needed for pool-data validity. Must be > IS_CASHBACK_COIN_OFF
+// so `data.get(244)` returns Some(_) rather than None (silent false on
+// mayhem/cashback detection).
+pub const POOL_DATA_MIN: usize = 245;
+// Byte 243 = is_mayhem_mode. Determines which set of fee recipients the
+// pAMM program accepts on this pool:
+//   false → GlobalConfig.protocol_fee_recipients[8]  (the "normal" set)
+//   true  → GlobalConfig.reserved_fee_recipient + reserved_fee_recipients[7]
+// Picking from the wrong set → Anchor 6013 InvalidProtocolFeeRecipient at
+// pump-amm/src/instructions/swap/mod.rs:160. See CLAUDE.md "Aggregator
+// decoders" section notes.
+pub const IS_MAYHEM_MODE_OFF: usize = 243;
 // Offset of the is_cashback_coin bool field in the pool account.
 pub const IS_CASHBACK_COIN_OFF: usize = 244;
 
@@ -23,6 +34,13 @@ pub struct PumpFunAccounts {
     pub owner_program: String,
     #[serde(default)]
     pub is_cashback: bool,
+    /// See `IS_MAYHEM_MODE_OFF`. Immutable per pool (set at creation) so
+    /// stored once at discovery/backfill; drives protocol_fee_recipient
+    /// selection in the swap ix builder. Default `false` — pre-Phase-8
+    /// pool docs lack the field but are also non-mayhem by construction
+    /// (mayhem-mode pools began appearing after the April-2025 upgrade).
+    #[serde(default)]
+    pub is_mayhem_mode: bool,
     /// Decimals of the base (token) mint. Defaults to 6 if absent in old docs.
     #[serde(default = "default_decimals")]
     pub token_decimals: u8,
@@ -69,4 +87,8 @@ pub fn parse_coin_creator(data: &[u8]) -> Option<Pubkey> {
 
 pub fn parse_is_cashback_coin(data: &[u8]) -> bool {
     data.get(IS_CASHBACK_COIN_OFF).copied().unwrap_or(0) != 0
+}
+
+pub fn parse_is_mayhem_mode(data: &[u8]) -> bool {
+    data.get(IS_MAYHEM_MODE_OFF).copied().unwrap_or(0) != 0
 }

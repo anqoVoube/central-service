@@ -57,6 +57,7 @@ async fn handle_one(
         .with_context(|| format!("parse_pool({pool_pk})"))?;
 
     let is_cashback = pump_fun::parse_is_cashback_coin(&pool_acc.data);
+    let is_mayhem_mode = pump_fun::parse_is_mayhem_mode(&pool_acc.data);
 
     let base_mint = parsed.base_mint;
     let mint_acc = rpc
@@ -84,6 +85,7 @@ async fn handle_one(
             coin_creator: parsed.coin_creator.to_string(),
             owner_program: token_program.to_string(),
             is_cashback,
+            is_mayhem_mode,
             token_decimals,
         }),
         // Always insert as Confirmed so the WS init filter ships the pool

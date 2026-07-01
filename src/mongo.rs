@@ -271,6 +271,39 @@ impl Repo {
         Ok(())
     }
 
+    /// Set `accounts.is_mayhem_mode` for a pump_fun pool. Called by the
+    /// startup mayhem-backfill once it reads the pool account byte 243
+    /// (see `pool::pump_fun::IS_MAYHEM_MODE_OFF`). `is_mayhem_mode` is
+    /// immutable per pool (set at pool creation), so backfill runs at
+    /// most once per pool; subsequent restarts skip pools already
+    /// carrying the field.
+    pub async fn update_is_mayhem_mode(&self, pool: &str, val: bool) -> anyhow::Result<()> {
+        self.pools
+            .update_one(
+                doc! { "pool": pool },
+                doc! { "$set": {
+                    "accounts.is_mayhem_mode": val,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Pump-fun pools missing `accounts.is_mayhem_mode` — driven by the
+    /// startup backfill. Once every existing pool has the field set,
+    /// subsequent runs are no-ops (query returns empty). Filter narrower
+    /// than `load_pump_fun_confirmed` — includes even non-WSOL-quote pools
+    /// so we don't leak un-backfilled docs into the working set later.
+    pub async fn pools_missing_is_mayhem_mode(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        use futures::TryStreamExt;
+        let filter = doc! {
+            "pool_type": "pump_fun",
+            "accounts.is_mayhem_mode": { "$exists": false },
+        };
+        Ok(self.pools.find(filter).await?.try_collect().await?)
+    }
+
     /// Pools that the `measure_cu` binary should hit on this run. Filter:
     ///   - `ata_status == "confirmed"` (the wallet's ATA exists for the base
     ///     mint, otherwise the buy ix errors with AccountNotInitialized)

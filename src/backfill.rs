@@ -1,15 +1,26 @@
-//! Startup migration: populate `pair_created_at_ms` for any pool doc that
-//! pre-dates the field. Queries Dexscreener's pair endpoint
-//! (`/latest/dex/pairs/solana/<pool>`) which returns the pair directly by
-//! address — no mint lookup needed, works for every pool type.
+//! Startup migrations:
+//!   1. Populate `pair_created_at_ms` for any pool doc that pre-dates the
+//!      field. Queries Dexscreener's pair endpoint
+//!      (`/latest/dex/pairs/solana/<pool>`) which returns the pair directly
+//!      by address — no mint lookup needed, works for every pool type.
+//!   2. Populate `accounts.is_mayhem_mode` for pump_fun pool docs that
+//!      pre-date the field. Reads the pool account from RPC and pulls
+//!      byte 243 (see `pool::pump_fun::IS_MAYHEM_MODE_OFF`). Critical for
+//!      routing the pAMM protocol_fee_recipient — mayhem pools require a
+//!      different 8-slot set than the default. Without this backfill,
+//!      pre-existing mayhem pools (like Bongo-WSOL) deserialize with
+//!      `is_mayhem_mode = false` via `#[serde(default)]` and every buy on
+//!      them fails 6013 InvalidProtocolFeeRecipient.
 //!
-//! Best-effort. Pools Dexscreener can't index (dust / dead / very fresh)
-//! stay `None`; the WS init filter then drops them when computing the
-//! "< 30 days" set, which is the intended behavior.
+//! Both best-effort. Pools we can't reach stay unchanged; the mayhem
+//! backfill will retry them on next central startup.
 
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{stream, StreamExt};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 
 use crate::mongo::Repo;
 
@@ -147,6 +158,80 @@ async fn report_outdated(repo: &Repo) {
     println!(
         "[outdated] summary: total={total} fresh<30d={fresh} old>=30d={old_count} unindexed={none_count}"
     );
+}
+
+/// Startup mayhem backfill. Reads `accounts.is_mayhem_mode` for every
+/// pump_fun pool doc missing it, by fetching the pool account and pulling
+/// byte 243. Idempotent — `pools_missing_is_mayhem_mode` returns only
+/// docs where the field is absent, so re-runs are cheap (empty query).
+///
+/// Call BEFORE the WS server accepts client connections so bots don't
+/// receive un-backfilled pool docs in `init.pools`. Called from
+/// `main::main` right after the Dexscreener backfill.
+pub async fn run_mayhem(repo: &Repo, rpc_url: &str) {
+    let pools = match repo.pools_missing_is_mayhem_mode().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[backfill-mayhem] failed to load pools: {e:#}");
+            return;
+        }
+    };
+    if pools.is_empty() {
+        println!("[backfill-mayhem] no pools need is_mayhem_mode");
+        return;
+    }
+    let total = pools.len();
+    println!(
+        "[backfill-mayhem] {total} pump_fun pool(s) missing is_mayhem_mode; probing pool accounts (concurrency={BACKFILL_CONCURRENCY})"
+    );
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let results: Vec<(String, Option<bool>)> = stream::iter(pools)
+        .map(|p| {
+            let pool_str = p.pool.clone();
+            let rpc = &rpc;
+            async move {
+                let val = fetch_is_mayhem_mode(rpc, &pool_str).await;
+                (pool_str, val)
+            }
+        })
+        .buffer_unordered(BACKFILL_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut filled = 0usize;
+    let mut mayhem = 0usize;
+    let mut failed = 0usize;
+    for (pool, val) in results {
+        match val {
+            Some(v) => {
+                if let Err(e) = repo.update_is_mayhem_mode(&pool, v).await {
+                    eprintln!("[backfill-mayhem] mongo update {pool} failed: {e:#}");
+                    failed += 1;
+                } else {
+                    filled += 1;
+                    if v {
+                        mayhem += 1;
+                    }
+                }
+            }
+            None => failed += 1,
+        }
+    }
+    println!(
+        "[backfill-mayhem] done — {filled}/{total} filled ({mayhem} mayhem, {}) non-mayhem, {failed} failed)",
+        filled - mayhem
+    );
+}
+
+async fn fetch_is_mayhem_mode(rpc: &RpcClient, pool: &str) -> Option<bool> {
+    let pk = Pubkey::from_str(pool).ok()?;
+    match rpc.get_account(&pk).await {
+        Ok(acc) => Some(crate::pool::pump_fun::parse_is_mayhem_mode(&acc.data)),
+        Err(e) => {
+            eprintln!("[backfill-mayhem] {pool} rpc get_account failed: {e}");
+            None
+        }
+    }
 }
 
 /// Dexscreener `/latest/dex/pairs/solana/<pool>` returns a single pair (or

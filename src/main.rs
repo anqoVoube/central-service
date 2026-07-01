@@ -43,6 +43,15 @@ async fn main() -> anyhow::Result<()> {
     // pools have the field set.
     backfill::run(&repo).await;
 
+    // Migrate any pump_fun pool docs that pre-date the `is_mayhem_mode`
+    // field. Reads pool account byte 243 via RPC and writes the flag to
+    // Mongo. MUST run before the WS server accepts client connections —
+    // bots consult this flag to route the pAMM protocol_fee_recipient,
+    // and stale docs (deserialize `is_mayhem_mode = false` via
+    // `#[serde(default)]`) will fail every buy on mayhem pools with
+    // Anchor 6013 InvalidProtocolFeeRecipient.
+    backfill::run_mayhem(&repo, &cfg.rpc_url).await;
+
     let positions = positions::Positions::load_and_spawn(cfg.positions_log.clone()).await?;
 
     let (broadcast_tx, _rx) = broadcast::channel::<ws::ServerMsg>(1024);

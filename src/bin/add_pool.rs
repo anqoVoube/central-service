@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let parsed = pump_fun::parse_pool(&pool_acc.data)
         .with_context(|| format!("parse_pool({pool_pk}) — is this really a PumpFun pAMM pool?"))?;
     let is_cashback = pump_fun::parse_is_cashback_coin(&pool_acc.data);
+    let is_mayhem_mode = pump_fun::parse_is_mayhem_mode(&pool_acc.data);
 
     let base_mint = parsed.base_mint;
     let mint_acc = rpc
@@ -125,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     println!("  coin_creator:        {}", parsed.coin_creator);
     println!("  base_token_program:  {token_program}");
     println!("  is_cashback:         {is_cashback}");
+    println!("  is_mayhem_mode:      {is_mayhem_mode}");
     println!("  token_decimals:      {token_decimals}");
     println!("  token_name:          {token_name:?}");
     println!("  token_symbol:        {token_symbol:?}");
@@ -141,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
             coin_creator: parsed.coin_creator.to_string(),
             owner_program: token_program.to_string(),
             is_cashback,
+            is_mayhem_mode,
             token_decimals,
         }),
         // Same default as discover.rs — bots get visibility immediately;
