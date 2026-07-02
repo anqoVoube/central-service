@@ -269,6 +269,11 @@ struct AppState {
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
+    /// Live-mutable auto-unwrap config. Read by `GET /auto-unwrap/config`,
+    /// swapped by `POST /auto-unwrap/config`. The poller task in
+    /// `auto_unwrap::spawn` shares the same ArcSwap so operator changes
+    /// take effect on the next 30 s tick without restart.
+    auto_unwrap_config: Arc<arc_swap::ArcSwap<crate::auto_unwrap::AutoUnwrapConfig>>,
 }
 
 pub async fn serve(
@@ -287,6 +292,7 @@ pub async fn serve(
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
+    auto_unwrap_config: Arc<arc_swap::ArcSwap<crate::auto_unwrap::AutoUnwrapConfig>>,
 ) -> anyhow::Result<()> {
     let state = AppState {
         repo,
@@ -303,6 +309,7 @@ pub async fn serve(
         tip_priority,
         guaranteed,
         fee_config_file,
+        auto_unwrap_config,
     };
     // TTP sweeper: every 5s, drop expired temporary tip-priority entries.
     // `prune_expired` broadcasts `tip_priority_changed{is_priority:false}`
@@ -342,6 +349,10 @@ pub async fn serve(
         .route(
             "/fee-config.json",
             get(serve_fee_config_json).post(serve_fee_config_set),
+        )
+        .route(
+            "/auto-unwrap/config",
+            get(serve_auto_unwrap_get).post(serve_auto_unwrap_post),
         )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -787,6 +798,70 @@ async fn serve_fee_config_json(
             (StatusCode::INTERNAL_SERVER_ERROR, "fee-config read failed").into_response()
         }
     }
+}
+
+/// GET current auto-unwrap config. Returned in the same JSON shape the
+/// dashboard's `/api/sol-wsol-swap/auto-config` proxy already serves, so
+/// the UI code doesn't need to know whether the response came from bot
+/// or central. IP-whitelisted.
+async fn serve_auto_unwrap_get(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting GET /auto-unwrap/config from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let c = **state.auto_unwrap_config.load();
+    Json(serde_json::json!({
+        "ok": true,
+        "data": {
+            "enabled": c.enabled,
+            "low_threshold_lamports": c.low_threshold_lamports,
+            "high_threshold_lamports": c.high_threshold_lamports,
+        }
+    }))
+    .into_response()
+}
+
+/// POST update auto-unwrap config. Body is the `AutoUnwrapConfig` shape;
+/// validation runs before persistence. On success, ArcSwap replaces the
+/// live handle and the poller reads the new value on its next 30 s tick.
+/// IP-whitelisted.
+async fn serve_auto_unwrap_post(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<crate::auto_unwrap::AutoUnwrapConfig>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /auto-unwrap/config from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    if let Err(e) = req.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response();
+    }
+    if let Err(e) = crate::auto_unwrap::save_config(&req) {
+        tracing::error!("auto-unwrap persist failed: {e:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("persist failed: {e}") })),
+        )
+            .into_response();
+    }
+    state.auto_unwrap_config.store(Arc::new(req));
+    println!(
+        "[auto-unwrap] config updated: enabled={} low={:.4} SOL high={:.4} SOL",
+        req.enabled,
+        req.low_threshold_lamports as f64 / 1e9,
+        req.high_threshold_lamports as f64 / 1e9,
+    );
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 /// JSON array of currently-banned pool pubkeys. The dashboard fetches

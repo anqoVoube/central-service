@@ -4,6 +4,7 @@
 
 pub mod alts;
 pub mod ata;
+pub mod auto_unwrap;
 pub mod zeroslot;
 pub mod backfill;
 pub mod bans;

@@ -4,8 +4,8 @@ use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::broadcast;
 
 use central_service::{
-    alts, ata, backfill, bans, block_detail, config, discover, fee_config, lanes, leaders, mongo,
-    poll, pool, positions, validators, ws,
+    alts, ata, auto_unwrap, backfill, bans, block_detail, config, discover, fee_config, lanes,
+    leaders, mongo, poll, pool, positions, validators, ws,
 };
 
 #[tokio::main]
@@ -111,6 +111,18 @@ async fn main() -> anyhow::Result<()> {
 
     let fee_config_file = fee_config::FeeConfigFile::open(&cfg.fee_config_path)?;
 
+    // Auto-unwrap poller: 30 s tick, keeps native SOL ≥ low_threshold by
+    // unwrapping WSOL up to high_threshold. Config lives in a JSON file
+    // (`auto_unwrap_config.json`); the operator toggles via the dashboard
+    // which proxies to `POST /auto-unwrap/config`. Handle held here so
+    // the HTTP layer + poller both see the same ArcSwap.
+    let auto_unwrap_config = Arc::new(arc_swap::ArcSwap::from(Arc::new(auto_unwrap::load_config())));
+    auto_unwrap::spawn(
+        cfg.rpc_url.clone(),
+        Arc::clone(&wallet_kp),
+        Arc::clone(&auto_unwrap_config),
+    );
+
     {
         let repo = Arc::clone(&repo);
         let tx = broadcast_tx.clone();
@@ -185,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         tip_priority,
         guaranteed,
         fee_config_file,
+        auto_unwrap_config,
     )
     .await
 }

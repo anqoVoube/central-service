@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 bincode = "1"
