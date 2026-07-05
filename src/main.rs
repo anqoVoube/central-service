@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         ips.sort();
         println!("[whitelist] {} ip(s) loaded: {}", ips.len(), ips.join(", "));
     }
-    println!("For rebuild");
+    println!("For rebuild.....");
 
     let repo = Arc::new(mongo::Repo::connect(&cfg.mongo_uri, &cfg.mongo_db).await?);
     repo.ensure_indexes().await?;
