@@ -5,7 +5,9 @@
 //!   (a) empty (`amount == 0`), and
 //!   (b) whose mint appears in NO Mongo pool doc — i.e. true orphans that
 //!       no bot will ever trade.
-//! Rent is swept back to the wallet. Closes are batched 5 per tx.
+//! Rent is swept back to the wallet. Closes are batched `--per-tx` (default 5)
+//! per tx and sent fire-and-forget (no per-tx confirmation wait — that was the
+//! bottleneck); a batched status check at the end reports how many landed.
 //!
 //! SAFETY — why orphans only:
 //!   The bot's buy tx does NOT create the wallet token ATA (layout is
@@ -23,24 +25,31 @@
 //!
 //! Env: WALLET_KEYPAIR, MONGO_URI, MONGO_DB, RPC_URL (falls back to Helius).
 //!
+//! Flags: --apply (execute), --tx-number N (cap # of txs, test with 1),
+//!        --per-tx N (accounts/tx, default 5, max 24), --pace-ms N (default 50).
+//!
 //! Run:
-//!   cargo run --release --bin close_unused_atas                       # dry-run
-//!   cargo run --release --bin close_unused_atas -- --apply            # close all
-//!   cargo run --release --bin close_unused_atas -- --apply --tx-number 1  # one test tx (≤5 accts)
+//!   cargo run --release --bin close_unused_atas                          # dry-run
+//!   cargo run --release --bin close_unused_atas -- --apply --tx-number 1 # one test tx
+//!   cargo run --release --bin close_unused_atas -- --apply               # close all (fast)
+//!   cargo run --release --bin close_unused_atas -- --apply --per-tx 20   # 20 accts/tx, fewer txs
 
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use solana_account_decoder_client_types::UiAccountData;
-use solana_client::{nonblocking::rpc_client::RpcClient, rpc_request::TokenAccountsFilter};
+use solana_client::{
+    nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig,
+    rpc_request::TokenAccountsFilter,
+};
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{Keypair, Signature, Signer},
     transaction::Transaction,
 };
 
@@ -55,9 +64,8 @@ use central_service::{
 const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const HELIUS_RPC: &str =
     "https://mainnet.helius-rpc.com/?api-key=75715a51-2511-436d-ad3a-1d8c76208072";
-const BATCH: usize = 5; // CloseAccount ixs per tx (per request)
-const CU_LIMIT: u32 = 60_000; // 5 closes ≈ ~15k CU; ample headroom
-const CU_PRICE: u64 = 100_000;
+const BATCH: usize = 5; // default CloseAccount ixs per tx (override: --per-tx)
+const CU_PRICE: u64 = 100_000; // priority-fee µlamports/CU (helps fire-and-forget land)
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
 struct TokenAcct {
@@ -109,14 +117,19 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let apply = args.iter().any(|a| a == "--apply");
-    // `--tx-number N` caps how many transactions the --apply pass sends
-    // (each tx still closes up to 5 accounts). Handy for a single-tx test
-    // run (`--apply --tx-number 1`). Absent = no cap (send all batches).
-    let tx_limit: Option<usize> = args
-        .iter()
-        .position(|a| a == "--tx-number")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<usize>().ok());
+    let arg_num = |name: &str| -> Option<usize> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<usize>().ok())
+    };
+    // `--tx-number N`: cap how many txs --apply sends (test with 1).
+    let tx_limit: Option<usize> = arg_num("--tx-number");
+    // `--per-tx N`: accounts closed per tx (default 5; up to ~24 fit a
+    // packet). Raising this is the cheapest speedup — fewer txs to send.
+    let per_tx: usize = arg_num("--per-tx").unwrap_or(BATCH).clamp(1, 24);
+    // `--pace-ms N`: sleep between fire-and-forget sends (default 50 ≈ 20/s).
+    let pace_ms: u64 = arg_num("--pace-ms").unwrap_or(50) as u64;
 
     let wallet_keypair_b58 = std::env::var("WALLET_KEYPAIR").context("WALLET_KEYPAIR not set")?;
     let mongo_uri = std::env::var("MONGO_URI").context("MONGO_URI not set")?;
@@ -125,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
 
     let wallet_kp = Keypair::from_base58_string(&wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
-    tracing::info!(wallet = %wallet_pk, apply, ?tx_limit, "close_unused_atas starting");
+    tracing::info!(wallet = %wallet_pk, apply, ?tx_limit, per_tx, pace_ms, "close_unused_atas starting");
 
     let repo = Repo::connect(&mongo_uri, &mongo_db).await?;
     let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
@@ -231,62 +244,89 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // ---- Apply: BATCH closes per tx, capped by --tx-number ----
-    let full_batches = candidates.len().div_ceil(BATCH);
+    // ---- Apply: fire-and-forget, `per_tx` closes per tx ----
+    // The old `send_and_confirm_transaction` blocked ~10s/tx waiting for
+    // confirmation — THAT was the slowdown, not rate limiting. We now send
+    // fire-and-forget (skip_preflight), reuse one blockhash across a ~40s
+    // window, pace lightly, then do ONE batched status check at the end.
+    // Anything that didn't land is caught by simply re-running the binary
+    // (it re-enumerates the surviving accounts).
+    let full_batches = candidates.len().div_ceil(per_tx);
     let total_batches = tx_limit.map(|l| l.min(full_batches)).unwrap_or(full_batches);
-    if let Some(l) = tx_limit {
-        tracing::info!(
-            "--tx-number {l}: sending {total_batches} of {full_batches} batch(es) this run"
-        );
-    }
-    let mut closed = 0usize;
-    let mut reclaimed: u64 = 0;
-    let mut failed = 0usize;
-    for (i, chunk) in candidates.chunks(BATCH).enumerate() {
+    tracing::info!(
+        per_tx,
+        pace_ms,
+        "--apply: sending {total_batches} of {full_batches} tx(s) (fire-and-forget)"
+    );
+    let send_cfg = RpcSendTransactionConfig { skip_preflight: true, ..Default::default() };
+    let mut bh = rpc.get_latest_blockhash().await?;
+    let mut bh_at = Instant::now();
+    let mut sent: Vec<(Signature, usize, u64)> = Vec::new(); // (sig, n_accts, lamports)
+    let mut send_err = 0usize;
+    for (i, chunk) in candidates.chunks(per_tx).enumerate() {
         if i >= total_batches {
-            break; // --tx-number cap reached
+            break; // --tx-number cap
         }
+        // Refresh the blockhash before it expires (~60-90s validity).
+        if bh_at.elapsed() > Duration::from_secs(40) {
+            if let Ok(new) = rpc.get_latest_blockhash().await {
+                bh = new;
+                bh_at = Instant::now();
+            }
+        }
+        // Size the CU limit to the batch so we don't overpay priority fee
+        // (fee = cu_price × requested cu_limit). ~6k CU covers one close.
+        let cu_limit = (chunk.len() as u32).saturating_mul(6_000).saturating_add(5_000);
         let mut ixs = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT),
+            ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
             ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE),
         ];
         for a in chunk {
             ixs.push(ix_close(&a.pubkey, &wallet_pk, &wallet_pk, &a.program));
         }
-        let bh = match rpc.get_latest_blockhash().await {
-            Ok(bh) => bh,
-            Err(e) => {
-                tracing::error!("[batch {}/{total_batches}] blockhash failed: {e:#}", i + 1);
-                failed += chunk.len();
-                continue;
-            }
-        };
         let tx = Transaction::new_signed_with_payer(&ixs, Some(&wallet_pk), &[&wallet_kp], bh);
         let chunk_lamports: u64 = chunk.iter().map(|a| a.lamports).sum();
-        match rpc.send_and_confirm_transaction(&tx).await {
+        match rpc.send_transaction_with_config(&tx, send_cfg).await {
             Ok(sig) => {
-                closed += chunk.len();
-                reclaimed += chunk_lamports;
-                tracing::info!(
-                    "[batch {}/{total_batches}] closed {} ata(s) +{:.6} SOL sig={sig}",
-                    i + 1,
-                    chunk.len(),
-                    chunk_lamports as f64 / LAMPORTS_PER_SOL
-                );
+                sent.push((sig, chunk.len(), chunk_lamports));
+                if (i + 1) % 25 == 0 {
+                    tracing::info!("dispatched {}/{total_batches} tx", i + 1);
+                }
             }
             Err(e) => {
-                failed += chunk.len();
-                tracing::warn!("[batch {}/{total_batches}] close failed: {e:#}", i + 1);
+                send_err += 1;
+                tracing::warn!("[tx {}/{total_batches}] send failed: {e:#}", i + 1);
             }
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(pace_ms)).await;
     }
+    tracing::info!(sent = sent.len(), send_err, "all sends dispatched; verifying landings");
 
+    // ---- Final: batched status check (getSignatureStatuses, 256/call) ----
+    tokio::time::sleep(Duration::from_secs(5)).await; // let the last txs land
+    let sigs: Vec<Signature> = sent.iter().map(|(s, _, _)| *s).collect();
+    let mut landed = 0usize;
+    let mut reclaimed: u64 = 0;
+    for (grp_i, group) in sigs.chunks(256).enumerate() {
+        match rpc.get_signature_statuses(group).await {
+            Ok(resp) => {
+                for (j, st) in resp.value.iter().enumerate() {
+                    let ok = st.as_ref().map(|s| s.err.is_none()).unwrap_or(false);
+                    if ok {
+                        landed += 1;
+                        reclaimed += sent[grp_i * 256 + j].2;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("status check failed: {e:#}"),
+        }
+    }
     tracing::info!(
-        closed,
-        failed,
+        tx_dispatched = sent.len(),
+        tx_landed = landed,
+        tx_send_err = send_err,
         reclaimed_sol = reclaimed as f64 / LAMPORTS_PER_SOL,
-        "close_unused_atas done"
+        "close_unused_atas done — re-run to retry any that didn't land"
     );
     Ok(())
 }
