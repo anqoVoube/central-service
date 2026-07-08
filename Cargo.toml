@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sled = "0.34"
 solana-client = "2"
+solana-account-decoder-client-types = "2"
 solana-compute-budget-interface = "2"
 solana-sdk = "2"
 solana-transaction-status-client-types = "2"

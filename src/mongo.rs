@@ -45,6 +45,15 @@ impl Repo {
             .await?)
     }
 
+    /// Load EVERY pool doc regardless of `ata_status` / `disabled`. Used by
+    /// the `close_unused_atas` binary to build the ATA keep-set: any mint
+    /// referenced by ANY pool doc must NOT be closed (the bot's buy tx
+    /// assumes the ATA pre-exists and central won't recreate confirmed
+    /// pools' ATAs). Only mints in NO pool doc are true orphans.
+    pub async fn load_all(&self) -> anyhow::Result<Vec<PoolDoc>> {
+        Ok(self.pools.find(doc! {}).await?.try_collect().await?)
+    }
+
     /// Pool pubkeys currently flagged `disabled: true`. Used by the
     /// dashboard's `GET /banned` proxy to gray-out banned rows in the
     /// history view. Banned pools are few, so loading full docs is fine.
