@@ -247,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- Apply: fire-and-forget, `per_tx` closes per tx ----
     // The old `send_and_confirm_transaction` blocked ~10s/tx waiting for
     // confirmation — THAT was the slowdown, not rate limiting. We now send
-    // fire-and-forget (skip_preflight), reuse one blockhash across a ~40s
+    // fire-and-forget (skip_preflight), reuse one blockhash across a ~30s
     // window, pace lightly, then do ONE batched status check at the end.
     // Anything that didn't land is caught by simply re-running the binary
     // (it re-enumerates the surviving accounts).
@@ -268,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
             break; // --tx-number cap
         }
         // Refresh the blockhash before it expires (~60-90s validity).
-        if bh_at.elapsed() > Duration::from_secs(40) {
+        if bh_at.elapsed() > Duration::from_secs(30) {
             if let Ok(new) = rpc.get_latest_blockhash().await {
                 bh = new;
                 bh_at = Instant::now();
