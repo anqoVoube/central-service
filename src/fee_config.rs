@@ -183,6 +183,17 @@ pub struct FireProfiles {
     pub max_tip_lamports: Option<u64>,
     pub tp: ProfileVariations,
     pub def: ProfileVariations,
+    /// Fee-Priority profile — mirrors the bot. Fires only no-tip senders
+    /// (helius_rpc / corvus / atlas / jet / harmonic) at 100% fee; every
+    /// tip service is skipped. Default = pure fee-only. `#[serde(default)]`
+    /// so pre-FP configs still load.
+    #[serde(default = "default_fp_profile")]
+    pub fp: ProfileVariations,
+}
+
+/// Default Fee-Priority profile: pure fee-only (no tip splits).
+pub fn default_fp_profile() -> ProfileVariations {
+    ProfileVariations { splits: Vec::new(), fee_only: true }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,8 +293,11 @@ pub fn validate(cfg: &FeeConfig) -> anyhow::Result<()> {
         }
         prev_max = b.max_sol_lamports;
     }
-    for (name, p) in [("tp", &cfg.fire_profiles.tp), ("def", &cfg.fire_profiles.def)]
-    {
+    for (name, p) in [
+        ("tp", &cfg.fire_profiles.tp),
+        ("def", &cfg.fire_profiles.def),
+        ("fp", &cfg.fire_profiles.fp),
+    ] {
         let effective = p.splits.len() + (p.fee_only as usize);
         if effective == 0 {
             anyhow::bail!(
@@ -464,6 +478,7 @@ pub fn default_fee_config() -> FeeConfig {
                 ],
                 fee_only: true,
             },
+            fp: default_fp_profile(),
         },
         buy_slip_pct_of_dump_bps: default_buy_slip_pct_of_dump_bps(),
         buy_size_tiers: default_buy_size_tiers(),

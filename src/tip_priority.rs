@@ -74,6 +74,10 @@ pub struct TipPriorityStore {
 
 struct Inner {
     db: sled::Tree,
+    /// Second tree in the SAME sled DB for the mutually-exclusive
+    /// FEE-PRIORITY set — kept alongside `db` so both classes share one
+    /// db path and one store wiring. See `fp_set` / `fp_snapshot_bincode`.
+    fee_db: sled::Tree,
     bcast: broadcast::Sender<ServerMsg>,
 }
 
@@ -86,9 +90,13 @@ impl TipPriorityStore {
         let tree = db
             .open_tree("tip_priority")
             .context("open sled tip_priority tree")?;
+        let fee_tree = db
+            .open_tree("fee_priority")
+            .context("open sled fee_priority tree")?;
         let store = Self {
             inner: Arc::new(Inner {
                 db: tree,
+                fee_db: fee_tree,
                 bcast,
             }),
         };
@@ -127,6 +135,49 @@ impl TipPriorityStore {
             "[tip-priority] set pubkey={pk} is_priority={is_priority} set_size={set_size}"
         );
         Ok(())
+    }
+
+    /// Set/clear a validator's FEE-PRIORITY status (mutually exclusive with
+    /// tip-priority — the CHANGE endpoint clears the other set). Persists to
+    /// the `fee_priority` tree, broadcasts `FeePriorityChanged`.
+    pub fn fp_set(&self, pk: Pubkey, is_priority: bool) -> anyhow::Result<()> {
+        if is_priority {
+            self.inner
+                .fee_db
+                .insert(pk.as_ref(), &[])
+                .context("sled insert fee_priority")?;
+        } else {
+            self.inner
+                .fee_db
+                .remove(pk.as_ref())
+                .context("sled remove fee_priority")?;
+        }
+        self.inner.fee_db.flush().context("sled flush fee")?;
+        let set_size = self.inner.fee_db.iter().count();
+        let _ = self.inner.bcast.send(ServerMsg::FeePriorityChanged {
+            pubkey: pk.to_string(),
+            is_priority,
+        });
+        println!(
+            "[fee-priority] set pubkey={pk} is_priority={is_priority} set_size={set_size}"
+        );
+        Ok(())
+    }
+
+    /// `bincode::serialize(&Vec<Pubkey>)` for `GET /fee-priority.bin`. Bots
+    /// decode this at startup + on WS reconnect to refresh the FP set.
+    pub fn fp_snapshot_bincode(&self) -> anyhow::Result<Vec<u8>> {
+        let mut out: Vec<Pubkey> = Vec::new();
+        for kv in self.inner.fee_db.iter() {
+            let (k, _) = kv.context("sled iter fee_priority")?;
+            if k.len() != 32 {
+                continue;
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&k);
+            out.push(Pubkey::new_from_array(arr));
+        }
+        bincode::serialize(&out).context("encode fee_priority snapshot")
     }
 
     /// Mark `pk` as **temporary** tip-priority (TTP): it counts as

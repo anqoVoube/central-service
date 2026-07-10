@@ -339,7 +339,11 @@ pub fn spawn(
                     continue;
                 }
             };
-            if wsol < need {
+            // Unwrap as much as we can toward the target. When WSOL is short
+            // of the full gap we still unwrap what's there (partial top-up)
+            // instead of refusing — a partial top-up beats leaving SOL below
+            // the floor. Only alert when there's literally nothing to unwrap.
+            if wsol == 0 {
                 let now = Instant::now();
                 let should_alert = last_alert_at
                     .map(|t| now.duration_since(t) > ALERT_DEDUP)
@@ -347,23 +351,25 @@ pub fn spawn(
                 if should_alert {
                     last_alert_at = Some(now);
                     telegram_alert(format!(
-                        "[auto-unwrap] WSOL empty — need {:.4} SOL, have {:.4} WSOL. Manually top up.",
-                        need as f64 / 1e9,
-                        wsol as f64 / 1e9,
+                        "[auto-unwrap] WSOL empty — SOL {:.4} below low {:.4}, nothing to unwrap. Manually top up.",
+                        sol as f64 / 1e9,
+                        cfg.low_threshold_lamports as f64 / 1e9,
                     ))
                     .await;
                 }
                 continue;
             }
+            let amount = need.min(wsol); // unwrap the smaller of gap / available
             in_flight = true;
             println!(
-                "[auto-unwrap] SOL={:.4} < low={:.4}, unwrapping {:.4} WSOL (target={:.4} SOL)",
+                "[auto-unwrap] SOL={:.4} < low={:.4}, unwrapping {:.4} WSOL (have {:.4}, target={:.4} SOL)",
                 sol as f64 / 1e9,
                 cfg.low_threshold_lamports as f64 / 1e9,
-                need as f64 / 1e9,
+                amount as f64 / 1e9,
+                wsol as f64 / 1e9,
                 cfg.high_threshold_lamports as f64 / 1e9,
             );
-            match do_unwrap(&rpc, &wallet_kp, wsol_ata, need).await {
+            match do_unwrap(&rpc, &wallet_kp, wsol_ata, amount).await {
                 Ok(sig) => println!("[auto-unwrap] ok sig={sig}"),
                 Err(e) => {
                     eprintln!("[auto-unwrap] tx failed: {e:#}");

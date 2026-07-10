@@ -128,6 +128,14 @@ pub enum ServerMsg {
         pubkey: String,
         is_priority: bool,
     },
+    /// Broadcast after an operator sets a validator to FEE-PRIORITY via the
+    /// dashboard CHANGE button. Bots update the FP set (dropping it from TP)
+    /// and rebuild the leader bitmap. Serializes as
+    /// `{"type":"fee_priority_changed","pubkey":"...","is_priority":true|false}`.
+    FeePriorityChanged {
+        pubkey: String,
+        is_priority: bool,
+    },
     /// Broadcast after an operator flips a validator's [G] guaranteed
     /// marker via the dashboard G button. Pure UX flag — dashboards
     /// re-render the [G] pill; bots ignore this message. Serializes as
@@ -343,6 +351,7 @@ pub async fn serve(
         .route("/ttp/list", get(serve_pool_ttp_view))
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
+        .route("/fee-priority.bin", get(serve_fee_priority_snapshot))
         .route("/tip-priority-status", get(serve_tip_priority_status))
         .route("/guaranteed", post(serve_guaranteed_set))
         .route("/guaranteed.bin", get(serve_guaranteed_snapshot))
@@ -581,19 +590,34 @@ async fn serve_tip_priority_set(
     };
     // "ttp" = temporary tip-priority: tip-priority now, auto-reverts to
     // default after the operator-configured `ttp_ttl_secs` (from fee config).
+    // FP and TP are mutually exclusive — setting one class clears the other
+    // so a leader is always exactly one of DEF / TP / FP.
     let result = match req.status.trim() {
-        "tip_priority" => state.tip_priority.set(pk, true),
-        "default" => state.tip_priority.set(pk, false),
+        "tip_priority" => state
+            .tip_priority
+            .fp_set(pk, false)
+            .and_then(|_| state.tip_priority.set(pk, true)),
+        "fee_priority" => state
+            .tip_priority
+            .set(pk, false)
+            .and_then(|_| state.tip_priority.fp_set(pk, true)),
+        "default" => state
+            .tip_priority
+            .fp_set(pk, false)
+            .and_then(|_| state.tip_priority.set(pk, false)),
         "ttp" => {
             let ttl = ttp_ttl_secs(&state);
             let expires_at = now_unix().saturating_add(ttl);
-            state.tip_priority.set_temporary(pk, expires_at)
+            state
+                .tip_priority
+                .fp_set(pk, false)
+                .and_then(|_| state.tip_priority.set_temporary(pk, expires_at))
         }
         other => {
             return (
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "status must be \"tip_priority\", \"ttp\", or \"default\", got {other:?}"
+                    "status must be \"tip_priority\", \"fee_priority\", \"ttp\", or \"default\", got {other:?}"
                 ),
             )
                 .into_response();
@@ -672,6 +696,32 @@ async fn serve_tip_priority_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build tip-priority body")
+}
+
+/// `GET /fee-priority.bin` — bincode `Vec<Pubkey>` of the fee-priority set.
+/// Bots fetch at startup to seed `FEE_PRIORITY_LEADER_HANDLE`. IP-whitelisted.
+async fn serve_fee_priority_snapshot(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting fee-priority.bin from non-whitelisted ip {ip}");
+        println!("[whitelist] reject GET /fee-priority.bin from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let bytes = match state.tip_priority.fp_snapshot_bincode() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("fee-priority snapshot build failed: {e:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed")
+                .into_response();
+        }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes))
+        .expect("build fee-priority body")
 }
 
 #[derive(Deserialize)]
