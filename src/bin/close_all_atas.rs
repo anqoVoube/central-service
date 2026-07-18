@@ -16,15 +16,17 @@
 //!
 //! Requires only WALLET_KEYPAIR + RPC_URL (both mandatory — no Mongo).
 //!
-//! Flags: --apply (execute; dry-run otherwise), --tx-number N (cap # of txs,
-//!        test with 1), --per-tx N (accounts/tx, default 5, max 24),
-//!        --pace-ms N (default 50).
+//! Flags: --apply (execute; dry-run otherwise), --with-burn (also burn+close
+//!        non-empty accounts — IRREVERSIBLE; WSOL unwrap-closed, never burned),
+//!        --tx-number N (cap # of txs, test with 1), --per-tx N (accounts/tx,
+//!        default 5, max 24; capped to 10 with --with-burn), --pace-ms N (50).
 //!
 //! Run:
-//!   cargo run --release --bin close_all_atas                          # dry-run
-//!   cargo run --release --bin close_all_atas -- --apply --tx-number 1 # one test tx
-//!   cargo run --release --bin close_all_atas -- --apply               # close all
-//!   cargo run --release --bin close_all_atas -- --apply --per-tx 20   # 20 accts/tx
+//!   cargo run --release --bin close_all_atas                            # dry-run (empty only)
+//!   cargo run --release --bin close_all_atas -- --with-burn             # dry-run (incl. burns)
+//!   cargo run --release --bin close_all_atas -- --apply --tx-number 1   # one test tx
+//!   cargo run --release --bin close_all_atas -- --apply                 # close all empty
+//!   cargo run --release --bin close_all_atas -- --with-burn --apply     # burn dust + close everything
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -74,6 +76,24 @@ fn ix_close(account: &Pubkey, destination: &Pubkey, owner: &Pubkey, token_prog: 
     }
 }
 
+/// SPL Token `Burn` (tag 8). IRREVERSIBLY destroys `amount` tokens from
+/// `account` (decrementing the mint's supply); `owner` signs. Used only under
+/// `--with-burn` on non-empty, non-WSOL accounts so the ATA can then be closed.
+fn ix_burn(account: &Pubkey, mint: &Pubkey, owner: &Pubkey, amount: u64, token_prog: &Pubkey) -> Instruction {
+    let mut data = Vec::with_capacity(9);
+    data.push(8u8);
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: *token_prog,
+        accounts: vec![
+            AccountMeta::new(*account, false),
+            AccountMeta::new(*mint, false),
+            AccountMeta::new_readonly(*owner, true),
+        ],
+        data,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -93,7 +113,16 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|s| s.parse::<usize>().ok())
     };
     let tx_limit: Option<usize> = arg_num("--tx-number");
-    let per_tx: usize = arg_num("--per-tx").unwrap_or(BATCH).clamp(1, 24);
+    // `--with-burn`: also process NON-empty accounts — burn the token balance
+    // (SPL Burn) then close. WSOL is never burned (it's wrapped SOL); it's
+    // unwrap-closed instead. Without the flag, only empty accounts are closed.
+    let with_burn = args.iter().any(|a| a == "--with-burn");
+    let mut per_tx: usize = arg_num("--per-tx").unwrap_or(BATCH).clamp(1, 24);
+    // Burn adds the mint as an extra account key per entry, so a burn batch is
+    // ~2× the keys — cap lower to stay under the 1232-byte packet limit.
+    if with_burn {
+        per_tx = per_tx.min(10);
+    }
     let pace_ms: u64 = arg_num("--pace-ms").unwrap_or(50) as u64;
 
     // ONLY these two env vars — no Mongo.
@@ -102,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
     let wallet_kp = Keypair::from_base58_string(&wallet_keypair_b58);
     let wallet_pk = wallet_kp.pubkey();
-    tracing::info!(wallet = %wallet_pk, apply, ?tx_limit, per_tx, pace_ms, "close_all_atas starting");
+    tracing::info!(wallet = %wallet_pk, apply, with_burn, ?tx_limit, per_tx, pace_ms, "close_all_atas starting");
 
     let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     let wsol = wsol_pk();
@@ -141,46 +170,62 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(token_accounts = accts.len(), "enumerated wallet token accounts");
 
-    // ---- Candidates: EVERY empty account (no matter the mint) ----
+    // ---- Candidates ----
+    // Default: empty accounts only. With --with-burn: EVERY account — non-empty
+    // non-WSOL balances get burned first, then closed; WSOL is unwrap-closed.
     let mut candidates: Vec<&TokenAcct> = accts
         .iter()
-        .filter(|a| a.amount == 0)
+        .filter(|a| with_burn || a.amount == 0)
         .collect();
     candidates.sort_by_key(|a| a.pubkey.to_bytes()); // stable batching/output
 
-    let held = accts.iter().filter(|a| a.amount > 0).count();
+    let will_burn = |a: &TokenAcct| with_burn && a.amount > 0 && a.mint != wsol;
+    let burn_n = candidates.iter().filter(|a| will_burn(a)).count();
+    let held_kept = if with_burn { 0 } else { accts.iter().filter(|a| a.amount > 0).count() };
     let reclaimable: u64 = candidates.iter().map(|a| a.lamports).sum();
     let wsol_in_set = candidates.iter().any(|a| a.mint == wsol);
 
     tracing::info!(
         candidates = candidates.len(),
-        held_skipped = held,
+        burn = burn_n,
+        held_skipped = held_kept,
         reclaimable_sol = reclaimable as f64 / LAMPORTS_PER_SOL,
         "scan complete"
     );
     for a in &candidates {
         let prog = if a.program == token2022 { "T22" } else { "TOK" };
-        let tag = if a.mint == wsol { "  <-- WSOL" } else { "" };
+        let action = if will_burn(a) {
+            "BURN+CLOSE"
+        } else if a.mint == wsol && a.amount > 0 {
+            "UNWRAP+CLOSE"
+        } else {
+            "close     "
+        };
         println!(
-            "  close ata={} mint={} rent={:.6} SOL prog={prog}{tag}",
+            "  {action} ata={} mint={} bal={} rent={:.6} SOL prog={prog}",
             a.pubkey,
             a.mint,
+            a.amount,
             a.lamports as f64 / LAMPORTS_PER_SOL
         );
     }
+    if burn_n > 0 {
+        println!("\n⚠️  --with-burn: {burn_n} account(s) will have their token balance BURNED (irreversible) before close.");
+    }
     if wsol_in_set {
-        println!("\n⚠️  WSOL ATA is empty and WILL be closed — this breaks the bot's WSOL path until recreated.");
+        println!("⚠️  WSOL ATA is in the set and WILL be closed (unwrapped if it holds SOL) — breaks the bot's WSOL path until recreated.");
     }
 
     if candidates.is_empty() {
-        tracing::info!("no empty ATAs to close");
+        tracing::info!("nothing to close");
         return Ok(());
     }
     if !apply {
         println!(
-            "\nDRY RUN — {} empty ATA(s), {:.6} SOL reclaimable. Re-run with --apply to close \
+            "\nDRY RUN — {} ATA(s) ({} to burn), {:.6} SOL reclaimable. Re-run with --apply \
              (add `--tx-number 1` to send just one test tx).",
             candidates.len(),
+            burn_n,
             reclaimable as f64 / LAMPORTS_PER_SOL
         );
         return Ok(());
@@ -209,12 +254,17 @@ async fn main() -> anyhow::Result<()> {
                 bh_at = Instant::now();
             }
         }
-        let cu_limit = (chunk.len() as u32).saturating_mul(6_000).saturating_add(5_000);
+        // burn+close ≈ 12k CU/acct, close-only ≈ 6k.
+        let per_acct_cu: u32 = if with_burn { 12_000 } else { 6_000 };
+        let cu_limit = (chunk.len() as u32).saturating_mul(per_acct_cu).saturating_add(5_000);
         let mut ixs = vec![
             ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
             ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE),
         ];
         for a in chunk {
+            if will_burn(a) {
+                ixs.push(ix_burn(&a.pubkey, &a.mint, &wallet_pk, a.amount, &a.program));
+            }
             ixs.push(ix_close(&a.pubkey, &wallet_pk, &wallet_pk, &a.program));
         }
         let tx = Transaction::new_signed_with_payer(&ixs, Some(&wallet_pk), &[&wallet_kp], bh);
