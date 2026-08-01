@@ -1105,6 +1105,17 @@ async fn serve_block_detail(
     if let Some(d) = state.block_details.get_cached(&opp_sig, &q.pool) {
         return Json(d).into_response();
     }
+    // Definitive negative: the opp tx never reached the chain, so there is no
+    // block to show. Answering 202 here (as we used to) made the dashboard
+    // poll 12 times and then report a timeout, which reads as "central is
+    // broken" when the real answer is "this dump never landed".
+    if state.block_details.is_known_absent(&opp_sig, &q.pool) {
+        return Json(serde_json::json!({
+            "not_landed": true,
+            "opp_sig": opp_sig,
+        }))
+        .into_response();
+    }
     // Not in cache yet — kick off resolution in the background so a later
     // poll lands on a warm entry. Bot-driven resolution already runs on
     // every Opened/Failed; this branch covers click-through on legacy rows

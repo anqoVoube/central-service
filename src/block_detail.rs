@@ -194,6 +194,22 @@ impl BlockDetailStore {
         self.cache_get(&cache_key(opp_sig, pool))
     }
 
+    /// True once we've established this opportunity tx is NOT on chain, so
+    /// there is no block to fetch and never will be.
+    ///
+    /// Without this the HTTP layer could only ever answer "still pending":
+    /// `resolve` caches nothing for a never-landed tx, so every poll was a
+    /// cache miss and the dashboard spun through all 12 attempts before
+    /// giving up with a misleading timeout. Since orderflow detects
+    /// pre-block, never-landed is the COMMON case, not an edge one.
+    pub fn is_known_absent(&self, opp_sig: &str, pool: &str) -> bool {
+        self.inner
+            .not_landed
+            .lock()
+            .unwrap()
+            .contains(&cache_key(opp_sig, pool))
+    }
+
     /// Resolve `(opp_sig, pool)` → `Resolution`. Cache fast path on hit;
     /// 5s pre-RPC delay + retries on miss. The same dedup pattern as
     /// `lanes.rs` / `leaders.rs` so concurrent callers share one RPC.
