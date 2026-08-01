@@ -22,6 +22,67 @@ pub struct FeeBucket {
     pub fee_bps: u32,
 }
 
+/// Config for the SECONDARY copy-trading bot.
+///
+/// Separate from everything above: that config drives the dump-reversion bot,
+/// this drives a wallet (`SECOND_LOGIC_WALLET`) that mirrors one trader's buys
+/// and then exits on ITS OWN thresholds — the trader's sells are deliberately
+/// ignored, so the entry signal can be evaluated on its own merits.
+///
+/// Dispatches from this bot are NOT reported to Temporal while it is under
+/// test: detection is pre-block, so a copy tx can land ahead of the trader we
+/// are copying, and that front-run needs finding and fixing before any of it
+/// is filed as evidence.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CopyTrading {
+    /// Master switch. `false` = detect and record nothing, fire nothing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Wallet whose buys we mirror.
+    #[serde(default = "default_copy_trader")]
+    pub trader_wallet: String,
+    /// Fixed SOL per copy buy. Static while testing.
+    #[serde(default = "default_copy_buy_size_sol")]
+    pub buy_size_sol: f64,
+    /// Take profit, percent (2.0 = +2%).
+    #[serde(default = "default_copy_tp_pct")]
+    pub tp_pct: f64,
+    /// Stop loss, percent (20.0 = -20%).
+    #[serde(default = "default_copy_sl_pct")]
+    pub sl_pct: f64,
+    /// Force-sell after this long if neither TP nor SL is hit, so a token that
+    /// goes quiet can't tie up capital indefinitely.
+    #[serde(default = "default_copy_max_hold_secs")]
+    pub max_hold_secs: u64,
+    /// Hard cap on simultaneously open copy positions. Bounds exposure to
+    /// `max_open_positions × buy_size_sol` no matter how active the trader is.
+    #[serde(default = "default_copy_max_open")]
+    pub max_open_positions: u32,
+}
+
+pub fn default_copy_trader() -> String {
+    "hnu5iBK8UoHb51UFsH1RYTUAYdrhjHvV5YMTf9T1CYN".to_owned()
+}
+pub fn default_copy_buy_size_sol() -> f64 { 0.2 }
+pub fn default_copy_tp_pct() -> f64 { 2.0 }
+pub fn default_copy_sl_pct() -> f64 { 20.0 }
+pub fn default_copy_max_hold_secs() -> u64 { 300 }
+pub fn default_copy_max_open() -> u32 { 10 }
+
+impl Default for CopyTrading {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trader_wallet: default_copy_trader(),
+            buy_size_sol: default_copy_buy_size_sol(),
+            tp_pct: default_copy_tp_pct(),
+            sl_pct: default_copy_sl_pct(),
+            max_hold_secs: default_copy_max_hold_secs(),
+            max_open_positions: default_copy_max_open(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FeeConfig {
     pub fee_table: Vec<FeeBucket>,
@@ -47,6 +108,10 @@ pub struct FeeConfig {
     /// Dashboard-configurable; default 1800 (30 min).
     #[serde(default = "default_ttp_ttl_secs")]
     pub ttp_ttl_secs: u64,
+    /// Secondary copy-trading bot. `#[serde(default)]` so pre-existing config
+    /// files load unchanged, with the bot disabled.
+    #[serde(default)]
+    pub copy_trading: CopyTrading,
     /// Partial-sell tiers (Usual / Fast schedules per buy-size bucket).
     /// Mirrors `statics::FeeConfig::partial_sell_tiers`. Tiers must be
     /// sorted ascending by `max_sol_lamports`; last tier uses
@@ -484,6 +549,7 @@ pub fn default_fee_config() -> FeeConfig {
         buy_size_tiers: default_buy_size_tiers(),
         rung_min_sol_lamports: default_rung_min_sol_lamports(),
         ttp_ttl_secs: default_ttp_ttl_secs(),
+        copy_trading: CopyTrading::default(),
         partial_sell_tiers: default_partial_sell_tiers(),
     }
 }
