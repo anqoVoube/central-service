@@ -8,10 +8,25 @@ use std::{collections::HashSet, net::{IpAddr, SocketAddr}, path::PathBuf};
 pub const POOL_MAX_AGE_DAYS: i64 = 150;
 pub const POOL_MAX_AGE_MS: i64 = POOL_MAX_AGE_DAYS * 24 * 60 * 60 * 1_000;
 
+/// Default endpoint for history block-detail fetches. Deliberately separate
+/// from `RPC_URL` so heavy `getBlock` traffic can't throttle the fast path.
+pub const BLOCK_DETAIL_RPC_DEFAULT: &str =
+    "https://mainnet.helius-rpc.com/?api-key=e57668cb-43f4-4d35-9d83-fbb9c1d71ad2";
+
 pub struct Config {
     pub mongo_uri: String,
     pub mongo_db: String,
     pub rpc_url: String,
+    /// Dedicated RPC for the history page's block-detail fetches.
+    ///
+    /// Split out from `rpc_url` because these two workloads are wildly
+    /// different: `getBlock` with full transaction details pulls whole blocks
+    /// (megabytes each) and is by far the heaviest call central makes, while
+    /// everything else on `rpc_url` — orderflow `getSignatureStatuses`, bans,
+    /// lanes, leaders, ATA/CU — is small and latency-sensitive. Sharing one
+    /// endpoint let block-detail traffic throttle all of it. Override with
+    /// `BLOCK_DETAIL_RPC_URL`.
+    pub block_detail_rpc_url: String,
     pub ws_bind: SocketAddr,
     pub whitelist_ips: HashSet<IpAddr>,
     pub poll_interval_secs: u64,
@@ -42,6 +57,8 @@ impl Config {
         let mongo_uri = std::env::var("MONGO_URI").context("MONGO_URI not set")?;
         let mongo_db = std::env::var("MONGO_DB").context("MONGO_DB not set")?;
         let rpc_url = std::env::var("RPC_URL").context("RPC_URL not set")?;
+        let block_detail_rpc_url = std::env::var("BLOCK_DETAIL_RPC_URL")
+            .unwrap_or_else(|_| BLOCK_DETAIL_RPC_DEFAULT.to_owned());
         let ws_bind = std::env::var("WS_BIND")
             .unwrap_or_else(|_| "0.0.0.0:9001".into())
             .parse()
@@ -99,6 +116,7 @@ impl Config {
             mongo_uri,
             mongo_db,
             rpc_url,
+            block_detail_rpc_url,
             ws_bind,
             whitelist_ips,
             poll_interval_secs,

@@ -83,11 +83,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("leaders db opened at {}", cfg.leaders_db_path.display());
 
     let block_details =
-        block_detail::BlockDetailStore::open(&cfg.block_details_db_path, cfg.rpc_url.clone())?;
-    tracing::info!(
-        "block_details db opened at {}",
-        cfg.block_details_db_path.display()
-    );
+        block_detail::BlockDetailStore::open(
+            &cfg.block_details_db_path,
+            // Dedicated endpoint: `getBlock(full)` is the heaviest call we
+            // make and would otherwise contend with orderflow/bans/leaders.
+            cfg.block_detail_rpc_url.clone(),
+        )?;
+    {
+        // Log host only — the URL carries an api key.
+        let host = cfg
+            .block_detail_rpc_url
+            .split("://")
+            .nth(1)
+            .and_then(|r| r.split('/').next())
+            .unwrap_or("?");
+        tracing::info!(
+            "block_details db opened at {} (rpc={host}{})",
+            cfg.block_details_db_path.display(),
+            if cfg.block_detail_rpc_url == cfg.rpc_url { ", SHARED with RPC_URL" } else { ", dedicated" },
+        );
+    }
 
     // Orderflow detections that reached the chain (landed/failed). Persisted
     // so the dashboard survives restarts; never-landed txs are dropped.
