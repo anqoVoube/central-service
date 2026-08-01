@@ -39,6 +39,8 @@ pub struct Config {
     pub block_details_db_path: PathBuf,
     /// sled DB of orderflow-detected dumps that reached the chain.
     pub orderflow_db_path: PathBuf,
+    /// sled DB of the secondary copy-trading bot's trades + front-run verdicts.
+    pub copy_trades_db_path: PathBuf,
     pub tip_priority_db_path: PathBuf,
     /// Sled DB for the dashboard's [G] guaranteed-leader marker set.
     /// Pure UX flag; no bot consumption. Defaults to `./guaranteed.db`.
@@ -97,6 +99,9 @@ impl Config {
         let block_details_db_path = std::env::var("BLOCK_DETAILS_DB_PATH")
             .unwrap_or_else(|_| "block_details.db".into())
             .into();
+        let copy_trades_db_path = std::env::var("COPY_TRADES_DB_PATH")
+            .unwrap_or_else(|_| "copytrades.db".into())
+            .into();
         let orderflow_db_path = std::env::var("ORDERFLOW_DB_PATH")
             .unwrap_or_else(|_| "orderflow.db".into())
             .into();
@@ -128,6 +133,7 @@ impl Config {
             leaders_db_path,
             block_details_db_path,
             orderflow_db_path,
+            copy_trades_db_path,
             tip_priority_db_path,
             guaranteed_db_path,
             fee_config_path,

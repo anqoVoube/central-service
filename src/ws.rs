@@ -277,6 +277,39 @@ enum ClientMsg {
         #[serde(default)]
         ts_ms: u64,
     },
+    /// The SECONDARY copy-trading bot mirrored a trader's buy. Central stores
+    /// it and resolves whether we landed before or after the trader — the
+    /// front-run check that gates taking this bot out of test.
+    ///
+    /// Deliberately NOT reported to Temporal: this bot's activity is not part
+    /// of the orderflow-reversion strategy they reconcile against.
+    CopyTradeOpened {
+        pool: String,
+        mint: String,
+        trader_sig: String,
+        buy_sig: String,
+        buy_size_lamports: u64,
+        #[serde(default)]
+        buy_price_sol: f64,
+        #[serde(default)]
+        loc: u8,
+        #[serde(default)]
+        ts_ms: u64,
+    },
+    /// The copy bot exited a position. Patches the existing row.
+    CopyTradeClosed {
+        buy_sig: String,
+        sell_sig: String,
+        #[serde(default)]
+        sell_price_sol: f64,
+        /// `tp` | `sl` | `max_hold` | `manual`.
+        #[serde(default)]
+        exit_reason: String,
+        #[serde(default)]
+        pnl_sol: Option<f64>,
+        #[serde(default)]
+        ts_ms: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -293,6 +326,7 @@ struct AppState {
     leaders: LeaderStore,
     block_details: BlockDetailStore,
     orderflow: crate::orderflow::OrderflowStore,
+    copy_trades: crate::copytrades::CopyTradeStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
@@ -317,6 +351,7 @@ pub async fn serve(
     leaders: LeaderStore,
     block_details: BlockDetailStore,
     orderflow: crate::orderflow::OrderflowStore,
+    copy_trades: crate::copytrades::CopyTradeStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
@@ -335,6 +370,7 @@ pub async fn serve(
         leaders,
         block_details,
         orderflow,
+        copy_trades,
         tip_priority,
         guaranteed,
         fee_config_file,
@@ -374,6 +410,7 @@ pub async fn serve(
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
         .route("/fee-priority.bin", get(serve_fee_priority_snapshot))
         .route("/orderflow.json", get(serve_orderflow))
+        .route("/copytrades.json", get(serve_copy_trades))
         .route("/tip-priority-status", get(serve_tip_priority_status))
         .route("/guaranteed", post(serve_guaranteed_set))
         .route("/guaranteed.bin", get(serve_guaranteed_snapshot))
@@ -762,6 +799,36 @@ async fn serve_orderflow(
         "total_pages": total.div_ceil(limit.max(1)),
         "count": rows.len(),
         "events": rows,
+    }))
+    .into_response()
+}
+
+/// `GET /copytrades.json?page=N&limit=50` — the secondary copy bot's trades,
+/// newest first, with the front-run verdict per trade. Also returns a
+/// `summary` block so the dashboard can show the front-run rate without
+/// paging through everything. IP-whitelisted.
+async fn serve_copy_trades(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<OrderflowQuery>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting copytrades.json from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let page = q.page.unwrap_or(0);
+    let total = state.copy_trades.count();
+    let rows = state.copy_trades.page(page.saturating_mul(limit), limit);
+    Json(serde_json::json!({
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": total.div_ceil(limit.max(1)),
+        "count": rows.len(),
+        "summary": state.copy_trades.summary(),
+        "trades": rows,
     }))
     .into_response()
 }
@@ -1572,6 +1639,40 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.orderflow.handle_detected(
                             sig, venue, pool, dumper, amount_in, min_amount_out, loc, ts,
+                        );
+                    }
+                    Ok(ClientMsg::CopyTradeOpened {
+                        pool, mint, trader_sig, buy_sig, buy_size_lamports,
+                        buy_price_sol, loc, ts_ms,
+                    }) => {
+                        let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
+                        state.copy_trades.record_buy(crate::copytrades::CopyTrade {
+                            ts_ms: ts,
+                            pool,
+                            mint,
+                            trader_sig,
+                            buy_sig,
+                            buy_size_lamports,
+                            buy_price_sol,
+                            loc,
+                            sell_sig: None,
+                            sell_price_sol: None,
+                            exit_reason: None,
+                            pnl_sol: None,
+                            closed_ts_ms: None,
+                            verdict: "pending".to_owned(),
+                            trader_slot: None,
+                            our_slot: None,
+                            trader_block_index: None,
+                            our_block_index: None,
+                        });
+                    }
+                    Ok(ClientMsg::CopyTradeClosed {
+                        buy_sig, sell_sig, sell_price_sol, exit_reason, pnl_sol, ts_ms,
+                    }) => {
+                        let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
+                        state.copy_trades.record_sell(
+                            &buy_sig, sell_sig, sell_price_sol, exit_reason, pnl_sol, ts,
                         );
                     }
                     Ok(ClientMsg::SigDispatched { prefix }) => {

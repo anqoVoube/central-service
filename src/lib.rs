@@ -11,6 +11,7 @@ pub mod bans;
 pub mod bg_worker;
 pub mod block_detail;
 pub mod config;
+pub mod copytrades;
 pub mod discover;
 pub mod fee_config;
 pub mod guaranteed;
