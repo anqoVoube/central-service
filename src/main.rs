@@ -89,6 +89,13 @@ async fn main() -> anyhow::Result<()> {
         cfg.block_details_db_path.display()
     );
 
+    // Orderflow detections that reached the chain (landed/failed). Persisted
+    // so the dashboard survives restarts; never-landed txs are dropped.
+    let orderflow = central_service::orderflow::OrderflowStore::open(
+        &cfg.orderflow_db_path,
+        cfg.rpc_url.clone(),
+    )?;
+
     let tip_priority =
         central_service::tip_priority::TipPriorityStore::open(
             &cfg.tip_priority_db_path,
@@ -194,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         lanes,
         leaders,
         block_details,
+        orderflow,
         tip_priority,
         guaranteed,
         fee_config_file,

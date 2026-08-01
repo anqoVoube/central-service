@@ -149,7 +149,27 @@ pub struct BlockDetailStore {
 struct Inner {
     db: sled::Tree,
     in_flight: Mutex<HashSet<String>>,
+    /// Keys whose opp tx is NOT on chain. Since the orderflow migration the
+    /// bot detects opportunities PRE-BLOCK, so a large share of `opp_sig`s
+    /// never land — `getTransaction` returns `null` forever. Without this,
+    /// every dashboard poll re-ran the 5 s delay + 3 retries and logged a
+    /// WARN, hammering the RPC with calls that can never succeed.
+    not_landed: Mutex<HashSet<String>>,
     rpc_url: String,
+}
+
+/// Bound on `not_landed` so a long-running central can't grow it without
+/// limit. On overflow we clear it wholesale — worst case is one extra
+/// resolve attempt for keys that were already known-absent.
+const NOT_LANDED_CAP: usize = 20_000;
+
+/// True when the error is "the cluster has no such transaction" rather than a
+/// transient RPC failure. The JSON-RPC returns `null` for an unknown
+/// signature, which surfaces as a serde error against the expected struct.
+/// Retrying can't help, so this is terminal.
+fn is_tx_not_found(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    s.contains("invalid type: null")
 }
 
 impl BlockDetailStore {
@@ -162,6 +182,7 @@ impl BlockDetailStore {
             inner: Arc::new(Inner {
                 db: tree,
                 in_flight: Mutex::new(HashSet::new()),
+                not_landed: Mutex::new(HashSet::new()),
                 rpc_url,
             }),
         })
@@ -181,6 +202,11 @@ impl BlockDetailStore {
         if let Some(d) = self.cache_get(&key) {
             return Resolution::Resolved(d);
         }
+        // Known-absent short-circuit: an opp tx that never landed will never
+        // land, so don't pay the 5 s delay + retries again on every poll.
+        if self.inner.not_landed.lock().unwrap().contains(&key) {
+            return Resolution::Unknown;
+        }
         let already_in_flight = {
             let mut g = self.inner.in_flight.lock().unwrap();
             !g.insert(key.clone())
@@ -198,8 +224,11 @@ impl BlockDetailStore {
         tokio::time::sleep(RESOLVE_INITIAL_DELAY).await;
         let mut result = fetch_block_detail(&self.inner.rpc_url, opp_sig, pool).await;
         for attempt in 1..=RESOLVE_MAX_RETRIES {
-            if !matches!(result, Err(_)) {
-                break;
+            match &result {
+                Ok(_) => break,
+                // Terminal: the tx isn't on chain. Retrying just burns RPC.
+                Err(e) if is_tx_not_found(e) => break,
+                Err(_) => {}
             }
             tracing::debug!(
                 "[block_detail] opp={opp_sig} pool={pool} RPC failed; retry {attempt}/{RESOLVE_MAX_RETRIES} in {:?}",
@@ -221,6 +250,20 @@ impl BlockDetailStore {
                 tracing::warn!(
                     "[block_detail] opp={opp_sig} pool={pool}: tx not confirmed or block missing"
                 );
+                Resolution::Unknown
+            }
+            // Expected since the orderflow migration: we detect opportunities
+            // pre-block, so many never land. Record it and stop asking —
+            // debug, not warn, because it isn't a fault.
+            Err(e) if is_tx_not_found(&e) => {
+                tracing::debug!(
+                    "[block_detail] opp={opp_sig} pool={pool}: opp tx never landed (pre-block detection)"
+                );
+                let mut g = self.inner.not_landed.lock().unwrap();
+                if g.len() >= NOT_LANDED_CAP {
+                    g.clear();
+                }
+                g.insert(key);
                 Resolution::Unknown
             }
             Err(e) => {

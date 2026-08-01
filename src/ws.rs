@@ -226,6 +226,21 @@ pub enum ServerMsg {
     SigDispatched {
         prefix: String,
     },
+    /// A bot detected a dump on the Nozomi ORDERFLOW stream (pre-block).
+    /// Central resolves the on-chain outcome and persists landed/failed rows;
+    /// never-landed ones are dropped. Reported by EVERY location, so the
+    /// dashboard shows the full picture rather than one box's view.
+    OrderflowDetected {
+        sig: String,
+        venue: String,
+        pool: String,
+        dumper: String,
+        amount_in: u64,
+        #[serde(default)]
+        loc: u8,
+        #[serde(default)]
+        ts_ms: u64,
+    },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
@@ -259,6 +274,21 @@ enum ClientMsg {
     SigDispatched {
         prefix: String,
     },
+    /// A bot detected a dump on the Nozomi ORDERFLOW stream (pre-block).
+    /// Central resolves the on-chain outcome and persists landed/failed rows;
+    /// never-landed ones are dropped. Reported by EVERY location, so the
+    /// dashboard shows the full picture rather than one box's view.
+    OrderflowDetected {
+        sig: String,
+        venue: String,
+        pool: String,
+        dumper: String,
+        amount_in: u64,
+        #[serde(default)]
+        loc: u8,
+        #[serde(default)]
+        ts_ms: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -274,6 +304,7 @@ struct AppState {
     lanes: LaneStore,
     leaders: LeaderStore,
     block_details: BlockDetailStore,
+    orderflow: crate::orderflow::OrderflowStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
@@ -297,6 +328,7 @@ pub async fn serve(
     lanes: LaneStore,
     leaders: LeaderStore,
     block_details: BlockDetailStore,
+    orderflow: crate::orderflow::OrderflowStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
@@ -314,6 +346,7 @@ pub async fn serve(
         lanes,
         leaders,
         block_details,
+        orderflow,
         tip_priority,
         guaranteed,
         fee_config_file,
@@ -352,6 +385,7 @@ pub async fn serve(
         .route("/tip-priority", post(serve_tip_priority_set))
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
         .route("/fee-priority.bin", get(serve_fee_priority_snapshot))
+        .route("/orderflow.json", get(serve_orderflow))
         .route("/tip-priority-status", get(serve_tip_priority_status))
         .route("/guaranteed", post(serve_guaranteed_set))
         .route("/guaranteed.bin", get(serve_guaranteed_snapshot))
@@ -632,6 +666,15 @@ async fn serve_tip_priority_set(
 }
 
 /// Current unix time in whole seconds.
+/// Milliseconds since the epoch. Used to stamp orderflow detections when the
+/// reporting bot didn't (its detect path stays clock-free).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -696,6 +739,31 @@ async fn serve_tip_priority_snapshot(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(Body::from(bytes))
         .expect("build tip-priority body")
+}
+
+/// `GET /orderflow.json` — orderflow-detected dumps that reached the chain,
+/// newest first. Only `landed` / `failed` are stored; never-landed txs are
+/// dropped at resolve time, so the dashboard never sees them. Survives
+/// restarts (sled) and aggregates every location. IP-whitelisted.
+async fn serve_orderflow(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting orderflow.json from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let rows = state.orderflow.recent(500);
+    let landed = rows.iter().filter(|r| r.status == "landed").count();
+    Json(serde_json::json!({
+        "count": rows.len(),
+        "landed": landed,
+        "failed": rows.len() - landed,
+        "total_stored": state.orderflow.count(),
+        "events": rows,
+    }))
+    .into_response()
 }
 
 /// `GET /fee-priority.bin` — bincode `Vec<Pubkey>` of the fee-priority set.
@@ -1484,6 +1552,16 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             (Err(e), _) => tracing::warn!("opp_check bad dumper_pk {dumper_pk}: {e}"),
                             (_, Err(e)) => tracing::warn!("opp_check bad dumper_ata {dumper_ata}: {e}"),
                         }
+                    }
+                    Ok(ClientMsg::OrderflowDetected {
+                        sig, venue, pool, dumper, amount_in, loc, ts_ms,
+                    }) => {
+                        // Fill in the arrival time if the bot didn't stamp one
+                        // (it deliberately keeps clocks off the detect path).
+                        let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
+                        state.orderflow.handle_detected(
+                            sig, venue, pool, dumper, amount_in, loc, ts,
+                        );
                     }
                     Ok(ClientMsg::SigDispatched { prefix }) => {
                         // Sanity-bound to the 8-char base58 prefix the bot
