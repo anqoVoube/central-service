@@ -226,21 +226,6 @@ pub enum ServerMsg {
     SigDispatched {
         prefix: String,
     },
-    /// A bot detected a dump on the Nozomi ORDERFLOW stream (pre-block).
-    /// Central resolves the on-chain outcome and persists landed/failed rows;
-    /// never-landed ones are dropped. Reported by EVERY location, so the
-    /// dashboard shows the full picture rather than one box's view.
-    OrderflowDetected {
-        sig: String,
-        venue: String,
-        pool: String,
-        dumper: String,
-        amount_in: u64,
-        #[serde(default)]
-        loc: u8,
-        #[serde(default)]
-        ts_ms: u64,
-    },
 }
 
 /// Inbound from a location. `discovered_pool` is Frankfurt-only;
@@ -284,6 +269,9 @@ enum ClientMsg {
         pool: String,
         dumper: String,
         amount_in: u64,
+        /// Dumper's min_amount_out in WSOL lamports (0 = venue exposes none).
+        #[serde(default)]
+        min_amount_out: u64,
         #[serde(default)]
         loc: u8,
         #[serde(default)]
@@ -741,26 +729,38 @@ async fn serve_tip_priority_snapshot(
         .expect("build tip-priority body")
 }
 
-/// `GET /orderflow.json` — orderflow-detected dumps that reached the chain,
+#[derive(Deserialize, Default)]
+struct OrderflowQuery {
+    page: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// `GET /orderflow.json?page=N&limit=50` — orderflow-detected dumps that reached the chain,
 /// newest first. Only `landed` / `failed` are stored; never-landed txs are
 /// dropped at resolve time, so the dashboard never sees them. Survives
 /// restarts (sled) and aggregates every location. IP-whitelisted.
 async fn serve_orderflow(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<OrderflowQuery>,
 ) -> Response {
     if !state.whitelist.contains(&addr.ip()) {
         let ip = addr.ip();
         tracing::warn!("rejecting orderflow.json from non-whitelisted ip {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
-    let rows = state.orderflow.recent(500);
-    let landed = rows.iter().filter(|r| r.status == "landed").count();
+    // Page size is clamped so a hand-crafted `limit` can't ask central to
+    // materialise the whole table.
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let page = q.page.unwrap_or(0);
+    let total = state.orderflow.count();
+    let rows = state.orderflow.page(page.saturating_mul(limit), limit);
     Json(serde_json::json!({
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": total.div_ceil(limit.max(1)),
         "count": rows.len(),
-        "landed": landed,
-        "failed": rows.len() - landed,
-        "total_stored": state.orderflow.count(),
         "events": rows,
     }))
     .into_response()
@@ -1554,13 +1554,13 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         }
                     }
                     Ok(ClientMsg::OrderflowDetected {
-                        sig, venue, pool, dumper, amount_in, loc, ts_ms,
+                        sig, venue, pool, dumper, amount_in, min_amount_out, loc, ts_ms,
                     }) => {
                         // Fill in the arrival time if the bot didn't stamp one
                         // (it deliberately keeps clocks off the detect path).
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.orderflow.handle_detected(
-                            sig, venue, pool, dumper, amount_in, loc, ts,
+                            sig, venue, pool, dumper, amount_in, min_amount_out, loc, ts,
                         );
                     }
                     Ok(ClientMsg::SigDispatched { prefix }) => {

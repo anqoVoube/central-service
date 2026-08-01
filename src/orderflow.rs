@@ -35,11 +35,21 @@ use solana_sdk::commitment_config::CommitmentConfig;
 /// propagation + confirmation, not just confirmation.
 const STATUS_CHECK_DELAY: Duration = Duration::from_secs(12);
 
-/// Cap on stored rows. Oldest are pruned past this so the DB stays bounded.
-const MAX_ROWS: usize = 20_000;
+/// Cap on stored rows. Effectively "keep everything" for months while staying
+/// bounded so sled and the dashboard remain predictable (operator decision:
+/// keep all landed+failed, don't delete).
+const MAX_ROWS: usize = 1_000_000;
 
 /// Prune only occasionally rather than on every insert.
-const PRUNE_EVERY: u64 = 256;
+const PRUNE_EVERY: u64 = 4_096;
+
+/// Dumper wallets whose NOT-LANDED detections we keep. Everything that reaches
+/// the chain (landed/failed) is stored for every dumper; never-landed ones are
+/// dropped as noise EXCEPT for these, which the operator tracks specifically.
+const KEEP_NOT_LANDED_DUMPERS: &[&str] = &[
+    "hnu5iBK8UoHb51UFsH1RYTUAYdrhjHvV5YMTf9T1CYN",
+    "FYX5JQ2kP7TD8gWb9WP1tjmwWWUAzi8edEZTr5Z8F1ck",
+];
 
 /// One detected dump that reached the chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,7 +62,10 @@ pub struct OrderflowRow {
     pub pool: String,
     pub dumper: String,
     pub amount_in: u64,
-    /// `landed` | `failed` — never "pending"/"not-landed"; those aren't stored.
+    /// Dumper's `min_amount_out` in WSOL lamports, from the swap ix. `0` when
+    /// the venue exposes none (aggregator routers) — rendered as "—".
+    #[serde(default)]
+    pub min_amount_out: u64,
     pub status: String,
     /// Which bot location reported it (`LOCATION_INDEX`), for attribution.
     pub loc: u8,
@@ -65,6 +78,11 @@ pub struct OrderflowStore {
 
 struct Inner {
     db: sled::Tree,
+    /// `sig -> ()` index. The main tree is keyed `ts_ms:sig` for time order,
+    /// so "have I already stored this sig?" used to be a FULL key scan — O(n)
+    /// per detection, fine at 20k rows and hopeless at 1M. This makes it a
+    /// point lookup.
+    by_sig: sled::Tree,
     /// Dedup by sig — every location that sees the same dump reports it, and
     /// we only want one RPC + one row.
     in_flight: Mutex<HashSet<String>>,
@@ -76,11 +94,15 @@ impl OrderflowStore {
     pub fn open(db_path: &Path, rpc_url: String) -> anyhow::Result<Self> {
         let db = sled::open(db_path).context("open sled orderflow db")?;
         let tree = db.open_tree("orderflow").context("open orderflow tree")?;
+        let by_sig = db
+            .open_tree("orderflow_by_sig")
+            .context("open orderflow_by_sig tree")?;
         let n = tree.iter().count();
         println!("[orderflow-db] opened at {} ({n} rows)", db_path.display());
         Ok(Self {
             inner: Arc::new(Inner {
                 db: tree,
+                by_sig,
                 in_flight: Mutex::new(HashSet::new()),
                 rpc_url,
                 inserts: Mutex::new(0),
@@ -98,6 +120,7 @@ impl OrderflowStore {
         pool: String,
         dumper: String,
         amount_in: u64,
+        min_amount_out: u64,
         loc: u8,
         ts_ms: u64,
     ) {
@@ -121,6 +144,7 @@ impl OrderflowStore {
                 pool,
                 dumper,
                 amount_in,
+                min_amount_out,
                 status: String::new(),
                 loc,
             };
@@ -131,10 +155,11 @@ impl OrderflowStore {
         });
     }
 
-    /// Newest-first rows, capped at `limit`.
-    pub fn recent(&self, limit: usize) -> Vec<OrderflowRow> {
+    /// One newest-first page. Keys are time-ordered, so a reverse iterator
+    /// walked `offset` forward is the page start — no full materialisation.
+    pub fn page(&self, offset: usize, limit: usize) -> Vec<OrderflowRow> {
         let mut out: Vec<OrderflowRow> = Vec::with_capacity(limit.min(1024));
-        for kv in self.inner.db.iter().rev() {
+        for kv in self.inner.db.iter().rev().skip(offset) {
             let Ok((_, v)) = kv else { continue };
             match bincode::deserialize::<OrderflowRow>(&v) {
                 Ok(r) => out.push(r),
@@ -152,16 +177,10 @@ impl OrderflowStore {
     }
 
     fn contains_sig(&self, sig: &str) -> bool {
-        // Keys are `ts_ms:sig`; a suffix scan is fine at this size and avoids
-        // a second index.
-        self.inner.db.iter().keys().any(|k| {
-            k.map(|k| {
-                std::str::from_utf8(&k)
-                    .map(|s| s.ends_with(sig))
-                    .unwrap_or(false)
-            })
+        self.inner
+            .by_sig
+            .contains_key(sig.as_bytes())
             .unwrap_or(false)
-        })
     }
 }
 
@@ -176,12 +195,21 @@ async fn resolve_and_store(inner: &Inner, mut row: OrderflowRow) -> anyhow::Resu
         .await
         .context("getSignatureStatuses")?;
 
-    let Some(Some(status)) = statuses.value.into_iter().next() else {
-        // Never landed — the common case for pre-block detection. DROP it:
-        // not stored, not counted, never shown in the dashboard.
-        return Ok(());
-    };
-    row.status = if status.err.is_none() { "landed" } else { "failed" }.to_owned();
+    match statuses.value.into_iter().next() {
+        // On chain: err distinguishes a clean land from a revert. Always kept.
+        Some(Some(status)) => {
+            row.status = if status.err.is_none() { "landed" } else { "failed" }.to_owned();
+        }
+        // Never landed. Normally dropped — with pre-block detection these are
+        // the majority and pure noise — EXCEPT for the operator-tracked
+        // dumpers, whose misses are themselves the signal.
+        _ => {
+            if !KEEP_NOT_LANDED_DUMPERS.contains(&row.dumper.as_str()) {
+                return Ok(());
+            }
+            row.status = "not-landed".to_owned();
+        }
+    }
 
     let key = format!("{:013}:{}", row.ts_ms, row.sig);
     let bytes = bincode::serialize(&row).context("encode orderflow row")?;
@@ -189,7 +217,14 @@ async fn resolve_and_store(inner: &Inner, mut row: OrderflowRow) -> anyhow::Resu
         .db
         .insert(key.as_bytes(), bytes)
         .context("sled insert orderflow")?;
+    // Index the sig so the next duplicate report is a point lookup, and
+    // remember its main-tree key so pruning can evict both together.
+    inner
+        .by_sig
+        .insert(row.sig.as_bytes(), key.as_bytes())
+        .context("sled insert orderflow_by_sig")?;
     inner.db.flush().context("sled flush orderflow")?;
+    inner.by_sig.flush().context("sled flush orderflow_by_sig")?;
 
     let should_prune = {
         let mut n = inner.inserts.lock().unwrap();
@@ -218,8 +253,17 @@ fn prune(inner: &Inner) {
         .filter_map(|k| k.ok())
         .collect();
     for k in &old {
+        // Key is `ts_ms:sig` — recover the sig to drop its index entry too,
+        // otherwise the index grows forever and would resurrect dedup hits
+        // for rows that no longer exist.
+        if let Ok(ks) = std::str::from_utf8(k) {
+            if let Some((_, sig)) = ks.split_once(':') {
+                let _ = inner.by_sig.remove(sig.as_bytes());
+            }
+        }
         let _ = inner.db.remove(k);
     }
     let _ = inner.db.flush();
+    let _ = inner.by_sig.flush();
     println!("[orderflow-db] pruned {} old row(s), {} remain", old.len(), total - old.len());
 }
