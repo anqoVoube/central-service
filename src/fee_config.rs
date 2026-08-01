@@ -41,6 +41,14 @@ pub struct CopyTrading {
     /// Wallet whose buys we mirror.
     #[serde(default = "default_copy_trader")]
     pub trader_wallet: String,
+    /// PUBLIC key of the copy wallet. The private key lives only in the
+    /// copy-trading host's `SECOND_LOGIC_WALLET`; this is shared config
+    /// because EVERY bot location needs to recognise that wallet's
+    /// transactions and drop them. A location that doesn't know the pubkey
+    /// reads the copy bot's sells as external dumps and fires buys against
+    /// our own secondary. Empty = no copy wallet configured.
+    #[serde(default)]
+    pub wallet_pubkey: String,
     /// Fixed SOL per copy buy. Static while testing.
     #[serde(default = "default_copy_buy_size_sol")]
     pub buy_size_sol: f64,
@@ -74,6 +82,7 @@ impl Default for CopyTrading {
         Self {
             enabled: false,
             trader_wallet: default_copy_trader(),
+            wallet_pubkey: String::new(),
             buy_size_sol: default_copy_buy_size_sol(),
             tp_pct: default_copy_tp_pct(),
             sl_pct: default_copy_sl_pct(),
