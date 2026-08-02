@@ -266,6 +266,10 @@ enum ClientMsg {
     OrderflowDetected {
         sig: String,
         venue: String,
+        /// `sell` (a dump) or `buy` (a watched wallet's entry). Older bots
+        /// don't send it — default to the historical meaning.
+        #[serde(default = "default_orderflow_side")]
+        side: String,
         pool: String,
         dumper: String,
         amount_in: u64,
@@ -310,6 +314,11 @@ enum ClientMsg {
         #[serde(default)]
         ts_ms: u64,
     },
+}
+
+/// Bots predating the buy/sell split only ever reported dumps.
+fn default_orderflow_side() -> String {
+    "sell".to_owned()
 }
 
 #[derive(Clone)]
@@ -770,6 +779,11 @@ async fn serve_tip_priority_snapshot(
 struct OrderflowQuery {
     page: Option<usize>,
     limit: Option<usize>,
+    /// `landed` | `failed` | `not-landed` | `pending`. Applied server-side so
+    /// a page really contains `limit` matching rows.
+    status: Option<String>,
+    /// `buy` | `sell`.
+    side: Option<String>,
 }
 
 /// `GET /orderflow.json?page=N&limit=50` — orderflow-detected dumps that reached the chain,
@@ -790,13 +804,26 @@ async fn serve_orderflow(
     // materialise the whole table.
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let page = q.page.unwrap_or(0);
-    let total = state.orderflow.count();
-    let rows = state.orderflow.page(page.saturating_mul(limit), limit);
+    let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
+    let side = q.side.as_deref().filter(|s| !s.is_empty() && *s != "all");
+    let filtered = status.is_some() || side.is_some();
+
+    let (rows, has_more) =
+        state
+            .orderflow
+            .page_filtered(page.saturating_mul(limit), limit, status, side);
+
+    // Unfiltered, `count()` is a cheap key scan. Filtered, an exact total
+    // means deserializing the whole tree — too expensive for an endpoint the
+    // dashboard polls every 3s — so the UI drives paging off `has_more`.
+    let total = if filtered { None } else { Some(state.orderflow.count()) };
     Json(serde_json::json!({
         "page": page,
         "limit": limit,
         "total": total,
-        "total_pages": total.div_ceil(limit.max(1)),
+        "total_pages": total.map(|t| t.div_ceil(limit.max(1))),
+        "has_more": has_more,
+        "filtered": filtered,
         "count": rows.len(),
         "events": rows,
     }))
@@ -1632,13 +1659,13 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         }
                     }
                     Ok(ClientMsg::OrderflowDetected {
-                        sig, venue, pool, dumper, amount_in, min_amount_out, loc, ts_ms,
+                        sig, venue, side, pool, dumper, amount_in, min_amount_out, loc, ts_ms,
                     }) => {
                         // Fill in the arrival time if the bot didn't stamp one
                         // (it deliberately keeps clocks off the detect path).
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.orderflow.handle_detected(
-                            sig, venue, pool, dumper, amount_in, min_amount_out, loc, ts,
+                            sig, venue, side, pool, dumper, amount_in, min_amount_out, loc, ts,
                         );
                     }
                     Ok(ClientMsg::CopyTradeOpened {

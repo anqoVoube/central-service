@@ -58,6 +58,11 @@ pub struct OrderflowRow {
     /// Venue label from the bot's parser: `direct_pump` / `direct_cpmm` /
     /// `jupiter` / `okx` / `dflow` / `axiom`.
     pub venue: String,
+    /// `sell` = a dump (the strategy signal). `buy` = a watched wallet's
+    /// entry, surfaced for observation only. Defaults to `sell` so rows
+    /// written before this field existed still deserialize.
+    #[serde(default = "default_side")]
+    pub side: String,
     pub sig: String,
     pub pool: String,
     pub dumper: String,
@@ -69,6 +74,10 @@ pub struct OrderflowRow {
     pub status: String,
     /// Which bot location reported it (`LOCATION_INDEX`), for attribution.
     pub loc: u8,
+}
+
+fn default_side() -> String {
+    "sell".to_owned()
 }
 
 #[derive(Clone)]
@@ -117,6 +126,7 @@ impl OrderflowStore {
         &self,
         sig: String,
         venue: String,
+        side: String,
         pool: String,
         dumper: String,
         amount_in: u64,
@@ -140,6 +150,7 @@ impl OrderflowStore {
             let row = OrderflowRow {
                 ts_ms,
                 venue,
+                side,
                 sig: sig.clone(),
                 pool,
                 dumper,
@@ -158,18 +169,71 @@ impl OrderflowStore {
     /// One newest-first page. Keys are time-ordered, so a reverse iterator
     /// walked `offset` forward is the page start — no full materialisation.
     pub fn page(&self, offset: usize, limit: usize) -> Vec<OrderflowRow> {
+        self.page_filtered(offset, limit, None, None).0
+    }
+
+    /// One newest-first page of rows matching an optional status and/or side.
+    ///
+    /// Filtering happens HERE, not in the browser. Filtering a
+    /// already-paginated response would return "the landed rows among the
+    /// most recent 50", which is a handful — not the 50 landed rows the
+    /// operator asked for.
+    ///
+    /// Returns `(rows, has_more)`. `has_more` comes from peeking one row past
+    /// the page rather than counting every match: a full count would mean
+    /// deserializing the entire tree on every request, and this endpoint is
+    /// polled every 3 seconds.
+    pub fn page_filtered(
+        &self,
+        offset: usize,
+        limit: usize,
+        status: Option<&str>,
+        side: Option<&str>,
+    ) -> (Vec<OrderflowRow>, bool) {
         let mut out: Vec<OrderflowRow> = Vec::with_capacity(limit.min(1024));
-        for kv in self.inner.db.iter().rev().skip(offset) {
+        let mut skipped = 0usize;
+        let mut has_more = false;
+        for kv in self.inner.db.iter().rev() {
             let Ok((_, v)) = kv else { continue };
-            match bincode::deserialize::<OrderflowRow>(&v) {
-                Ok(r) => out.push(r),
-                Err(_) => continue,
+            let Ok(r) = bincode::deserialize::<OrderflowRow>(&v) else {
+                continue;
+            };
+            if let Some(want) = status {
+                if r.status != want {
+                    continue;
+                }
             }
-            if out.len() >= limit {
+            if let Some(want) = side {
+                if r.side != want {
+                    continue;
+                }
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() == limit {
+                // One match beyond the page — enough to enable "next".
+                has_more = true;
                 break;
             }
+            out.push(r);
         }
-        out
+        (out, has_more)
+    }
+
+    /// Count of rows matching a filter. Only computed when a filter is
+    /// active and the table is small enough that a scan is cheap; callers
+    /// pass `None` to skip it entirely.
+    pub fn count_filtered(&self, status: Option<&str>, side: Option<&str>) -> usize {
+        self.inner
+            .db
+            .iter()
+            .filter_map(|kv| kv.ok())
+            .filter_map(|(_, v)| bincode::deserialize::<OrderflowRow>(&v).ok())
+            .filter(|r| status.is_none_or(|w| r.status == w))
+            .filter(|r| side.is_none_or(|w| r.side == w))
+            .count()
     }
 
     pub fn count(&self) -> usize {
