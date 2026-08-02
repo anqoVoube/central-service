@@ -68,7 +68,13 @@ pub struct CopyTrading {
     /// Sell slippage, basis points. Exits favour getting out.
     #[serde(default = "default_copy_sell_slippage_bps")]
     pub sell_slippage_bps: u32,
+    /// Buy tip used ONLY when the trader's tx carries no readable tip.
+    /// Normally our tip is theirs plus a random 10-15%.
+    #[serde(default = "default_copy_fallback_tip_sol")]
+    pub fallback_tip_sol: f64,
 }
+
+pub fn default_copy_fallback_tip_sol() -> f64 { 0.01 }
 
 pub fn default_copy_buy_slippage_bps() -> u32 { 1_500 }
 pub fn default_copy_sell_slippage_bps() -> u32 { 5_000 }
@@ -93,6 +99,7 @@ impl Default for CopyTrading {
             max_open_positions: default_copy_max_open(),
             buy_slippage_bps: default_copy_buy_slippage_bps(),
             sell_slippage_bps: default_copy_sell_slippage_bps(),
+            fallback_tip_sol: default_copy_fallback_tip_sol(),
         }
     }
 }
