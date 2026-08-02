@@ -80,6 +80,50 @@ fn default_side() -> String {
     "sell".to_owned()
 }
 
+
+/// The row shape as it was BEFORE `side` was added.
+///
+/// bincode is positional and non-self-describing, so `#[serde(default)]` does
+/// nothing for it: a row written without `side` cannot be read by a
+/// deserializer that expects `side`, and every byte after that point is
+/// misread. Without this fallback, adding the field would have silently
+/// orphaned the entire stored history — the rows stay in sled but decode to
+/// nothing, which shows up as a row count that disagrees with the table.
+#[derive(Deserialize)]
+struct LegacyOrderflowRow {
+    ts_ms: u64,
+    venue: String,
+    sig: String,
+    pool: String,
+    dumper: String,
+    amount_in: u64,
+    min_amount_out: u64,
+    status: String,
+    loc: u8,
+}
+
+/// Decode a stored row, falling back to the pre-`side` layout.
+fn decode_row(v: &[u8]) -> Option<OrderflowRow> {
+    if let Ok(r) = bincode::deserialize::<OrderflowRow>(v) {
+        return Some(r);
+    }
+    bincode::deserialize::<LegacyOrderflowRow>(v)
+        .ok()
+        .map(|l| OrderflowRow {
+            ts_ms: l.ts_ms,
+            venue: l.venue,
+            // Everything recorded before the split was a dump.
+            side: default_side(),
+            sig: l.sig,
+            pool: l.pool,
+            dumper: l.dumper,
+            amount_in: l.amount_in,
+            min_amount_out: l.min_amount_out,
+            status: l.status,
+            loc: l.loc,
+        })
+}
+
 #[derive(Clone)]
 pub struct OrderflowStore {
     inner: Arc<Inner>,
@@ -195,7 +239,7 @@ impl OrderflowStore {
         let mut has_more = false;
         for kv in self.inner.db.iter().rev() {
             let Ok((_, v)) = kv else { continue };
-            let Ok(r) = bincode::deserialize::<OrderflowRow>(&v) else {
+            let Some(r) = decode_row(&v) else {
                 continue;
             };
             if let Some(want) = status {
@@ -230,7 +274,7 @@ impl OrderflowStore {
             .db
             .iter()
             .filter_map(|kv| kv.ok())
-            .filter_map(|(_, v)| bincode::deserialize::<OrderflowRow>(&v).ok())
+            .filter_map(|(_, v)| decode_row(&v))
             .filter(|r| status.is_none_or(|w| r.status == w))
             .filter(|r| side.is_none_or(|w| r.side == w))
             .count()

@@ -48,6 +48,15 @@ const RESOLVE_DELAY: Duration = Duration::from_secs(15);
 const MAX_ROWS: usize = 200_000;
 
 /// One copy trade, from entry through exit.
+///
+/// NOTE: stored with bincode, which is positional and NOT self-describing.
+/// `skip_serializing_if` must never appear on these fields — omitting one on
+/// write shifts every byte after it, and the row becomes undecodable. The
+/// symptom is silent: `count()` still sees the key while `page()` and
+/// `summary()` drop the row, so the dashboard reports N trades above an empty
+/// table. For the same reason, ADDING a field invalidates every existing row
+/// (`#[serde(default)]` cannot help — bincode has no way to know a field is
+/// absent), so any new field needs a legacy fallback like `orderflow.rs` has.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CopyTrade {
     pub ts_ms: u64,
@@ -69,31 +78,31 @@ pub struct CopyTrade {
     pub loc: u8,
 
     // ---- exit, filled in when the position closes ----
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub sell_sig: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub sell_price_sol: Option<f64>,
     /// `tp` | `sl` | `max_hold` | `manual`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub exit_reason: Option<String>,
     /// Realised SOL delta on the round trip, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub pnl_sol: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub closed_ts_ms: Option<u64>,
 
     // ---- front-run analysis ----
     /// `after` | `same_slot` | `before` | `unresolved` | `pending`.
     #[serde(default = "verdict_pending")]
     pub verdict: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub trader_slot: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub our_slot: Option<u64>,
     /// Position within the block, when we had to look. Lower = earlier.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub trader_block_index: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub our_block_index: Option<u32>,
 }
 
@@ -212,8 +221,18 @@ impl CopyTradeStore {
         out
     }
 
+    /// Rows that actually DECODE — not raw key count.
+    ///
+    /// Counting keys is what let the summary claim "2 trades" over an empty
+    /// table. The store is small, so the scan is cheap and the two numbers
+    /// can never disagree again.
     pub fn count(&self) -> usize {
-        self.inner.db.iter().count()
+        self.inner
+            .db
+            .iter()
+            .filter_map(|kv| kv.ok())
+            .filter(|(_, v)| bincode::deserialize::<CopyTrade>(v).is_ok())
+            .count()
     }
 
     /// Aggregate stats over the whole DB — the numbers that decide whether
