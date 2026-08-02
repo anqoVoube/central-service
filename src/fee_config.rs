@@ -61,7 +61,17 @@ pub struct CopyTrading {
     /// `max_open_positions × buy_size_sol` no matter how active the trader is.
     #[serde(default = "default_copy_max_open")]
     pub max_open_positions: u32,
+    /// Buy slippage, basis points. Entry lands behind the trader into a pool
+    /// they just moved, so it must cover their impact as well as ours.
+    #[serde(default = "default_copy_buy_slippage_bps")]
+    pub buy_slippage_bps: u32,
+    /// Sell slippage, basis points. Exits favour getting out.
+    #[serde(default = "default_copy_sell_slippage_bps")]
+    pub sell_slippage_bps: u32,
 }
+
+pub fn default_copy_buy_slippage_bps() -> u32 { 1_500 }
+pub fn default_copy_sell_slippage_bps() -> u32 { 5_000 }
 
 pub fn default_copy_trader() -> String {
     "hnu5iBK8UoHb51UFsH1RYTUAYdrhjHvV5YMTf9T1CYN".to_owned()
@@ -81,6 +91,8 @@ impl Default for CopyTrading {
             sl_pct: default_copy_sl_pct(),
             max_hold_secs: default_copy_max_hold_secs(),
             max_open_positions: default_copy_max_open(),
+            buy_slippage_bps: default_copy_buy_slippage_bps(),
+            sell_slippage_bps: default_copy_sell_slippage_bps(),
         }
     }
 }

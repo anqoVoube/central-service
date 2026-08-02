@@ -117,19 +117,19 @@ pub struct BlockDetail {
     pub opp_sig: String,
     pub pool: String,
     pub slot: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub block_height: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub block_time_ms: Option<i64>,
     /// Slot of the next produced block walked (typically `slot + 1`, but
     /// can be `slot + 2` if slot+1 was skipped by its leader). `None` if
     /// the follow-up fetch failed (skipped slot beyond our scan window,
     /// RPC error, etc.).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_slot: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_block_height: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub next_block_time_ms: Option<i64>,
     pub attempts: Vec<BuyAttempt>,
 }
