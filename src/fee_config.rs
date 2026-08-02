@@ -24,6 +24,12 @@ pub struct FeeBucket {
 
 /// Config for the SECONDARY copy-trading bot.
 ///
+/// There is no on/off field here. The switch is the `COPY_TRADING_HOST` env
+/// var on the one box that runs it — a shared-config toggle defaulted to
+/// `false` on every config file written before this feature existed, so a
+/// correctly-provisioned host would sit idle until someone saved the page.
+/// These fields are parameters only.
+///
 /// Separate from everything above: that config drives the dump-reversion bot,
 /// this drives a wallet (`SECOND_LOGIC_WALLET`) that mirrors one trader's buys
 /// and then exits on ITS OWN thresholds — the trader's sells are deliberately
@@ -35,9 +41,6 @@ pub struct FeeBucket {
 /// is filed as evidence.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CopyTrading {
-    /// Master switch. `false` = detect and record nothing, fire nothing.
-    #[serde(default)]
-    pub enabled: bool,
     /// Wallet whose buys we mirror.
     #[serde(default = "default_copy_trader")]
     pub trader_wallet: String,
@@ -72,7 +75,6 @@ pub fn default_copy_max_open() -> u32 { 10 }
 impl Default for CopyTrading {
     fn default() -> Self {
         Self {
-            enabled: false,
             trader_wallet: default_copy_trader(),
             buy_size_sol: default_copy_buy_size_sol(),
             tp_pct: default_copy_tp_pct(),
