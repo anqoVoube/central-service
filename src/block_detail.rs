@@ -711,4 +711,3 @@ fn parse_system_transfer(data: &[u8]) -> Option<u64> {
     }
     Some(u64::from_le_bytes(data[4..12].try_into().ok()?))
 }
-

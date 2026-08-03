@@ -111,15 +111,12 @@ async fn main() -> anyhow::Result<()> {
         cfg.rpc_url.clone(),
     )?;
 
-    // Secondary copy-trading bot's trade log. The front-run verdict is
-    // resolved here (not in the bot) because it needs post-block RPC lookups
-    // that must never touch a bot's hot path. Same-slot tie-breaks use the
-    // heavier block-detail RPC.
-    let copy_trades = central_service::copytrades::CopyTradeStore::open(
-        &cfg.copy_trades_db_path,
-        cfg.rpc_url.clone(),
-        cfg.block_detail_rpc_url.clone(),
-    )?;
+    // Secondary copy-trading bot's trade log. Pure storage: the front-run
+    // verdict is computed BY THE BOT from its geyser stream (which carries
+    // slot and intra-block index on every transaction) and pushed here, so
+    // central makes no RPC calls for it at all.
+    let copy_trades =
+        central_service::copytrades::CopyTradeStore::open(&cfg.copy_trades_db_path)?;
 
     let tip_priority =
         central_service::tip_priority::TipPriorityStore::open(

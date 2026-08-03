@@ -291,6 +291,13 @@ enum ClientMsg {
         pool: String,
         mint: String,
         trader_sig: String,
+        /// Trader's wallet and the `amount_in` from their buy instruction —
+        /// together these identify their LANDED buy in a block scan, which a
+        /// signature cannot because they fan out across senders.
+        #[serde(default)]
+        trader_wallet: String,
+        #[serde(default)]
+        trader_amount_in: u64,
         buy_sig: String,
         buy_size_lamports: u64,
         #[serde(default)]
@@ -299,6 +306,20 @@ enum ClientMsg {
         loc: u8,
         #[serde(default)]
         ts_ms: u64,
+    },
+    /// Front-run verdict, computed by the bot from geyser slot + intra-block
+    /// index. Central stores it; it no longer derives it.
+    CopyTradeVerdict {
+        buy_sig: String,
+        verdict: String,
+        #[serde(default)]
+        our_slot: Option<u64>,
+        #[serde(default)]
+        our_index: Option<u64>,
+        #[serde(default)]
+        trader_slot: Option<u64>,
+        #[serde(default)]
+        trader_index: Option<u64>,
     },
     /// The copy bot exited a position. Patches the existing row.
     CopyTradeClosed {
@@ -1669,8 +1690,8 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         );
                     }
                     Ok(ClientMsg::CopyTradeOpened {
-                        pool, mint, trader_sig, buy_sig, buy_size_lamports,
-                        buy_price_sol, loc, ts_ms,
+                        pool, mint, trader_sig, trader_wallet, trader_amount_in,
+                        buy_sig, buy_size_lamports, buy_price_sol, loc, ts_ms,
                     }) => {
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.copy_trades.record_buy(crate::copytrades::CopyTrade {
@@ -1678,6 +1699,8 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             pool,
                             mint,
                             trader_sig,
+                            trader_wallet,
+                            trader_amount_in,
                             buy_sig,
                             buy_size_lamports,
                             buy_price_sol,
@@ -1693,6 +1716,13 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             trader_block_index: None,
                             our_block_index: None,
                         });
+                    }
+                    Ok(ClientMsg::CopyTradeVerdict {
+                        buy_sig, verdict, our_slot, our_index, trader_slot, trader_index,
+                    }) => {
+                        state.copy_trades.apply_verdict(
+                            &buy_sig, verdict, our_slot, our_index, trader_slot, trader_index,
+                        );
                     }
                     Ok(ClientMsg::CopyTradeClosed {
                         buy_sig, sell_sig, sell_price_sol, exit_reason, pnl_sol, ts_ms,

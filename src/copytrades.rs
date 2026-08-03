@@ -8,16 +8,22 @@
 //! while under test.
 //!
 //! So the headline field here is not PnL, it's `verdict`:
-//!   * `after`      — the trader landed first; we backran them. Correct.
-//!   * `same_slot`  — same block; decided by intra-block order.
-//!   * `before`     — WE landed first. We front-ran them. This is the bug.
-//!   * `unresolved` — one of the two txs never landed, or RPC failed.
+//!   * `after`        — the trader landed first; we are behind them.
+//!   * `before`       — WE landed first. We front-ran them.
+//!   * `no_trader_tx` — we landed, they never did (every fan-out attempt of
+//!                      theirs failed). A real outcome, not a failure to
+//!                      measure.
+//!   * `unresolved`   — we could not even locate our OWN buy. Measurement
+//!                      failure, worth distinguishing from the above.
+//!   * `pending`      — resolution has not run yet.
 //!
-//! Resolution is lazy and cheap in the common case: `getTransaction` on both
-//! signatures gives two slots, which usually settles it. Only when the slots
-//! are EQUAL do we pay for a `getBlock` to compare positions within the block
-//! — and that call goes to the dedicated block-detail RPC, since it is by far
-//! the heaviest thing we do.
+//! Same-slot is NOT a verdict: the block scan yields intra-block order for
+//! both transactions, so it always resolves to before or after.
+//!
+//! The verdict is computed BY THE BOT from its geyser stream, which carries
+//! slot and intra-block index on every transaction, and pushed here as
+//! `copy_trade_verdict`. Central used to fetch three full blocks per trade to
+//! derive the same ordering; it now stores what it is told.
 //!
 //! Keyed `ts_ms:buy_sig` so a reverse range scan is newest-first, matching
 //! `orderflow.rs`.
@@ -26,22 +32,10 @@ use std::{
     collections::HashSet,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use solana_client::{
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcBlockConfig, RpcTransactionConfig},
-};
-use solana_sdk::commitment_config::CommitmentConfig;
-use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
-
-/// Wait before resolving. Both txs must have had time to confirm; the copy
-/// buy is dispatched pre-block so it settles at roughly the same time as the
-/// trader's.
-const RESOLVE_DELAY: Duration = Duration::from_secs(15);
 
 /// Cap on stored trades. Generous — this is a low-rate bot and the history is
 /// the point of it.
@@ -64,8 +58,18 @@ pub struct CopyTrade {
     pub pool: String,
     /// Token mint bought.
     pub mint: String,
-    /// The trader's transaction we reacted to.
+    /// The trader's transaction we reacted to (the first of their fan-out we
+    /// happened to see — usually NOT the one that landed).
     pub trader_sig: String,
+    /// The trader's wallet.
+    #[serde(default)]
+    pub trader_wallet: String,
+    /// `amount_in` from their PumpFun buy instruction. This, with the pool, is
+    /// what identifies their LANDED buy: they fan one buy across several
+    /// senders and the instruction data is byte-identical across all of them,
+    /// so the amount matches whichever won while the signature does not.
+    #[serde(default)]
+    pub trader_amount_in: u64,
     /// Our copy BUY signature.
     pub buy_sig: String,
     /// Lamports of WSOL committed on the buy.
@@ -121,14 +125,10 @@ struct Inner {
     /// than a scan of the whole tree.
     by_buy_sig: sled::Tree,
     in_flight: Mutex<HashSet<String>>,
-    /// Light RPC (slots). Same endpoint as the rest of central.
-    rpc_url: String,
-    /// Heavy RPC (`getBlock`) — only used for same-slot tie-breaks.
-    block_rpc_url: String,
 }
 
 impl CopyTradeStore {
-    pub fn open(db_path: &Path, rpc_url: String, block_rpc_url: String) -> anyhow::Result<Self> {
+    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
         let db = sled::open(db_path).context("open sled copytrades db")?;
         let tree = db.open_tree("copytrades").context("open copytrades tree")?;
         let by_buy_sig = db
@@ -141,8 +141,6 @@ impl CopyTradeStore {
                 db: tree,
                 by_buy_sig,
                 in_flight: Mutex::new(HashSet::new()),
-                rpc_url,
-                block_rpc_url,
             }),
         })
     }
@@ -163,22 +161,44 @@ impl CopyTradeStore {
             .insert(trade.buy_sig.as_bytes(), key.as_bytes());
         let _ = self.inner.by_buy_sig.flush();
 
-        // Resolve the verdict once, in the background.
-        {
-            let mut g = self.inner.in_flight.lock().unwrap();
-            if !g.insert(trade.buy_sig.clone()) {
-                return;
-            }
+    }
+
+
+    /// Store a verdict computed by the bot from its geyser stream.
+    ///
+    /// Central no longer resolves this itself. The ordering that decides it —
+    /// (slot, intra-block index) — arrives free on every geyser transaction
+    /// the bot already receives, so fetching three full blocks per trade was
+    /// buying data we were being handed.
+    pub fn apply_verdict(
+        &self,
+        buy_sig: &str,
+        verdict: String,
+        our_slot: Option<u64>,
+        our_index: Option<u64>,
+        trader_slot: Option<u64>,
+        trader_index: Option<u64>,
+    ) {
+        let Some(key) = self.key_for(buy_sig) else {
+            tracing::debug!("[copytrades] verdict for unknown buy_sig={buy_sig}");
+            return;
+        };
+        let Some(mut t) = self.get(&key) else { return };
+        if verdict == "before" {
+            println!(
+                "[copytrades] FRONT-RUN buy={buy_sig} pool={} ours=({our_slot:?},{our_index:?}) \
+                 theirs=({trader_slot:?},{trader_index:?})",
+                t.pool
+            );
         }
-        let inner = Arc::clone(&self.inner);
-        let store = self.clone();
-        tokio::spawn(async move {
-            let sig = trade.buy_sig.clone();
-            if let Err(e) = store.resolve_verdict(&key).await {
-                tracing::debug!("[copytrades] verdict resolve failed sig={sig}: {e:#}");
-            }
-            inner.in_flight.lock().unwrap().remove(&sig);
-        });
+        t.verdict = verdict;
+        t.our_slot = our_slot;
+        t.trader_slot = trader_slot;
+        t.our_block_index = our_index.map(|v| v as u32);
+        t.trader_block_index = trader_index.map(|v| v as u32);
+        if let Err(e) = self.put(&key, &t) {
+            tracing::warn!("[copytrades] store verdict failed: {e:#}");
+        }
     }
 
     /// Position closed — patch the existing row rather than adding a new one.
@@ -238,15 +258,18 @@ impl CopyTradeStore {
     /// Aggregate stats over the whole DB — the numbers that decide whether
     /// this bot is safe to report to Temporal.
     pub fn summary(&self) -> serde_json::Value {
-        let (mut before, mut same, mut after, mut unresolved) = (0u64, 0u64, 0u64, 0u64);
+        let (mut before, mut after, mut unresolved) = (0u64, 0u64, 0u64);
+        // Their buy never landed at all — a real outcome, not a measurement
+        // failure, so it is counted separately from `unresolved`.
+        let mut no_trader = 0u64;
         let (mut closed, mut wins, mut pnl) = (0u64, 0u64, 0f64);
         for kv in self.inner.db.iter() {
             let Ok((_, v)) = kv else { continue };
             let Ok(t) = bincode::deserialize::<CopyTrade>(&v) else { continue };
             match t.verdict.as_str() {
                 "before" => before += 1,
-                "same_slot" => same += 1,
                 "after" => after += 1,
+                "no_trader_tx" => no_trader += 1,
                 _ => unresolved += 1,
             }
             if let Some(p) = t.pnl_sol {
@@ -257,13 +280,16 @@ impl CopyTradeStore {
                 }
             }
         }
-        let judged = before + same + after;
+        // A same-slot landing is no longer its own verdict: intra-block order
+        // comes straight from the block scan, so it always resolves to
+        // before or after.
+        let judged = before + after;
         serde_json::json!({
             "total": self.count(),
             "front_run": before,
-            "same_slot": same,
             "backrun": after,
             "unresolved": unresolved,
+            "no_trader_tx": no_trader,
             // The number that gates reporting this bot to Temporal.
             "front_run_pct": if judged > 0 { before as f64 * 100.0 / judged as f64 } else { 0.0 },
             "closed": closed,
@@ -324,78 +350,5 @@ impl CopyTradeStore {
             }
             let _ = self.inner.db.remove(&k);
         }
-    }
-
-    /// Decide whether we backran or front-ran the trader.
-    async fn resolve_verdict(&self, key: &str) -> anyhow::Result<()> {
-        tokio::time::sleep(RESOLVE_DELAY).await;
-        let Some(mut t) = self.get(key) else { return Ok(()) };
-
-        let rpc =
-            RpcClient::new_with_commitment(self.inner.rpc_url.clone(), CommitmentConfig::confirmed());
-        let cfg = RpcTransactionConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
-        };
-        let slot_of = |sig: &str| {
-            let sig = sig.to_owned();
-            let rpc = &rpc;
-            async move {
-                let parsed: solana_sdk::signature::Signature = sig.parse().ok()?;
-                rpc.get_transaction_with_config(&parsed, cfg).await.ok().map(|r| r.slot)
-            }
-        };
-
-        t.trader_slot = slot_of(&t.trader_sig).await;
-        t.our_slot = slot_of(&t.buy_sig).await;
-
-        t.verdict = match (t.trader_slot, t.our_slot) {
-            // One of them never landed — nothing to compare.
-            (None, _) | (_, None) => "unresolved".to_owned(),
-            (Some(their), Some(ours)) if ours > their => "after".to_owned(),
-            (Some(their), Some(ours)) if ours < their => "before".to_owned(),
-            // Same slot: order inside the block decides it. Only here do we
-            // pay for a getBlock, and it goes to the heavy-RPC endpoint.
-            (Some(slot), Some(_)) => {
-                match self.block_order(slot, &t.trader_sig, &t.buy_sig).await {
-                    Some((their_idx, our_idx)) => {
-                        t.trader_block_index = Some(their_idx);
-                        t.our_block_index = Some(our_idx);
-                        if our_idx > their_idx { "after".to_owned() } else { "before".to_owned() }
-                    }
-                    None => "same_slot".to_owned(),
-                }
-            }
-        };
-        self.put(key, &t)?;
-        if t.verdict == "before" {
-            // Loud: this is the failure mode the whole test phase exists for.
-            println!(
-                "[copytrades] FRONT-RUN buy={} trader={} our_slot={:?} trader_slot={:?}",
-                t.buy_sig, t.trader_sig, t.our_slot, t.trader_slot
-            );
-        }
-        Ok(())
-    }
-
-    /// Positions of two signatures within one block, if both are present.
-    async fn block_order(&self, slot: u64, a: &str, b: &str) -> Option<(u32, u32)> {
-        let rpc = RpcClient::new_with_commitment(
-            self.inner.block_rpc_url.clone(),
-            CommitmentConfig::confirmed(),
-        );
-        let cfg = RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            transaction_details: Some(TransactionDetails::Signatures),
-            rewards: Some(false),
-            commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
-        };
-        let block = rpc.get_block_with_config(slot, cfg).await.ok()?;
-        let sigs = block.signatures?;
-        let ia = sigs.iter().position(|s| s == a)? as u32;
-        let ib = sigs.iter().position(|s| s == b)? as u32;
-        Some((ia, ib))
     }
 }

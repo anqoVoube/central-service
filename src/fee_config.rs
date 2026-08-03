@@ -72,9 +72,15 @@ pub struct CopyTrading {
     /// Normally our tip is theirs plus a random 10-15%.
     #[serde(default = "default_copy_fallback_tip_sol")]
     pub fallback_tip_sol: f64,
+    /// Hard ceiling on the buy tip, in SOL. Our tip tracks the trader's, and
+    /// theirs is whatever they chose, so without a cap one aggressive entry
+    /// of theirs could spend an unbounded amount on a single trade.
+    #[serde(default = "default_copy_max_tip_sol")]
+    pub max_tip_sol: f64,
 }
 
 pub fn default_copy_fallback_tip_sol() -> f64 { 0.01 }
+pub fn default_copy_max_tip_sol() -> f64 { 0.05 }
 
 pub fn default_copy_buy_slippage_bps() -> u32 { 1_500 }
 pub fn default_copy_sell_slippage_bps() -> u32 { 5_000 }
@@ -100,6 +106,7 @@ impl Default for CopyTrading {
             buy_slippage_bps: default_copy_buy_slippage_bps(),
             sell_slippage_bps: default_copy_sell_slippage_bps(),
             fallback_tip_sol: default_copy_fallback_tip_sol(),
+            max_tip_sol: default_copy_max_tip_sol(),
         }
     }
 }
