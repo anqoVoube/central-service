@@ -298,6 +298,10 @@ enum ClientMsg {
         trader_wallet: String,
         #[serde(default)]
         trader_amount_in: u64,
+        #[serde(default)]
+        trader_tip_lamports: u64,
+        #[serde(default)]
+        trader_slippage_bps: u32,
         buy_sig: String,
         buy_size_lamports: u64,
         #[serde(default)]
@@ -312,6 +316,8 @@ enum ClientMsg {
     CopyTradeVerdict {
         buy_sig: String,
         verdict: String,
+        #[serde(default)]
+        trader_landed_sig: Option<String>,
         #[serde(default)]
         our_slot: Option<u64>,
         #[serde(default)]
@@ -1691,7 +1697,8 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     }
                     Ok(ClientMsg::CopyTradeOpened {
                         pool, mint, trader_sig, trader_wallet, trader_amount_in,
-                        buy_sig, buy_size_lamports, buy_price_sol, loc, ts_ms,
+                        trader_tip_lamports, trader_slippage_bps, buy_sig,
+                        buy_size_lamports, buy_price_sol, loc, ts_ms,
                     }) => {
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.copy_trades.record_buy(crate::copytrades::CopyTrade {
@@ -1701,6 +1708,9 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             trader_sig,
                             trader_wallet,
                             trader_amount_in,
+                            trader_tip_lamports,
+                            trader_slippage_bps,
+                            trader_landed_sig: None,
                             buy_sig,
                             buy_size_lamports,
                             buy_price_sol,
@@ -1718,10 +1728,12 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         });
                     }
                     Ok(ClientMsg::CopyTradeVerdict {
-                        buy_sig, verdict, our_slot, our_index, trader_slot, trader_index,
+                        buy_sig, verdict, trader_landed_sig, our_slot, our_index,
+                        trader_slot, trader_index,
                     }) => {
                         state.copy_trades.apply_verdict(
-                            &buy_sig, verdict, our_slot, our_index, trader_slot, trader_index,
+                            &buy_sig, verdict, trader_landed_sig, our_slot, our_index,
+                            trader_slot, trader_index,
                         );
                     }
                     Ok(ClientMsg::CopyTradeClosed {

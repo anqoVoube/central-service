@@ -10,9 +10,11 @@
 //! So the headline field here is not PnL, it's `verdict`:
 //!   * `after`        — the trader landed first; we are behind them.
 //!   * `before`       — WE landed first. We front-ran them.
-//!   * `no_trader_tx` — we landed, they never did (every fan-out attempt of
-//!                      theirs failed). A real outcome, not a failure to
-//!                      measure.
+//!   * `trader_failed` — we landed, their transaction REVERTED on chain.
+//!                       Invisible to the observation ring (geyser filters
+//!                       failed txs), so it is resolved by a status lookup
+//!                       over their fan-out.
+//!   * `no_trader_tx` — we landed, they never landed at all.
 //!   * `unresolved`   — we could not even locate our OWN buy. Measurement
 //!                      failure, worth distinguishing from the above.
 //!   * `pending`      — resolution has not run yet.
@@ -108,6 +110,22 @@ pub struct CopyTrade {
     pub trader_block_index: Option<u32>,
     #[serde(default)]
     pub our_block_index: Option<u32>,
+
+    // ---- the trader's side, for display ----
+    /// The trader signature that ACTUALLY landed, resolved by the verdict
+    /// matcher. `trader_sig` above is merely the first of their fan-out we
+    /// saw, which usually never landed — a link built from it is dead.
+    #[serde(default)]
+    pub trader_landed_sig: Option<String>,
+    /// Lamports the trader tipped on this buy.
+    #[serde(default)]
+    pub trader_tip_lamports: u64,
+    /// The trader's own implied slippage tolerance in bps, derived from their
+    /// instruction against the reserves at detection. Recorded for comparison
+    /// against ours — theirs is priced before their buy moves the pool, so it
+    /// is a floor on what we need, not a value to copy.
+    #[serde(default)]
+    pub trader_slippage_bps: u32,
 }
 
 fn verdict_pending() -> String {
@@ -170,10 +188,12 @@ impl CopyTradeStore {
     /// (slot, intra-block index) — arrives free on every geyser transaction
     /// the bot already receives, so fetching three full blocks per trade was
     /// buying data we were being handed.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_verdict(
         &self,
         buy_sig: &str,
         verdict: String,
+        trader_landed_sig: Option<String>,
         our_slot: Option<u64>,
         our_index: Option<u64>,
         trader_slot: Option<u64>,
@@ -192,6 +212,9 @@ impl CopyTradeStore {
             );
         }
         t.verdict = verdict;
+        if trader_landed_sig.is_some() {
+            t.trader_landed_sig = trader_landed_sig;
+        }
         t.our_slot = our_slot;
         t.trader_slot = trader_slot;
         t.our_block_index = our_index.map(|v| v as u32);
@@ -262,6 +285,10 @@ impl CopyTradeStore {
         // Their buy never landed at all — a real outcome, not a measurement
         // failure, so it is counted separately from `unresolved`.
         let mut no_trader = 0u64;
+        // WE landed, THEY reverted. Distinct from "never landed": once an
+        // anti-front-run contract is live, a revert of theirs may be the guard
+        // firing rather than an ordinary failure.
+        let mut trader_failed = 0u64;
         let (mut closed, mut wins, mut pnl) = (0u64, 0u64, 0f64);
         for kv in self.inner.db.iter() {
             let Ok((_, v)) = kv else { continue };
@@ -270,6 +297,7 @@ impl CopyTradeStore {
                 "before" => before += 1,
                 "after" => after += 1,
                 "no_trader_tx" => no_trader += 1,
+                "trader_failed" => trader_failed += 1,
                 _ => unresolved += 1,
             }
             if let Some(p) = t.pnl_sol {
@@ -290,6 +318,7 @@ impl CopyTradeStore {
             "backrun": after,
             "unresolved": unresolved,
             "no_trader_tx": no_trader,
+            "trader_failed": trader_failed,
             // The number that gates reporting this bot to Temporal.
             "front_run_pct": if judged > 0 { before as f64 * 100.0 / judged as f64 } else { 0.0 },
             "closed": closed,
