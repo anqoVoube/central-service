@@ -77,10 +77,20 @@ pub struct CopyTrading {
     /// of theirs could spend an unbounded amount on a single trade.
     #[serde(default = "default_copy_max_tip_sol")]
     pub max_tip_sol: f64,
+    /// Ceiling on the priority fee, microlamports per compute unit.
+    ///
+    /// Our CU price is the trader's DOUBLED, and theirs is whatever they
+    /// chose, so this is the bound. At 150k CU the default works out to
+    /// ~0.0015 SOL of priority fee per transaction.
+    #[serde(default = "default_copy_max_cu_price")]
+    pub max_cu_price_micro_lamports: u64,
 }
 
+pub fn default_copy_max_cu_price() -> u64 { 10_000_000 }
+
 pub fn default_copy_fallback_tip_sol() -> f64 { 0.01 }
-pub fn default_copy_max_tip_sol() -> f64 { 0.05 }
+/// $1 at $73/SOL.
+pub fn default_copy_max_tip_sol() -> f64 { 0.0137 }
 
 pub fn default_copy_buy_slippage_bps() -> u32 { 1_500 }
 pub fn default_copy_sell_slippage_bps() -> u32 { 5_000 }
@@ -88,10 +98,12 @@ pub fn default_copy_sell_slippage_bps() -> u32 { 5_000 }
 pub fn default_copy_trader() -> String {
     "hnu5iBK8UoHb51UFsH1RYTUAYdrhjHvV5YMTf9T1CYN".to_owned()
 }
-pub fn default_copy_buy_size_sol() -> f64 { 0.2 }
+/// $20 at $73/SOL. CEILING on a copy buy, not the size.
+pub fn default_copy_buy_size_sol() -> f64 { 0.274 }
 pub fn default_copy_tp_pct() -> f64 { 2.0 }
 pub fn default_copy_sl_pct() -> f64 { 20.0 }
-pub fn default_copy_max_hold_secs() -> u64 { 300 }
+/// SOLO exit timer — only when the trader's buy did not land.
+pub fn default_copy_max_hold_secs() -> u64 { 5 }
 pub fn default_copy_max_open() -> u32 { 10 }
 
 impl Default for CopyTrading {
@@ -107,6 +119,7 @@ impl Default for CopyTrading {
             sell_slippage_bps: default_copy_sell_slippage_bps(),
             fallback_tip_sol: default_copy_fallback_tip_sol(),
             max_tip_sol: default_copy_max_tip_sol(),
+            max_cu_price_micro_lamports: default_copy_max_cu_price(),
         }
     }
 }
