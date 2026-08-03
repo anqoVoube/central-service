@@ -81,12 +81,12 @@ pub struct CopyTrading {
     ///
     /// Our CU price is the trader's DOUBLED, and theirs is whatever they
     /// chose, so this is the bound. At 150k CU the default works out to
-    /// ~0.0015 SOL of priority fee per transaction.
+    /// ~0.0075 SOL of priority fee per transaction (~$0.55 at $73/SOL).
     #[serde(default = "default_copy_max_cu_price")]
     pub max_cu_price_micro_lamports: u64,
 }
 
-pub fn default_copy_max_cu_price() -> u64 { 10_000_000 }
+pub fn default_copy_max_cu_price() -> u64 { 50_000_000 }
 
 pub fn default_copy_fallback_tip_sol() -> f64 { 0.01 }
 /// $1 at $73/SOL.
