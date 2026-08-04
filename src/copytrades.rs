@@ -146,6 +146,12 @@ pub struct CopyTrade {
     pub sell_trader_slot: Option<u64>,
     #[serde(default)]
     pub sell_trader_index: Option<u64>,
+
+    /// Microseconds from the bot decoding the trader's transaction to ours
+    /// going on the wire. Our reaction time — the only part of the race we
+    /// control, as distinct from network and leader scheduling.
+    #[serde(default)]
+    pub build_us: u64,
 }
 
 fn verdict_pending() -> String {
@@ -186,10 +192,65 @@ struct LegacyCopyTrade {
     trader_slippage_bps: u32,
 }
 
-/// Decode a stored row, falling back to the pre-exit-race layout.
+/// The layout before `build_us`. bincode is positional, so each added field
+/// needs its own predecessor here or the rows written before it stop decoding.
+#[derive(Deserialize)]
+struct CopyTradeV2 {
+    ts_ms: u64,
+    pool: String,
+    mint: String,
+    trader_sig: String,
+    trader_wallet: String,
+    trader_amount_in: u64,
+    buy_sig: String,
+    buy_size_lamports: u64,
+    buy_price_sol: f64,
+    loc: u8,
+    sell_sig: Option<String>,
+    sell_price_sol: Option<f64>,
+    exit_reason: Option<String>,
+    pnl_sol: Option<f64>,
+    closed_ts_ms: Option<u64>,
+    verdict: String,
+    trader_slot: Option<u64>,
+    our_slot: Option<u64>,
+    trader_block_index: Option<u32>,
+    our_block_index: Option<u32>,
+    trader_landed_sig: Option<String>,
+    trader_tip_lamports: u64,
+    trader_slippage_bps: u32,
+    sell_verdict: String,
+    sell_trader_sig: Option<String>,
+    sell_our_slot: Option<u64>,
+    sell_our_index: Option<u64>,
+    sell_trader_slot: Option<u64>,
+    sell_trader_index: Option<u64>,
+}
+
+/// Decode a stored row, falling back through each earlier layout.
 fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
     if let Ok(t) = bincode::deserialize::<CopyTrade>(v) {
         return Some(t);
+    }
+    if let Ok(l) = bincode::deserialize::<CopyTradeV2>(v) {
+        return Some(CopyTrade {
+            ts_ms: l.ts_ms, pool: l.pool, mint: l.mint, trader_sig: l.trader_sig,
+            trader_wallet: l.trader_wallet, trader_amount_in: l.trader_amount_in,
+            buy_sig: l.buy_sig, buy_size_lamports: l.buy_size_lamports,
+            buy_price_sol: l.buy_price_sol, loc: l.loc, sell_sig: l.sell_sig,
+            sell_price_sol: l.sell_price_sol, exit_reason: l.exit_reason,
+            pnl_sol: l.pnl_sol, closed_ts_ms: l.closed_ts_ms, verdict: l.verdict,
+            trader_slot: l.trader_slot, our_slot: l.our_slot,
+            trader_block_index: l.trader_block_index, our_block_index: l.our_block_index,
+            trader_landed_sig: l.trader_landed_sig,
+            trader_tip_lamports: l.trader_tip_lamports,
+            trader_slippage_bps: l.trader_slippage_bps,
+            sell_verdict: l.sell_verdict, sell_trader_sig: l.sell_trader_sig,
+            sell_our_slot: l.sell_our_slot, sell_our_index: l.sell_our_index,
+            sell_trader_slot: l.sell_trader_slot, sell_trader_index: l.sell_trader_index,
+            // Not measured before this existed.
+            build_us: 0,
+        });
     }
     bincode::deserialize::<LegacyCopyTrade>(v).ok().map(|l| CopyTrade {
         ts_ms: l.ts_ms,
@@ -222,6 +283,7 @@ fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
         sell_our_index: None,
         sell_trader_slot: None,
         sell_trader_index: None,
+        build_us: 0,
     })
 }
 
