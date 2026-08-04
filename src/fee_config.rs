@@ -84,9 +84,34 @@ pub struct CopyTrading {
     /// ~0.0075 SOL of priority fee per transaction (~$0.55 at $73/SOL).
     #[serde(default = "default_copy_max_cu_price")]
     pub max_cu_price_micro_lamports: u64,
+
+    // ---- how our bid is derived from theirs ----
+    /// `true` = bid ABOVE their tip, `false` = below.
+    #[serde(default = "default_copy_tip_more")]
+    pub tip_more: bool,
+    #[serde(default = "default_copy_pct_min")]
+    pub tip_min_pct: f64,
+    #[serde(default = "default_copy_pct_max")]
+    pub tip_max_pct: f64,
+    /// `true` = bid ABOVE their CU price, `false` = below.
+    #[serde(default = "default_copy_fee_more")]
+    pub fee_more: bool,
+    #[serde(default = "default_copy_pct_min")]
+    pub fee_min_pct: f64,
+    #[serde(default = "default_copy_pct_max")]
+    pub fee_max_pct: f64,
+    /// Our size as a percentage OF THEIRS — a slice, so no direction.
+    #[serde(default = "default_copy_pct_min")]
+    pub size_min_pct: f64,
+    #[serde(default = "default_copy_pct_max")]
+    pub size_max_pct: f64,
 }
 
 pub fn default_copy_max_cu_price() -> u64 { 50_000_000 }
+pub fn default_copy_tip_more() -> bool { true }
+pub fn default_copy_fee_more() -> bool { true }
+pub fn default_copy_pct_min() -> f64 { 10.0 }
+pub fn default_copy_pct_max() -> f64 { 15.0 }
 
 pub fn default_copy_fallback_tip_sol() -> f64 { 0.001 }
 /// $1 at $73/SOL.
@@ -120,6 +145,14 @@ impl Default for CopyTrading {
             fallback_tip_sol: default_copy_fallback_tip_sol(),
             max_tip_sol: default_copy_max_tip_sol(),
             max_cu_price_micro_lamports: default_copy_max_cu_price(),
+            tip_more: default_copy_tip_more(),
+            tip_min_pct: default_copy_pct_min(),
+            tip_max_pct: default_copy_pct_max(),
+            fee_more: default_copy_fee_more(),
+            fee_min_pct: default_copy_pct_min(),
+            fee_max_pct: default_copy_pct_max(),
+            size_min_pct: default_copy_pct_min(),
+            size_max_pct: default_copy_pct_max(),
         }
     }
 }
