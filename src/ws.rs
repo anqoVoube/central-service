@@ -327,6 +327,22 @@ enum ClientMsg {
         #[serde(default)]
         trader_index: Option<u64>,
     },
+    /// Exit-race verdict: did our mirror sell land ahead of the trader's?
+    /// Only sent for mirror exits — a timed solo exit has no counterparty.
+    CopySellVerdict {
+        buy_sig: String,
+        sell_verdict: String,
+        #[serde(default)]
+        sell_trader_sig: Option<String>,
+        #[serde(default)]
+        sell_our_slot: Option<u64>,
+        #[serde(default)]
+        sell_our_index: Option<u64>,
+        #[serde(default)]
+        sell_trader_slot: Option<u64>,
+        #[serde(default)]
+        sell_trader_index: Option<u64>,
+    },
     /// The copy bot exited a position. Patches the existing row.
     CopyTradeClosed {
         buy_sig: String,
@@ -1725,6 +1741,14 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             our_slot: None,
                             trader_block_index: None,
                             our_block_index: None,
+                            // Filled in later, and only if this position ends
+                            // up mirroring their exit.
+                            sell_verdict: "n/a".to_owned(),
+                            sell_trader_sig: None,
+                            sell_our_slot: None,
+                            sell_our_index: None,
+                            sell_trader_slot: None,
+                            sell_trader_index: None,
                         });
                     }
                     Ok(ClientMsg::CopyTradeVerdict {
@@ -1734,6 +1758,15 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         state.copy_trades.apply_verdict(
                             &buy_sig, verdict, trader_landed_sig, our_slot, our_index,
                             trader_slot, trader_index,
+                        );
+                    }
+                    Ok(ClientMsg::CopySellVerdict {
+                        buy_sig, sell_verdict, sell_trader_sig, sell_our_slot,
+                        sell_our_index, sell_trader_slot, sell_trader_index,
+                    }) => {
+                        state.copy_trades.apply_sell_verdict(
+                            &buy_sig, sell_verdict, sell_trader_sig, sell_our_slot,
+                            sell_our_index, sell_trader_slot, sell_trader_index,
                         );
                     }
                     Ok(ClientMsg::CopyTradeClosed {

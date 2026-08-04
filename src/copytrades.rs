@@ -126,10 +126,103 @@ pub struct CopyTrade {
     /// is a floor on what we need, not a value to copy.
     #[serde(default)]
     pub trader_slippage_bps: u32,
+
+    // ---- exit race ----
+    /// Did OUR mirror sell land ahead of theirs? `before` | `after` |
+    /// `unresolved` | `n/a`.
+    ///
+    /// Only a mirror exit is a race. A solo exit fires on a timer with the
+    /// trader still holding, so there is no sell of theirs to order against
+    /// and the field stays `n/a`.
+    #[serde(default = "sell_verdict_na")]
+    pub sell_verdict: String,
+    #[serde(default)]
+    pub sell_trader_sig: Option<String>,
+    #[serde(default)]
+    pub sell_our_slot: Option<u64>,
+    #[serde(default)]
+    pub sell_our_index: Option<u64>,
+    #[serde(default)]
+    pub sell_trader_slot: Option<u64>,
+    #[serde(default)]
+    pub sell_trader_index: Option<u64>,
 }
 
 fn verdict_pending() -> String {
     "pending".to_owned()
+}
+
+fn sell_verdict_na() -> String {
+    "n/a".to_owned()
+}
+
+/// The layout before the exit-race fields. bincode is positional, so without
+/// this every trade recorded up to now would decode to nothing — present as a
+/// row count that disagrees with an empty table.
+#[derive(Deserialize)]
+struct LegacyCopyTrade {
+    ts_ms: u64,
+    pool: String,
+    mint: String,
+    trader_sig: String,
+    trader_wallet: String,
+    trader_amount_in: u64,
+    buy_sig: String,
+    buy_size_lamports: u64,
+    buy_price_sol: f64,
+    loc: u8,
+    sell_sig: Option<String>,
+    sell_price_sol: Option<f64>,
+    exit_reason: Option<String>,
+    pnl_sol: Option<f64>,
+    closed_ts_ms: Option<u64>,
+    verdict: String,
+    trader_slot: Option<u64>,
+    our_slot: Option<u64>,
+    trader_block_index: Option<u32>,
+    our_block_index: Option<u32>,
+    trader_landed_sig: Option<String>,
+    trader_tip_lamports: u64,
+    trader_slippage_bps: u32,
+}
+
+/// Decode a stored row, falling back to the pre-exit-race layout.
+fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
+    if let Ok(t) = bincode::deserialize::<CopyTrade>(v) {
+        return Some(t);
+    }
+    bincode::deserialize::<LegacyCopyTrade>(v).ok().map(|l| CopyTrade {
+        ts_ms: l.ts_ms,
+        pool: l.pool,
+        mint: l.mint,
+        trader_sig: l.trader_sig,
+        trader_wallet: l.trader_wallet,
+        trader_amount_in: l.trader_amount_in,
+        buy_sig: l.buy_sig,
+        buy_size_lamports: l.buy_size_lamports,
+        buy_price_sol: l.buy_price_sol,
+        loc: l.loc,
+        sell_sig: l.sell_sig,
+        sell_price_sol: l.sell_price_sol,
+        exit_reason: l.exit_reason,
+        pnl_sol: l.pnl_sol,
+        closed_ts_ms: l.closed_ts_ms,
+        verdict: l.verdict,
+        trader_slot: l.trader_slot,
+        our_slot: l.our_slot,
+        trader_block_index: l.trader_block_index,
+        our_block_index: l.our_block_index,
+        trader_landed_sig: l.trader_landed_sig,
+        trader_tip_lamports: l.trader_tip_lamports,
+        trader_slippage_bps: l.trader_slippage_bps,
+        // Nothing recorded before this existed was measured.
+        sell_verdict: sell_verdict_na(),
+        sell_trader_sig: None,
+        sell_our_slot: None,
+        sell_our_index: None,
+        sell_trader_slot: None,
+        sell_trader_index: None,
+    })
 }
 
 #[derive(Clone)]
@@ -189,6 +282,42 @@ impl CopyTradeStore {
     /// the bot already receives, so fetching three full blocks per trade was
     /// buying data we were being handed.
     #[allow(clippy::too_many_arguments)]
+    /// The exit race resolved: did our mirror sell land ahead of theirs?
+    pub fn apply_sell_verdict(
+        &self,
+        buy_sig: &str,
+        verdict: String,
+        trader_sig: Option<String>,
+        our_slot: Option<u64>,
+        our_index: Option<u64>,
+        trader_slot: Option<u64>,
+        trader_index: Option<u64>,
+    ) {
+        let Some(key) = self.key_for(buy_sig) else {
+            tracing::debug!("[copytrades] sell verdict for unknown buy_sig={buy_sig}");
+            return;
+        };
+        let Some(mut t) = self.get(&key) else { return };
+        if verdict == "before" {
+            println!(
+                "[copytrades] FRONT-RAN THEIR SELL buy={buy_sig} pool={} \
+                 ours=({our_slot:?},{our_index:?}) theirs=({trader_slot:?},{trader_index:?})",
+                t.pool
+            );
+        }
+        t.sell_verdict = verdict;
+        if trader_sig.is_some() {
+            t.sell_trader_sig = trader_sig;
+        }
+        t.sell_our_slot = our_slot;
+        t.sell_our_index = our_index;
+        t.sell_trader_slot = trader_slot;
+        t.sell_trader_index = trader_index;
+        if let Err(e) = self.put(&key, &t) {
+            tracing::warn!("[copytrades] store sell verdict failed: {e:#}");
+        }
+    }
+
     pub fn apply_verdict(
         &self,
         buy_sig: &str,
@@ -254,7 +383,7 @@ impl CopyTradeStore {
         let mut out = Vec::with_capacity(limit.min(1024));
         for kv in self.inner.db.iter().rev().skip(offset) {
             let Ok((_, v)) = kv else { continue };
-            if let Ok(t) = bincode::deserialize::<CopyTrade>(&v) {
+            if let Some(t) = decode_trade(&v) {
                 out.push(t);
             }
             if out.len() >= limit {
@@ -274,7 +403,7 @@ impl CopyTradeStore {
             .db
             .iter()
             .filter_map(|kv| kv.ok())
-            .filter(|(_, v)| bincode::deserialize::<CopyTrade>(v).is_ok())
+            .filter(|(_, v)| decode_trade(v).is_some())
             .count()
     }
 
@@ -290,15 +419,22 @@ impl CopyTradeStore {
         // firing rather than an ordinary failure.
         let mut trader_failed = 0u64;
         let (mut closed, mut wins, mut pnl) = (0u64, 0u64, 0f64);
+        // Exit race, counted only over mirror exits (solo exits are `n/a`).
+        let (mut sell_before, mut sell_after) = (0u64, 0u64);
         for kv in self.inner.db.iter() {
             let Ok((_, v)) = kv else { continue };
-            let Ok(t) = bincode::deserialize::<CopyTrade>(&v) else { continue };
+            let Some(t) = decode_trade(&v) else { continue };
             match t.verdict.as_str() {
                 "before" => before += 1,
                 "after" => after += 1,
                 "no_trader_tx" => no_trader += 1,
                 "trader_failed" => trader_failed += 1,
                 _ => unresolved += 1,
+            }
+            match t.sell_verdict.as_str() {
+                "before" => sell_before += 1,
+                "after" => sell_after += 1,
+                _ => {}
             }
             if let Some(p) = t.pnl_sol {
                 closed += 1;
@@ -325,6 +461,14 @@ impl CopyTradeStore {
             "wins": wins,
             "win_pct": if closed > 0 { wins as f64 * 100.0 / closed as f64 } else { 0.0 },
             "pnl_sol": pnl,
+            // Exit race. `sell_judged` is the denominator that matters —
+            // solo exits are excluded entirely, so a low count here just
+            // means few positions were ever mirrored.
+            "sell_front_run": sell_before,
+            "sell_backrun": sell_after,
+            "sell_front_run_pct": if sell_before + sell_after > 0 {
+                sell_before as f64 * 100.0 / (sell_before + sell_after) as f64
+            } else { 0.0 },
         })
     }
 
@@ -345,7 +489,7 @@ impl CopyTradeStore {
             .get(key.as_bytes())
             .ok()
             .flatten()
-            .and_then(|v| bincode::deserialize(&v).ok())
+            .and_then(|v| decode_trade(&v))
     }
 
     fn put(&self, key: &str, t: &CopyTrade) -> anyhow::Result<()> {
