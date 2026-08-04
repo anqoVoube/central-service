@@ -88,9 +88,9 @@ pub struct CopyTrading {
 
 pub fn default_copy_max_cu_price() -> u64 { 50_000_000 }
 
-pub fn default_copy_fallback_tip_sol() -> f64 { 0.01 }
+pub fn default_copy_fallback_tip_sol() -> f64 { 0.001 }
 /// $1 at $73/SOL.
-pub fn default_copy_max_tip_sol() -> f64 { 0.0137 }
+pub fn default_copy_max_tip_sol() -> f64 { 0.02 }
 
 pub fn default_copy_buy_slippage_bps() -> u32 { 1_500 }
 pub fn default_copy_sell_slippage_bps() -> u32 { 5_000 }
