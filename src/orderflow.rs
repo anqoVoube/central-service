@@ -74,6 +74,26 @@ pub struct OrderflowRow {
     pub status: String,
     /// Which bot location reported it (`LOCATION_INDEX`), for attribution.
     pub loc: u8,
+
+    // ---- what the transaction bid, straight off its instructions ----
+    //
+    // Populated for the watched trader's BUYS only. On dumps these stay 0 and
+    // render as "—": deriving the tip means walking every System transfer,
+    // which is fine for their handful of buys but not for the dump path, which
+    // runs on every orderflow transaction and is latency-critical.
+    /// Lamports transferred to a known tip account.
+    #[serde(default)]
+    pub tip_lamports: u64,
+    /// `SetComputeUnitPrice`, microlamports per compute unit.
+    #[serde(default)]
+    pub cu_price: u64,
+    /// `SetComputeUnitLimit`, compute units.
+    #[serde(default)]
+    pub cu_limit: u32,
+    /// `cu_limit x cu_price / 1e6`. Computed bot-side so the dashboard and the
+    /// copytrading page cannot disagree about the formula.
+    #[serde(default)]
+    pub priority_fee_lamports: u64,
 }
 
 fn default_side() -> String {
@@ -102,10 +122,33 @@ struct LegacyOrderflowRow {
     loc: u8,
 }
 
-/// Decode a stored row, falling back to the pre-`side` layout.
+/// The layout before the per-transaction bid fields.
+#[derive(Deserialize)]
+struct OrderflowRowV2 {
+    ts_ms: u64,
+    venue: String,
+    side: String,
+    sig: String,
+    pool: String,
+    dumper: String,
+    amount_in: u64,
+    min_amount_out: u64,
+    status: String,
+    loc: u8,
+}
+
+/// Decode a stored row, falling back through each earlier layout.
 fn decode_row(v: &[u8]) -> Option<OrderflowRow> {
     if let Ok(r) = bincode::deserialize::<OrderflowRow>(v) {
         return Some(r);
+    }
+    if let Ok(l) = bincode::deserialize::<OrderflowRowV2>(v) {
+        return Some(OrderflowRow {
+            ts_ms: l.ts_ms, venue: l.venue, side: l.side, sig: l.sig, pool: l.pool,
+            dumper: l.dumper, amount_in: l.amount_in, min_amount_out: l.min_amount_out,
+            status: l.status, loc: l.loc,
+            tip_lamports: 0, cu_price: 0, cu_limit: 0, priority_fee_lamports: 0,
+        });
     }
     bincode::deserialize::<LegacyOrderflowRow>(v)
         .ok()
@@ -121,6 +164,10 @@ fn decode_row(v: &[u8]) -> Option<OrderflowRow> {
             min_amount_out: l.min_amount_out,
             status: l.status,
             loc: l.loc,
+            tip_lamports: 0,
+            cu_price: 0,
+            cu_limit: 0,
+            priority_fee_lamports: 0,
         })
 }
 
@@ -177,6 +224,12 @@ impl OrderflowStore {
         min_amount_out: u64,
         loc: u8,
         ts_ms: u64,
+        // What the transaction bid. Zeroes on the dump path, where reading
+        // them would cost hot-path work on every orderflow transaction.
+        tip_lamports: u64,
+        cu_price: u64,
+        cu_limit: u32,
+        priority_fee_lamports: u64,
     ) {
         // Already stored (e.g. central restarted mid-flight, or a duplicate
         // report arrived late) — nothing to do.
@@ -202,6 +255,10 @@ impl OrderflowStore {
                 min_amount_out,
                 status: String::new(),
                 loc,
+                tip_lamports,
+                cu_price,
+                cu_limit,
+                priority_fee_lamports,
             };
             if let Err(e) = resolve_and_store(&inner, row).await {
                 tracing::debug!("[orderflow-db] resolve failed sig={sig}: {e:#}");

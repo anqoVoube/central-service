@@ -280,6 +280,16 @@ enum ClientMsg {
         loc: u8,
         #[serde(default)]
         ts_ms: u64,
+        /// What the transaction bid, read off its instructions. Populated for
+        /// the watched trader's buys; 0 on dumps (rendered "—").
+        #[serde(default)]
+        tip_lamports: u64,
+        #[serde(default)]
+        cu_price: u64,
+        #[serde(default)]
+        cu_limit: u32,
+        #[serde(default)]
+        priority_fee_lamports: u64,
     },
     /// The SECONDARY copy-trading bot mirrored a trader's buy. Central stores
     /// it and resolves whether we landed before or after the trader — the
@@ -1711,12 +1721,14 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     }
                     Ok(ClientMsg::OrderflowDetected {
                         sig, venue, side, pool, dumper, amount_in, min_amount_out, loc, ts_ms,
+                        tip_lamports, cu_price, cu_limit, priority_fee_lamports,
                     }) => {
                         // Fill in the arrival time if the bot didn't stamp one
                         // (it deliberately keeps clocks off the detect path).
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.orderflow.handle_detected(
                             sig, venue, side, pool, dumper, amount_in, min_amount_out, loc, ts,
+                            tip_lamports, cu_price, cu_limit, priority_fee_lamports,
                         );
                     }
                     Ok(ClientMsg::CopyTradeOpened {
