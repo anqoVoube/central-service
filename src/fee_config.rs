@@ -103,6 +103,9 @@ pub struct CopyTrading {
     /// Ignore the trader's buys smaller than this, in SOL. `0` disables.
     #[serde(default = "default_copy_min_trader_sol_in")]
     pub min_trader_sol_in: f64,
+    /// Ignore the trader's buys larger than this, in SOL. `0` disables.
+    #[serde(default = "default_copy_max_trader_sol_in")]
+    pub max_trader_sol_in: f64,
     /// Our size as a percentage OF THEIRS — a slice, so no direction.
     #[serde(default = "default_copy_pct_min")]
     pub size_min_pct: f64,
@@ -115,6 +118,7 @@ pub fn default_copy_tip_more() -> bool { true }
 pub fn default_copy_fee_more() -> bool { true }
 pub fn default_copy_pct_min() -> f64 { 10.0 }
 pub fn default_copy_min_trader_sol_in() -> f64 { 0.0 }
+pub fn default_copy_max_trader_sol_in() -> f64 { 0.0 }
 pub fn default_copy_pct_max() -> f64 { 15.0 }
 
 pub fn default_copy_fallback_tip_sol() -> f64 { 0.001 }
@@ -156,6 +160,7 @@ impl Default for CopyTrading {
             fee_min_pct: default_copy_pct_min(),
             fee_max_pct: default_copy_pct_max(),
             min_trader_sol_in: default_copy_min_trader_sol_in(),
+            max_trader_sol_in: default_copy_max_trader_sol_in(),
             size_min_pct: default_copy_pct_min(),
             size_max_pct: default_copy_pct_max(),
         }
