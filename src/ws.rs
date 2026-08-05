@@ -314,6 +314,10 @@ enum ClientMsg {
         /// ours on the wire. Excludes network and leader scheduling.
         #[serde(default)]
         build_us: u64,
+        /// Every transaction they submitted for this opportunity, each with
+        /// its own tip and priority fee.
+        #[serde(default)]
+        trader_attempts: Vec<crate::copytrades::TraderAttempt>,
     },
     /// Front-run verdict, computed by the bot from geyser slot + intra-block
     /// index. Central stores it; it no longer derives it.
@@ -1716,7 +1720,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         );
                     }
                     Ok(ClientMsg::CopyTradeOpened {
-                        build_us,
+                        build_us, trader_attempts,
                         pool, mint, trader_sig, trader_wallet, trader_amount_in,
                         trader_tip_lamports, trader_slippage_bps, buy_sig,
                         buy_size_lamports, buy_price_sol, loc, ts_ms,
@@ -1755,6 +1759,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             sell_trader_slot: None,
                             sell_trader_index: None,
                             build_us,
+                            trader_attempts,
                         });
                     }
                     Ok(ClientMsg::CopyTradeVerdict {
