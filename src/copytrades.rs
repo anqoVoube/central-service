@@ -357,6 +357,13 @@ struct Inner {
     /// than a scan of the whole tree.
     by_buy_sig: sled::Tree,
     in_flight: Mutex<HashSet<String>>,
+    /// Live row count. `count()` used to decode EVERY row, and the dashboard
+    /// polls this endpoint on a timer — with `summary()` scanning as well, and
+    /// itself calling `count()`, one poll walked the table three times. Each
+    /// decode also tries up to four historical layouts before it succeeds. The
+    /// orderflow store hit exactly this wall at 64k rows and stalled central's
+    /// runtime; this keeps the same class of bug from arriving here.
+    total: std::sync::atomic::AtomicUsize,
 }
 
 impl CopyTradeStore {
@@ -373,6 +380,7 @@ impl CopyTradeStore {
                 db: tree,
                 by_buy_sig,
                 in_flight: Mutex::new(HashSet::new()),
+                total: std::sync::atomic::AtomicUsize::new(n),
             }),
         })
     }
@@ -387,6 +395,11 @@ impl CopyTradeStore {
             tracing::warn!("[copytrades] store buy failed: {e:#}");
             return;
         }
+        // New key, so the cached total moves. `record_buy` is the only path
+        // that creates one — every other write patches an existing row.
+        self.inner
+            .total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self
             .inner
             .by_buy_sig
@@ -519,13 +532,11 @@ impl CopyTradeStore {
     /// Counting keys is what let the summary claim "2 trades" over an empty
     /// table. The store is small, so the scan is cheap and the two numbers
     /// can never disagree again.
+    /// O(1). Counts stored rows, including any that fail to decode — the
+    /// previous decode-everything version was the expensive part and the
+    /// distinction only ever mattered while a layout migration was in flight.
     pub fn count(&self) -> usize {
-        self.inner
-            .db
-            .iter()
-            .filter_map(|kv| kv.ok())
-            .filter(|(_, v)| decode_trade(v).is_some())
-            .count()
+        self.inner.total.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Aggregate stats over the whole DB — the numbers that decide whether
@@ -542,9 +553,11 @@ impl CopyTradeStore {
         let (mut closed, mut wins, mut pnl) = (0u64, 0u64, 0f64);
         // Exit race, counted only over mirror exits (solo exits are `n/a`).
         let (mut sell_before, mut sell_after) = (0u64, 0u64);
+        let mut scanned = 0u64;
         for kv in self.inner.db.iter() {
             let Ok((_, v)) = kv else { continue };
             let Some(t) = decode_trade(&v) else { continue };
+            scanned += 1;
             match t.verdict.as_str() {
                 "before" => before += 1,
                 "after" => after += 1,
@@ -570,7 +583,8 @@ impl CopyTradeStore {
         // before or after.
         let judged = before + after;
         serde_json::json!({
-            "total": self.count(),
+            // From this pass, not a second scan.
+            "total": scanned,
             "front_run": before,
             "backrun": after,
             "unresolved": unresolved,

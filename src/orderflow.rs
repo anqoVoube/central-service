@@ -188,6 +188,16 @@ struct Inner {
     in_flight: Mutex<HashSet<String>>,
     rpc_url: String,
     inserts: Mutex<u64>,
+    /// Live row count.
+    ///
+    /// `count()` used to be `db.iter().count()`, which walks the whole tree
+    /// and materialises every VALUE from sled. The dashboard polls the
+    /// unfiltered endpoint every 3 seconds, and that scan runs inside an async
+    /// handler with no `spawn_blocking` — so at 64k rows it stalls the entire
+    /// central runtime on a timer, taking WS ingest and orderflow storage down
+    /// with it. Symptom: the page freezes AND new detections stop arriving.
+    /// Counted incrementally instead; the only full scan is once at open.
+    total: std::sync::atomic::AtomicUsize,
 }
 
 impl OrderflowStore {
@@ -206,6 +216,7 @@ impl OrderflowStore {
                 in_flight: Mutex::new(HashSet::new()),
                 rpc_url,
                 inserts: Mutex::new(0),
+                total: std::sync::atomic::AtomicUsize::new(n),
             }),
         })
     }
@@ -337,8 +348,9 @@ impl OrderflowStore {
             .count()
     }
 
+    /// O(1). See `Inner::total` for why this must never scan.
     pub fn count(&self) -> usize {
-        self.inner.db.iter().count()
+        self.inner.total.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn contains_sig(&self, sig: &str) -> bool {
@@ -390,6 +402,9 @@ async fn resolve_and_store(inner: &Inner, mut row: OrderflowRow) -> anyhow::Resu
         .context("sled insert orderflow_by_sig")?;
     inner.db.flush().context("sled flush orderflow")?;
     inner.by_sig.flush().context("sled flush orderflow_by_sig")?;
+    inner
+        .total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let should_prune = {
         let mut n = inner.inserts.lock().unwrap();
@@ -405,7 +420,7 @@ async fn resolve_and_store(inner: &Inner, mut row: OrderflowRow) -> anyhow::Resu
 /// Drop the oldest rows past `MAX_ROWS`. Keys are time-ordered, so the
 /// oldest are simply the front of the tree.
 fn prune(inner: &Inner) {
-    let total = inner.db.iter().count();
+    let total = inner.total.load(std::sync::atomic::Ordering::Relaxed);
     if total <= MAX_ROWS {
         return;
     }
@@ -430,5 +445,8 @@ fn prune(inner: &Inner) {
     }
     let _ = inner.db.flush();
     let _ = inner.by_sig.flush();
+    inner
+        .total
+        .fetch_sub(old.len(), std::sync::atomic::Ordering::Relaxed);
     println!("[orderflow-db] pruned {} old row(s), {} remain", old.len(), total - old.len());
 }
