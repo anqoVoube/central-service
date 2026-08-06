@@ -187,6 +187,14 @@ struct Inner {
     /// we only want one RPC + one row.
     in_flight: Mutex<HashSet<String>>,
     rpc_url: String,
+    /// ONE client, shared.
+    ///
+    /// This was constructed per detection, and every `RpcClient` builds its
+    /// own reqwest client and connection pool. The trader alone fans out ~4
+    /// transactions per opportunity and every dump is a detection too, so at
+    /// live rates that is thousands of fresh TCP/TLS setups a minute, each
+    /// held open across a 12s sleep. Sharing one reuses the pool.
+    rpc: RpcClient,
     inserts: Mutex<u64>,
     /// Live row count.
     ///
@@ -214,6 +222,10 @@ impl OrderflowStore {
                 db: tree,
                 by_sig,
                 in_flight: Mutex::new(HashSet::new()),
+                rpc: RpcClient::new_with_commitment(
+                    rpc_url.clone(),
+                    CommitmentConfig::confirmed(),
+                ),
                 rpc_url,
                 inserts: Mutex::new(0),
                 total: std::sync::atomic::AtomicUsize::new(n),
@@ -363,11 +375,11 @@ impl OrderflowStore {
 
 async fn resolve_and_store(inner: &Inner, mut row: OrderflowRow) -> anyhow::Result<()> {
     tokio::time::sleep(STATUS_CHECK_DELAY).await;
-    let rpc = RpcClient::new_with_commitment(inner.rpc_url.clone(), CommitmentConfig::confirmed());
     let parsed: solana_sdk::signature::Signature = row.sig.parse().context("invalid signature")?;
     // `searchTransactionHistory` is off: we only care about txs recent enough
     // to be in the status cache. Anything older effectively never landed.
-    let statuses = rpc
+    let statuses = inner
+        .rpc
         .get_signature_statuses(&[parsed])
         .await
         .context("getSignatureStatuses")?;

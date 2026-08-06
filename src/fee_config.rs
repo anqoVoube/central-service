@@ -196,6 +196,11 @@ pub struct FeeConfig {
     /// files load unchanged, with the bot disabled.
     #[serde(default)]
     pub copy_trading: CopyTrading,
+    /// Copy-trading v2 — the whole strategy on the `copy-trading` branch.
+    /// Kept alongside the legacy single-wallet block so a config written by
+    /// either branch still loads.
+    #[serde(default)]
+    pub copy_trading_v2: CopyTradingV2,
     /// Partial-sell tiers (Usual / Fast schedules per buy-size bucket).
     /// Mirrors `statics::FeeConfig::partial_sell_tiers`. Tiers must be
     /// sorted ascending by `max_sol_lamports`; last tier uses
@@ -355,6 +360,144 @@ pub struct ProfileVariations {
 pub struct FeeTipSplit {
     pub fee_pct: u32,
     pub tip_pct: u32,
+}
+
+/// Copy-trading v2 — the whole strategy of the `copy-trading` branch.
+///
+/// Replaces the single-wallet `CopyTrading` block. Everything here is editable
+/// on the dashboard and pushed to every location, so adding a competitor or
+/// retuning a filter is not a deploy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CopyTradingV2 {
+    /// Competitor wallets we copy. ONE list — the A/B split in the sell logic
+    /// is derived at runtime from who bought before or after us, not from
+    /// separate lists here.
+    #[serde(default)]
+    pub competitors: Vec<String>,
+
+    // ---- entry filter ----
+    /// Only copy buys whose `amount_in` is at least this, in SOL.
+    #[serde(default = "d_min_in")]
+    pub min_competitor_sol_in: f64,
+    /// ...and at most this. `0` = no upper bound.
+    #[serde(default = "d_max_in")]
+    pub max_competitor_sol_in: f64,
+
+    // ---- sizing ----
+    /// Our `amount_in` as a percentage of THEIRS.
+    #[serde(default = "d_size_pct")]
+    pub size_pct_of_their_amount_in: f64,
+
+    // ---- fee model ----
+    /// How the competitor's own (tip + priority fee) budget is split across
+    /// the transactions we send. One entry per variant; every variant goes to
+    /// every sender except nozomi / harmonic / jito.
+    #[serde(default = "d_variants")]
+    pub variants: Vec<FeeTipSplit>,
+    /// Per-transaction ceiling on the tip, after the split.
+    #[serde(default = "d_max_tip")]
+    pub max_tip_sol: f64,
+    /// Per-transaction ceiling on the priority fee, after the split.
+    #[serde(default = "d_max_fee")]
+    pub max_priority_fee_sol: f64,
+
+    // ---- exits ----
+    /// How long after our buy we resolve mirror-vs-timer, in ms. Case A (a
+    /// tracked wallet buying in after us) fires immediately and is not gated
+    /// on this.
+    #[serde(default = "d_case_a_ms")]
+    pub case_a_window_ms: u64,
+    /// Case C: nobody tracked is in the pool, so exit on a timer.
+    #[serde(default = "d_timer")]
+    pub timer_secs: u64,
+    #[serde(default = "d_sell_tip")]
+    pub sell_tip_sol: f64,
+    #[serde(default = "d_sell_fee")]
+    pub sell_priority_fee_sol: f64,
+    /// Normal sell slippage. Retries escalate to 100%.
+    #[serde(default = "d_sell_slip")]
+    pub sell_slippage_bps: u32,
+
+    // ---- exposure ----
+    #[serde(default = "d_max_open")]
+    pub max_open_positions: u32,
+}
+
+fn d_min_in() -> f64 { 7.0 }
+fn d_max_in() -> f64 { 0.0 }
+fn d_size_pct() -> f64 { 10.0 }
+fn d_max_tip() -> f64 { 0.05 }
+fn d_max_fee() -> f64 { 0.02 }
+fn d_case_a_ms() -> u64 { 1_500 }
+fn d_timer() -> u64 { 5 }
+fn d_sell_tip() -> f64 { 0.001 }
+fn d_sell_fee() -> f64 { 0.0001 }
+fn d_sell_slip() -> u32 { 3_000 }
+fn d_max_open() -> u32 { 10 }
+fn d_variants() -> Vec<FeeTipSplit> {
+    vec![
+        FeeTipSplit { fee_pct: 80, tip_pct: 20 },
+        FeeTipSplit { fee_pct: 20, tip_pct: 80 },
+    ]
+}
+
+impl Default for CopyTradingV2 {
+    fn default() -> Self {
+        Self {
+            competitors: Vec::new(),
+            min_competitor_sol_in: d_min_in(),
+            max_competitor_sol_in: d_max_in(),
+            size_pct_of_their_amount_in: d_size_pct(),
+            variants: d_variants(),
+            max_tip_sol: d_max_tip(),
+            max_priority_fee_sol: d_max_fee(),
+            case_a_window_ms: d_case_a_ms(),
+            timer_secs: d_timer(),
+            sell_tip_sol: d_sell_tip(),
+            sell_priority_fee_sol: d_sell_fee(),
+            sell_slippage_bps: d_sell_slip(),
+            max_open_positions: d_max_open(),
+        }
+    }
+}
+
+impl CopyTradingV2 {
+    /// Reject a config that would trade wrongly rather than let it through.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.variants.is_empty() {
+            return Err("at least one fee/tip variant is required".into());
+        }
+        if self.variants.len() > MAX_DYNAMIC_SLOTS {
+            return Err(format!("at most {MAX_DYNAMIC_SLOTS} variants"));
+        }
+        for (i, v) in self.variants.iter().enumerate() {
+            if v.fee_pct + v.tip_pct != 100 {
+                return Err(format!(
+                    "variant {} splits {}/{} — fee_pct + tip_pct must be 100",
+                    i + 1,
+                    v.fee_pct,
+                    v.tip_pct
+                ));
+            }
+        }
+        if self.size_pct_of_their_amount_in <= 0.0 || self.size_pct_of_their_amount_in > 100.0 {
+            return Err("size % must be in (0, 100]".into());
+        }
+        if self.max_competitor_sol_in > 0.0
+            && self.min_competitor_sol_in > self.max_competitor_sol_in
+        {
+            return Err("min competitor size must be <= max (0 = no cap)".into());
+        }
+        if self.max_open_positions == 0 {
+            return Err("max open positions must be >= 1".into());
+        }
+        for w in &self.competitors {
+            if w.parse::<solana_sdk::pubkey::Pubkey>().is_err() {
+                return Err(format!("not a valid pubkey: {w}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Mirrors `statics::MAX_DYNAMIC_SLOTS` in the bot. Each profile may
@@ -634,6 +777,7 @@ pub fn default_fee_config() -> FeeConfig {
         rung_min_sol_lamports: default_rung_min_sol_lamports(),
         ttp_ttl_secs: default_ttp_ttl_secs(),
         copy_trading: CopyTrading::default(),
+            copy_trading_v2: CopyTradingV2::default(),
         partial_sell_tiers: default_partial_sell_tiers(),
     }
 }

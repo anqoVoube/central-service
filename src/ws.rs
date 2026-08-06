@@ -1025,6 +1025,18 @@ async fn serve_fee_config_set(
         println!("[whitelist] reject POST /fee-config.json from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
+    // Validate BEFORE writing. This file is pushed to every location and read
+    // as gospel, so a config that would trade wrongly — variants that do not
+    // sum to 100, a size outside (0,100], an unparseable wallet — has to be
+    // refused at the door rather than persisted and broadcast.
+    if let Err(e) = cfg.copy_trading_v2.validate() {
+        tracing::warn!("rejecting fee-config: {e}");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response();
+    }
     if let Err(e) = state.fee_config_file.write_atomic(&cfg) {
         tracing::error!("fee_config_file.write_atomic failed: {e:#}");
         return (
