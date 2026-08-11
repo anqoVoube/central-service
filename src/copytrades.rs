@@ -160,6 +160,19 @@ pub struct CopyTrade {
     /// part that says how badly they wanted the fill.
     #[serde(default)]
     pub trader_attempts: Vec<TraderAttempt>,
+
+    /// Did THEIR buy land cleanly?
+    ///
+    /// Independent of whether ours did, and the two are genuinely orthogonal:
+    /// a block has been observed where both reverted, and one where we landed
+    /// while they did not. The verdict string cannot carry both — it had one
+    /// slot and `our_buy_failed` won it — so the trader's own outcome lived
+    /// nowhere and read as success by omission.
+    ///
+    /// `None` means not established: their transaction was never located, so
+    /// the page says so rather than guessing.
+    #[serde(default)]
+    pub trader_buy_ok: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -263,12 +276,52 @@ struct CopyTradeV3 {
     sell_trader_index: Option<u64>, build_us: u64,
 }
 
+/// The layout before `trader_buy_ok`.
+#[derive(Deserialize)]
+struct CopyTradeV4 {
+    ts_ms: u64, pool: String, mint: String, trader_sig: String,
+    trader_wallet: String, trader_amount_in: u64, buy_sig: String,
+    buy_size_lamports: u64, buy_price_sol: f64, loc: u8,
+    sell_sig: Option<String>, sell_price_sol: Option<f64>,
+    exit_reason: Option<String>, pnl_sol: Option<f64>, closed_ts_ms: Option<u64>,
+    verdict: String, trader_slot: Option<u64>, our_slot: Option<u64>,
+    trader_block_index: Option<u32>, our_block_index: Option<u32>,
+    trader_landed_sig: Option<String>, trader_tip_lamports: u64,
+    trader_slippage_bps: u32, sell_verdict: String,
+    sell_trader_sig: Option<String>, sell_our_slot: Option<u64>,
+    sell_our_index: Option<u64>, sell_trader_slot: Option<u64>,
+    sell_trader_index: Option<u64>, build_us: u64,
+    trader_attempts: Vec<TraderAttempt>,
+}
+
 /// Decode a stored row, falling back through each earlier layout.
 fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
     if let Ok(t) = bincode::deserialize::<CopyTrade>(v) {
         return Some(t);
     }
+    if let Ok(l) = bincode::deserialize::<CopyTradeV4>(v) {
+        return Some(CopyTrade {
+            ts_ms: l.ts_ms, pool: l.pool, mint: l.mint, trader_sig: l.trader_sig,
+            trader_wallet: l.trader_wallet, trader_amount_in: l.trader_amount_in,
+            buy_sig: l.buy_sig, buy_size_lamports: l.buy_size_lamports,
+            buy_price_sol: l.buy_price_sol, loc: l.loc, sell_sig: l.sell_sig,
+            sell_price_sol: l.sell_price_sol, exit_reason: l.exit_reason,
+            pnl_sol: l.pnl_sol, closed_ts_ms: l.closed_ts_ms,
+            trader_slot: l.trader_slot, our_slot: l.our_slot,
+            trader_block_index: l.trader_block_index, our_block_index: l.our_block_index,
+            trader_tip_lamports: l.trader_tip_lamports,
+            trader_slippage_bps: l.trader_slippage_bps,
+            sell_verdict: l.sell_verdict, sell_trader_sig: l.sell_trader_sig,
+            sell_our_slot: l.sell_our_slot, sell_our_index: l.sell_our_index,
+            sell_trader_slot: l.sell_trader_slot, sell_trader_index: l.sell_trader_index,
+            build_us: l.build_us, trader_attempts: l.trader_attempts,
+            trader_buy_ok: legacy_trader_buy_ok(&l.verdict, &l.trader_landed_sig),
+            trader_landed_sig: l.trader_landed_sig,
+            verdict: l.verdict,
+        });
+    }
     if let Ok(l) = bincode::deserialize::<CopyTradeV3>(v) {
+        let trader_buy_ok = legacy_trader_buy_ok(&l.verdict, &l.trader_landed_sig);
         return Some(CopyTrade {
             ts_ms: l.ts_ms, pool: l.pool, mint: l.mint, trader_sig: l.trader_sig,
             trader_wallet: l.trader_wallet, trader_amount_in: l.trader_amount_in,
@@ -287,9 +340,11 @@ fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
             build_us: l.build_us,
             // Not recorded before this existed.
             trader_attempts: Vec::new(),
+            trader_buy_ok,
         });
     }
     if let Ok(l) = bincode::deserialize::<CopyTradeV2>(v) {
+        let trader_buy_ok = legacy_trader_buy_ok(&l.verdict, &l.trader_landed_sig);
         return Some(CopyTrade {
             ts_ms: l.ts_ms, pool: l.pool, mint: l.mint, trader_sig: l.trader_sig,
             trader_wallet: l.trader_wallet, trader_amount_in: l.trader_amount_in,
@@ -308,9 +363,12 @@ fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
             // Not measured before this existed.
             build_us: 0,
             trader_attempts: Vec::new(),
+            trader_buy_ok,
         });
     }
-    bincode::deserialize::<LegacyCopyTrade>(v).ok().map(|l| CopyTrade {
+    bincode::deserialize::<LegacyCopyTrade>(v).ok().map(|l| {
+        let trader_buy_ok = legacy_trader_buy_ok(&l.verdict, &l.trader_landed_sig);
+        CopyTrade {
         ts_ms: l.ts_ms,
         pool: l.pool,
         mint: l.mint,
@@ -343,7 +401,22 @@ fn decode_trade(v: &[u8]) -> Option<CopyTrade> {
         sell_trader_index: None,
         build_us: 0,
         trader_attempts: Vec::new(),
+        trader_buy_ok,
+        }
     })
+}
+
+/// The most an older row can still say about the trader's outcome: an explicit
+/// `trader_failed` verdict, or a resolved landed signature. Anything else stays
+/// unknown — absence of evidence was never evidence of a clean fill.
+fn legacy_trader_buy_ok(verdict: &str, trader_landed_sig: &Option<String>) -> Option<bool> {
+    if verdict == "trader_failed" {
+        Some(false)
+    } else if trader_landed_sig.is_some() {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -390,6 +463,25 @@ impl CopyTradeStore {
     /// background.
     #[allow(clippy::too_many_arguments)]
     pub fn record_buy(&self, trade: CopyTrade) {
+        // Every location that fired at this opportunity sees the same fill on
+        // its own geyser stream and reports it, so one landed buy arrives here
+        // once per box. The key carries `ts_ms`, which each box computes for
+        // itself, so those would be DIFFERENT keys — N rows for one trade. And
+        // worse than duplicates: the `by_buy_sig` index would end up pointing
+        // at the last of them, so `record_sell` would patch only that one and
+        // the rest would read as open forever.
+        //
+        // First report wins; its `loc` is the one recorded. Which box that is
+        // does not matter — the fill is the same fill, and the transaction
+        // that landed is named by `buy_sig` either way.
+        if self.key_for(&trade.buy_sig).is_some() {
+            tracing::debug!(
+                "[copytrades] duplicate buy_sig={} from loc={} — already recorded",
+                trade.buy_sig,
+                trade.loc
+            );
+            return;
+        }
         let key = format!("{:013}:{}", trade.ts_ms, trade.buy_sig);
         if let Err(e) = self.put(&key, &trade) {
             tracing::warn!("[copytrades] store buy failed: {e:#}");
@@ -474,6 +566,14 @@ impl CopyTradeStore {
                 t.pool
             );
         }
+        // Their outcome, where the verdict itself settles it. A resolved landed
+        // signature means they filled; `trader_failed` means they did not.
+        // Every other verdict is silent about them and must stay silent.
+        if verdict == "trader_failed" {
+            t.trader_buy_ok = Some(false);
+        } else if trader_landed_sig.is_some() {
+            t.trader_buy_ok = Some(true);
+        }
         t.verdict = verdict;
         if trader_landed_sig.is_some() {
             t.trader_landed_sig = trader_landed_sig;
@@ -484,6 +584,58 @@ impl CopyTradeStore {
         t.trader_block_index = trader_index.map(|v| v as u32);
         if let Err(e) = self.put(&key, &t) {
             tracing::warn!("[copytrades] store verdict failed: {e:#}");
+        }
+    }
+
+    /// The pool and the wallet being copied, for a row we only know by its
+    /// buy signature. Needed to resolve the block a failed buy landed in.
+    pub fn pool_and_trader(&self, buy_sig: &str) -> Option<(String, String)> {
+        let key = self.key_for(buy_sig)?;
+        let t = self.get(&key)?;
+        Some((t.pool, t.trader_wallet))
+    }
+
+    /// Fill in where both transactions sat in the block, without touching the
+    /// verdict.
+    ///
+    /// A reverted buy still has a place in the ordering — it reached the chain
+    /// and the validator gave it an index. The bot cannot supply it: geyser
+    /// hands it our fills, and a revert has none, so the only source is the
+    /// block itself. This is the backfill from that block, and it is what lets
+    /// a failed row answer "did we actually lose the race, or were we beaten
+    /// by someone we do not track".
+    pub fn apply_block_order(
+        &self,
+        buy_sig: &str,
+        our_slot: Option<u64>,
+        our_index: Option<u32>,
+        trader_slot: Option<u64>,
+        trader_index: Option<u32>,
+        trader_landed_sig: Option<String>,
+        trader_buy_ok: Option<bool>,
+    ) {
+        let Some(key) = self.key_for(buy_sig) else { return };
+        let Some(mut t) = self.get(&key) else { return };
+        // The block is the authority on whether their buy executed — it is the
+        // one source that sees a revert, which geyser never reports.
+        if trader_buy_ok.is_some() {
+            t.trader_buy_ok = trader_buy_ok;
+        }
+        // Never overwrite an order the bot already observed first-hand: geyser
+        // saw the real fill, this is reconstruction.
+        if t.our_slot.is_none() {
+            t.our_slot = our_slot;
+            t.our_block_index = our_index;
+        }
+        if t.trader_slot.is_none() {
+            t.trader_slot = trader_slot;
+            t.trader_block_index = trader_index;
+        }
+        if t.trader_landed_sig.is_none() && trader_landed_sig.is_some() {
+            t.trader_landed_sig = trader_landed_sig;
+        }
+        if let Err(e) = self.put(&key, &t) {
+            tracing::warn!("[copytrades] store block order failed: {e:#}");
         }
     }
 

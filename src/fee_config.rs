@@ -421,8 +421,24 @@ pub struct CopyTradingV2 {
     // ---- exposure ----
     #[serde(default = "d_max_open")]
     pub max_open_positions: u32,
+
+    // ---- which services the BUY fan-out goes to ----
+    /// The eight tip-bearing services (helius, zeroslot, stellium, bloxroute,
+    /// node1, nextblock, flashblock, blocksprint).
+    ///
+    /// Buy leg only. The exit always uses these whatever is set here: they are
+    /// the only ones that can pay a tip, and an exit that cannot be sent leaves
+    /// a position open that we have already decided to leave.
+    #[serde(default = "d_true")]
+    pub use_tip_senders: bool,
+    /// The fee-only RPCs (`helius_rpc`, `corvus_rpc`). They take no tip, so the
+    /// whole bid is folded into the priority fee.
+    #[serde(default = "d_false")]
+    pub use_fee_only_senders: bool,
 }
 
+fn d_true() -> bool { true }
+fn d_false() -> bool { false }
 fn d_min_in() -> f64 { 7.0 }
 fn d_max_in() -> f64 { 0.0 }
 fn d_size_pct() -> f64 { 10.0 }
@@ -457,6 +473,8 @@ impl Default for CopyTradingV2 {
             sell_priority_fee_sol: d_sell_fee(),
             sell_slippage_bps: d_sell_slip(),
             max_open_positions: d_max_open(),
+            use_tip_senders: d_true(),
+            use_fee_only_senders: d_false(),
         }
     }
 }
@@ -490,6 +508,12 @@ impl CopyTradingV2 {
         }
         if self.max_open_positions == 0 {
             return Err("max open positions must be >= 1".into());
+        }
+        // Refused here rather than at fire time. With neither group the buy has
+        // nowhere to go, and the bot would discover that one opportunity at a
+        // time, in a log line, having already decided to trade.
+        if !self.use_tip_senders && !self.use_fee_only_senders {
+            return Err("at least one group of senders must be enabled".into());
         }
         for w in &self.competitors {
             if w.parse::<solana_sdk::pubkey::Pubkey>().is_err() {

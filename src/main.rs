@@ -4,8 +4,8 @@ use solana_sdk::signature::{Keypair, Signer};
 use tokio::sync::broadcast;
 
 use central_service::{
-    alts, ata, auto_unwrap, backfill, bans, block_detail, config, discover, fee_config, lanes,
-    leaders, mongo, poll, pool, positions, validators, ws,
+    alts, auto_unwrap, backfill, bans, block_detail, config, discover, fee_config, lanes,
+    leaders, mongo, poll, positions, validators, ws,
 };
 
 #[tokio::main]
@@ -118,6 +118,24 @@ async fn main() -> anyhow::Result<()> {
     let copy_trades =
         central_service::copytrades::CopyTradeStore::open(&cfg.copy_trades_db_path)?;
 
+    // Exits, one row each. A mirror leaves a position in pieces, and the trade
+    // row can only ever hold the last of them.
+    let copy_sells =
+        central_service::copysells::CopySellStore::open(&cfg.copy_sells_db_path)?;
+
+    // Rows written before the block-order backfill existed carry no ordering
+    // for their reverted buys. New verdicts fill themselves in; these cannot,
+    // so sweep the recent ones once at startup. Bounded and paced on purpose —
+    // each row is a getBlock, and the history page must not be competing with
+    // it for the RPC.
+    {
+        let trades = copy_trades.clone();
+        let details = block_details.clone();
+        tokio::spawn(async move {
+            central_service::ws::backfill_block_order(trades, details, 60).await;
+        });
+    }
+
     let tip_priority =
         central_service::tip_priority::TipPriorityStore::open(
             &cfg.tip_priority_db_path,
@@ -168,47 +186,15 @@ async fn main() -> anyhow::Result<()> {
         let repo = Arc::clone(&repo);
         let tx = broadcast_tx.clone();
         let rpc_url = cfg.rpc_url.clone();
-        let kp = Arc::clone(&wallet_kp);
-        tokio::spawn(discover::run(discover_rx, rpc_url, kp, repo, tx));
+        tokio::spawn(discover::run(discover_rx, rpc_url, repo, tx));
     }
 
-    // Periodic ATA + CU background worker. Every 10 minutes:
-    //   • Retry ATA creation for pools still pending (capped per pool
-    //     so structurally-broken rows don't hammer the chain forever).
-    //   • Measure CU for any confirmed pool missing `compute_unit_limit`.
-    // Sequential within each pass; errors logged + loop continues.
-    {
-        let repo = Arc::clone(&repo);
-        let rpc_url = cfg.rpc_url.clone();
-        let kp = Arc::clone(&wallet_kp);
-        let tx = broadcast_tx.clone();
-        let interval = Duration::from_secs(600); // 10 min
-        tokio::spawn(async move {
-            if let Err(e) = central_service::bg_worker::run(repo, rpc_url, kp, tx, interval).await {
-                tracing::error!("bg_worker task exited: {e:#}");
-            }
-        });
-    }
-
-    // Replay pending pools through the discovery pipeline so the ATA
-    // creator gets another shot at each. New rows reset their attempts
-    // counter via the seed binary's `--retry-pending` flag before central
-    // is restarted; the actual retry happens here. Rows whose
-    // `ata_attempts` still equals 3 will fail again immediately and stay
-    // pending — which is the same end state as not running this at all.
-    match repo.load_pending_pubkeys().await {
-        Ok(pending) if !pending.is_empty() => {
-            tracing::info!(
-                "discover: replaying {} pending pool(s) into the ATA creator",
-                pending.len()
-            );
-            for pool in pending {
-                let _ = discover_tx.send(pool);
-            }
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("load_pending_pubkeys failed: {e:#}"),
-    }
+    // No periodic background worker any more. It used to create and repair
+    // ATAs (that moved into the bot's own buy) and to measure each pool's CU
+    // by firing a real 121_335-lamport buy with a 100_000-lamport tip every
+    // ten minutes. Nothing reads the measurement: the copy strategy pins
+    // `COPY_CU_LIMIT`, and the legacy path falls back to a static constant.
+    // Measure by hand with `bin/measure_cu` if it is ever needed again.
 
     ws::serve(
         cfg.ws_bind,
@@ -225,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
         block_details,
         orderflow,
         copy_trades,
+        copy_sells,
         tip_priority,
         guaranteed,
         fee_config_file,

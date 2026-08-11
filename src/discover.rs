@@ -2,31 +2,31 @@ use std::{str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair};
+use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use tokio::sync::{broadcast, mpsc::UnboundedReceiver};
 
 
 use crate::{
-    ata,
     mongo::Repo,
     pool::{pump_fun, AtaStatus, PoolAccounts, PoolDoc, PumpFunAccounts},
     ws::ServerMsg,
 };
 
+/// Discovery no longer signs anything, so it no longer takes the wallet:
+/// the only transaction it ever sent was the ATA create, and provisioning
+/// now happens inside the bot's own buy.
 pub async fn run(
     mut rx: UnboundedReceiver<String>,
     rpc_url: String,
-    wallet_kp: Arc<Keypair>,
     repo: Arc<Repo>,
     broadcast: broadcast::Sender<ServerMsg>,
 ) {
     while let Some(pool_str) = rx.recv().await {
         let rpc_url = rpc_url.clone();
-        let wallet_kp = Arc::clone(&wallet_kp);
         let repo = Arc::clone(&repo);
         let broadcast = broadcast.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_one(pool_str, rpc_url, wallet_kp, repo, broadcast).await {
+            if let Err(e) = handle_one(pool_str, rpc_url, repo, broadcast).await {
                 eprintln!("[discover] {e:#}");
             }
         });
@@ -36,7 +36,6 @@ pub async fn run(
 async fn handle_one(
     pool_str: String,
     rpc_url: String,
-    wallet_kp: Arc<Keypair>,
     repo: Arc<Repo>,
     broadcast: broadcast::Sender<ServerMsg>,
 ) -> anyhow::Result<()> {
@@ -88,11 +87,12 @@ async fn handle_one(
             is_mayhem_mode,
             token_decimals,
         }),
-        // Always insert as Confirmed so the WS init filter ships the pool
-        // to bots immediately. The on-chain ATA creation still runs below
-        // (via `ata::create`) on best-effort — bots get visibility right
-        // away, and if ATA creation fails the buy will revert at trade
-        // time rather than stranding the pool in pending forever.
+        // Always Confirmed. The field is vestigial: central no longer
+        // creates ATAs at all. The bot's buy transaction carries
+        // `create_associated_token_account_idempotent` for the token side,
+        // so provisioning happens at trade time, in the same transaction
+        // that needs it. Keeping the value at Confirmed is what makes the
+        // WS init filter and `pools_for_cu_measurement` still see the row.
         ata_status: AtaStatus::Confirmed,
         ata_attempts: 0,
         token_name,
@@ -110,16 +110,19 @@ async fn handle_one(
         return Ok(());
     }
 
-    tokio::spawn(ata::create(
-        pool_str,
-        base_mint,
-        token_program,
-        wallet_kp,
-        rpc_url,
-        repo,
-        broadcast,
-        doc,
-    ));
+    // Announce the pool. This used to be sent from inside `ata::create` on
+    // ATA confirmation, which coupled a bot's visibility of a pool to an
+    // on-chain transaction succeeding — and, once ATA creation went away,
+    // would have meant no running bot ever heard about a new pool until it
+    // reconnected. `compute_unit_limit` is None here: the CU probe pass in
+    // `bg_worker` fills it in later if it ever runs. The copy strategy uses
+    // a fixed `COPY_CU_LIMIT` and does not read this value.
+    let _ = broadcast.send(ServerMsg::NewPool {
+        pool: doc.pool.clone(),
+        accounts: doc.accounts.clone(),
+        pair_created_at_ms: doc.pair_created_at_ms,
+        compute_unit_limit: None,
+    });
 
     Ok(())
 }

@@ -317,6 +317,17 @@ fn cache_key(opp_sig: &str, pool: &str) -> String {
 /// the typical worst case without ballooning the per-resolve RPC bill.
 const NEXT_BLOCK_SCAN_RANGE: u64 = 2;
 
+/// How many slots BEFORE ours to scan.
+///
+/// The forward-only window is inherited from the dump-sniping bot, where the
+/// opportunity's own block is the anchor and every copy lands after it. The
+/// copy bot asks the opposite question — who was already in ahead of us — and
+/// a competitor sitting at the tail of the previous block is invisible to a
+/// forward scan. Observed live: theirs at slot 438250189 index 2114, ours at
+/// 438250190 index 97. One slot apart, and the panel reported "0 buys reached
+/// the pool before us".
+const PREV_BLOCK_SCAN_RANGE: u64 = 2;
+
 /// `getTransaction(opp_sig)` → slot, then `getBlock(slot, full+base64)` for
 /// the dump's slot plus the next produced block (best-effort), walking
 /// every tx and filtering PumpFun BUY / BUY_EXACT_IN for the given pool.
@@ -365,6 +376,33 @@ async fn fetch_block_detail(
         if let Some(mut att) = try_parse_pump_buy(tx, &pool_pk, idx as u32) {
             att.slot = slot;
             attempts.push(att);
+        }
+    }
+
+    // Backwards first. Unlike the forward walk this does NOT stop at the first
+    // block it gets: a competitor can be one slot back and another two, and
+    // both are "before us". A skipped slot simply contributes nothing.
+    for offset in 1..=PREV_BLOCK_SCAN_RANGE {
+        let candidate = slot.saturating_sub(offset);
+        if candidate == 0 || candidate == slot {
+            break;
+        }
+        match rpc.get_block_with_config(candidate, block_cfg.clone()).await {
+            Ok(b) => {
+                let txs0 = b.transactions.unwrap_or_default();
+                for (idx, tx) in txs0.iter().enumerate() {
+                    if let Some(mut att) = try_parse_pump_buy(tx, &pool_pk, idx as u32) {
+                        att.slot = candidate;
+                        attempts.push(att);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "[block_detail] getBlock(slot={candidate}) failed for opp={opp_sig}: {e:#}; \
+                     earlier slot skipped"
+                );
+            }
         }
     }
 
@@ -476,9 +514,18 @@ fn try_parse_pump_buy(
                     // delta. quote_vault is at PumpFun account index 8.
                     sol_in_lamports = if exact_in {
                         amount
-                    } else {
+                    } else if success {
                         pool_quote_vault_delta(&tx.meta, &ix.accounts)
                             .unwrap_or(amount)
+                    } else {
+                        // A reverted transaction moved nothing, so the vault
+                        // delta is zero — and zero on the page reads as "bid
+                        // nothing" for precisely the attempts worth studying.
+                        // What it declared is the honest figure for a buy that
+                        // never executed. u64::MAX is the CPI-wrapper sentinel
+                        // for "no cap at all" and is not a number to show, so
+                        // it stays 0 and the page renders it as unknown.
+                        if amount == u64::MAX { 0 } else { amount }
                     };
                     is_buy_exact_in = exact_in;
                     found_pump_buy = true;

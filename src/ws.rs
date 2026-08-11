@@ -237,6 +237,10 @@ pub enum ServerMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
     DiscoveredPool { pool: String },
+    /// One EXIT, reported whether or not it closed the position. Boxed: it is
+    /// much larger than the other variants and would otherwise set the size of
+    /// every message the socket decodes.
+    CopySellEvent(Box<crate::copysells::CopySell>),
     PositionOpened(OpenedReport),
     PositionClosed(ClosedReport),
     PositionFailed(FailedReport),
@@ -397,6 +401,7 @@ struct AppState {
     block_details: BlockDetailStore,
     orderflow: crate::orderflow::OrderflowStore,
     copy_trades: crate::copytrades::CopyTradeStore,
+    copy_sells: crate::copysells::CopySellStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
@@ -422,6 +427,7 @@ pub async fn serve(
     block_details: BlockDetailStore,
     orderflow: crate::orderflow::OrderflowStore,
     copy_trades: crate::copytrades::CopyTradeStore,
+    copy_sells: crate::copysells::CopySellStore,
     tip_priority: crate::tip_priority::TipPriorityStore,
     guaranteed: crate::guaranteed::GuaranteedStore,
     fee_config_file: crate::fee_config::FeeConfigFile,
@@ -441,6 +447,7 @@ pub async fn serve(
         block_details,
         orderflow,
         copy_trades,
+        copy_sells,
         tip_priority,
         guaranteed,
         fee_config_file,
@@ -481,6 +488,7 @@ pub async fn serve(
         .route("/fee-priority.bin", get(serve_fee_priority_snapshot))
         .route("/orderflow.json", get(serve_orderflow))
         .route("/copytrades.json", get(serve_copy_trades))
+        .route("/copysells.json", get(serve_copy_sells))
         .route("/tip-priority-status", get(serve_tip_priority_status))
         .route("/guaranteed", post(serve_guaranteed_set))
         .route("/guaranteed.bin", get(serve_guaranteed_snapshot))
@@ -889,6 +897,113 @@ async fn serve_orderflow(
         "events": rows,
     }))
     .into_response()
+}
+
+/// Resolve the block a buy landed in and write both transactions' places in it
+/// back onto the row. `true` when something was written.
+///
+/// The bot cannot supply this for a reverted buy: geyser reports fills, and a
+/// revert produces none. The block still contains the transaction — the
+/// validator gave it an index — so the ordering is recoverable, just not from
+/// the stream the bot listens to.
+pub async fn resolve_block_order(
+    trades: &crate::copytrades::CopyTradeStore,
+    details: &crate::block_detail::BlockDetailStore,
+    buy_sig: &str,
+) -> bool {
+    let Some((pool, trader_wallet)) = trades.pool_and_trader(buy_sig) else {
+        return false;
+    };
+    let crate::block_detail::Resolution::Resolved(d) = details.resolve(buy_sig, &pool).await
+    else {
+        return false;
+    };
+    let ours = d.attempts.iter().find(|a| a.sig == buy_sig);
+    // Theirs: a FILLED buy from the wallet we copy beats a reverted one. A
+    // revert of theirs is not the transaction we were racing, and taking it
+    // would report us as having beaten a buy that never happened.
+    let theirs = d
+        .attempts
+        .iter()
+        .filter(|a| a.fee_payer == trader_wallet)
+        .min_by_key(|a| (!a.success, a.slot, a.intra_block_order));
+    if ours.is_none() && theirs.is_none() {
+        return false;
+    }
+    trades.apply_block_order(
+        buy_sig,
+        ours.map(|a| a.slot),
+        ours.map(|a| a.intra_block_order),
+        theirs.map(|a| a.slot),
+        theirs.map(|a| a.intra_block_order),
+        theirs.filter(|a| a.success).map(|a| a.sig.clone()),
+        theirs.map(|a| a.success),
+    );
+    true
+}
+
+/// One-shot sweep for rows written before the backfill existed.
+///
+/// Bounded to the newest `max_rows` and paced at one block per two seconds:
+/// each row costs a `getBlock`, and the history page must not be racing this
+/// for the same RPC.
+pub async fn backfill_block_order(
+    trades: crate::copytrades::CopyTradeStore,
+    details: crate::block_detail::BlockDetailStore,
+    max_rows: usize,
+) {
+    let pending: Vec<String> = trades
+        .page(0, max_rows.max(1))
+        .into_iter()
+        // Either question can be open independently: a row backfilled before
+        // the trader's outcome was stored has an ordering but no verdict on
+        // their side, and re-resolving is free once the block is cached.
+        .filter(|t| (t.our_slot.is_none() || t.trader_buy_ok.is_none()) && !t.buy_sig.is_empty())
+        .map(|t| t.buy_sig)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!("[copytrades] backfilling block order for {} row(s)", pending.len());
+    let mut done = 0usize;
+    for sig in pending {
+        if resolve_block_order(&trades, &details, &sig).await {
+            done += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    tracing::info!("[copytrades] block order backfilled for {done} row(s)");
+}
+
+/// `GET /copysells.json?page=N&limit=50` — every EXIT, newest first.
+///
+/// Its own endpoint because a trade row holds one sell and a mirror leaves in
+/// pieces; the trades page can only ever show the last of them.
+async fn serve_copy_sells(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> impl axum::response::IntoResponse {
+    let ip = addr.ip();
+    if !state.whitelist.is_empty() && !state.whitelist.contains(&ip) {
+        tracing::warn!("rejecting copysells from non-whitelisted ip {ip}");
+        return axum::Json(serde_json::json!({ "error": "forbidden" }));
+    }
+    let page = q.get("page").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let total = state.copy_sells.count();
+    axum::Json(serde_json::json!({
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": total.div_ceil(limit).max(1),
+        "summary": state.copy_sells.summary(500),
+        "sells": state.copy_sells.page(page * limit, limit),
+    }))
 }
 
 /// `GET /copytrades.json?page=N&limit=50` — the secondary copy bot's trades,
@@ -1784,16 +1899,32 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             sell_trader_index: None,
                             build_us,
                             trader_attempts,
+                            // Their transaction has not been located yet at
+                            // open time; the verdict or the block fills it in.
+                            trader_buy_ok: None,
                         });
                     }
                     Ok(ClientMsg::CopyTradeVerdict {
                         buy_sig, verdict, trader_landed_sig, our_slot, our_index,
                         trader_slot, trader_index,
                     }) => {
+                        let needs_order = our_slot.is_none();
                         state.copy_trades.apply_verdict(
                             &buy_sig, verdict, trader_landed_sig, our_slot, our_index,
                             trader_slot, trader_index,
                         );
+                        // A reverted buy arrives with no ordering: geyser only
+                        // reports fills, and a revert produces none. The block
+                        // still has both transactions in it, so resolve it and
+                        // backfill. Async and silent — the row is already
+                        // stored and correct without this, just less useful.
+                        if needs_order {
+                            let details = state.block_details.clone();
+                            let trades = state.copy_trades.clone();
+                            tokio::spawn(async move {
+                                resolve_block_order(&trades, &details, &buy_sig).await;
+                            });
+                        }
                     }
                     Ok(ClientMsg::CopySellVerdict {
                         buy_sig, sell_verdict, sell_trader_sig, sell_our_slot,
@@ -1803,6 +1934,9 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             &buy_sig, sell_verdict, sell_trader_sig, sell_our_slot,
                             sell_our_index, sell_trader_slot, sell_trader_index,
                         );
+                    }
+                    Ok(ClientMsg::CopySellEvent(r)) => {
+                        state.copy_sells.record(*r);
                     }
                     Ok(ClientMsg::CopyTradeClosed {
                         buy_sig, sell_sig, sell_price_sol, exit_reason, pnl_sol, ts_ms,
