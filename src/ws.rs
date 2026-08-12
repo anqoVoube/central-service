@@ -971,17 +971,17 @@ async fn serve_orderflow(
     let page = q.page.unwrap_or(0);
     let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
     let side = q.side.as_deref().filter(|s| !s.is_empty() && *s != "all");
-    let filtered = status.is_some() || side.is_some();
+    // `page_filtered` now always restricts to the tracked dumpers, so this is
+    // inherently a filtered view: an exact total would need a full-tree scan
+    // (too expensive for a 3s poll), so the UI drives paging off `has_more`.
+    let filtered = true;
 
     let (rows, has_more) =
         state
             .orderflow
             .page_filtered(page.saturating_mul(limit), limit, status, side);
 
-    // Unfiltered, `count()` is a cheap key scan. Filtered, an exact total
-    // means deserializing the whole tree — too expensive for an endpoint the
-    // dashboard polls every 3s — so the UI drives paging off `has_more`.
-    let total = if filtered { None } else { Some(state.orderflow.count()) };
+    let total: Option<usize> = None;
     Json(serde_json::json!({
         "page": page,
         "limit": limit,

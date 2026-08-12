@@ -43,12 +43,16 @@ const MAX_ROWS: usize = 1_000_000;
 /// Prune only occasionally rather than on every insert.
 const PRUNE_EVERY: u64 = 4_096;
 
-/// Dumper wallets whose NOT-LANDED detections we keep. Everything that reaches
-/// the chain (landed/failed) is stored for every dumper; never-landed ones are
-/// dropped as noise EXCEPT for these, which the operator tracks specifically.
+/// The operator-tracked dumper wallets. Two roles:
+///  1. INGEST — their never-landed detections are kept (everyone else's are
+///     dropped as noise; landed/failed are stored for every dumper).
+///  2. SERVE — `page_filtered` returns ONLY these wallets, so the /orderflow
+///     page shows just the tracked competitors and nothing else.
+/// Keep this in sync with `copy_trading_v2.competitors` in the fee config.
 const KEEP_NOT_LANDED_DUMPERS: &[&str] = &[
     "hnu5iBK8UoHb51UFsH1RYTUAYdrhjHvV5YMTf9T1CYN",
     "FYX5JQ2kP7TD8gWb9WP1tjmwWWUAzi8edEZTr5Z8F1ck",
+    "popo3Rj6arKNttyUFpWfbkv2gG8uS13TGtmH6JPMuHz",
 ];
 
 /// One detected dump that reached the chain.
@@ -322,6 +326,10 @@ impl OrderflowStore {
             let Some(r) = decode_row(&v) else {
                 continue;
             };
+            // Only the operator-tracked dumpers are ever shown on /orderflow.
+            if !KEEP_NOT_LANDED_DUMPERS.contains(&r.dumper.as_str()) {
+                continue;
+            }
             if let Some(want) = status {
                 if r.status != want {
                     continue;
