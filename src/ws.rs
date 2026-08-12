@@ -151,6 +151,17 @@ pub enum ServerMsg {
     /// the bot re-fetches it on its next startup. Serializes as
     /// `{"type":"fee_config_reload"}`.
     FeeConfigReload,
+    /// Broadcast after an operator flips the v2 copy-engine switch on the
+    /// `/copy` dashboard. Every connected bot calls `v2.set_enabled(enabled)`,
+    /// which persists its own `copy_v2_enabled` file and logs
+    /// `[v2] ENABLED/STOPPED`. Unlike `fee_config_reload` this does NOT
+    /// restart anyone — it is a live kill-switch that must take effect at once.
+    /// A box's `COPY_V2_FIRE` env is still the safety catch: the switch cannot
+    /// arm a box that was never prepared. Serializes as
+    /// `{"type":"copy_v2_enabled","enabled":true|false}`.
+    CopyV2Enabled {
+        enabled: bool,
+    },
     /// Late-arriving leader info for a `position_opened` whose leader RPC
     /// took longer than the bot's open→close cycle (or any time after the
     /// open). Bots merge this into the matching `central_positions` entry
@@ -500,6 +511,7 @@ pub async fn serve(
             "/auto-unwrap/config",
             get(serve_auto_unwrap_get).post(serve_auto_unwrap_post),
         )
+        .route("/copy-v2-enabled", post(serve_copy_v2_enabled))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!("ws server listening on {bind}");
@@ -1168,6 +1180,44 @@ async fn serve_fee_config_set(
         state.fee_config_file.path().display()
     );
     (StatusCode::OK, "ok").into_response()
+}
+
+#[derive(Deserialize)]
+struct CopyV2EnabledReq {
+    enabled: bool,
+}
+
+/// Flip the v2 copy-engine switch across the whole fleet. Dashboard's
+/// `/api/copy-v2-enabled` POSTs here (was point-to-point to a single bot).
+/// Broadcasts `copy_v2_enabled` so every connected location flips its live
+/// switch and logs — not just the box behind the dashboard. No persistence:
+/// each bot writes its own `copy_v2_enabled` file on receipt, so a restart
+/// re-reads the right state locally. IP-whitelisted, same list as the WS
+/// upgrade and `/fee-config.json`.
+async fn serve_copy_v2_enabled(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<CopyV2EnabledReq>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /copy-v2-enabled from non-whitelisted ip {ip}");
+        println!("[whitelist] reject POST /copy-v2-enabled from {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let subs = state
+        .tx
+        .send(ServerMsg::CopyV2Enabled { enabled: req.enabled })
+        .unwrap_or(0);
+    println!(
+        "[copy-v2] enabled={} + broadcast copy_v2_enabled (subscribers={subs})",
+        req.enabled
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "enabled": req.enabled, "subscribers": subs })),
+    )
+        .into_response()
 }
 
 /// Serve the fee-config JSON file. Bots fetch this once at startup
