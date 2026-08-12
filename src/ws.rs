@@ -390,11 +390,90 @@ enum ClientMsg {
         #[serde(default)]
         ts_ms: u64,
     },
+    /// One location fired on an opportunity — its detect time and fire time.
+    /// Sent by EVERY location that raced, win or lose: the shared nonce admits
+    /// exactly one, but all of them tried, and only the winner also sends
+    /// `CopyTradeOpened`. Grouped in-memory by `trader_sig` (identical at every
+    /// location) so the dashboard row can show the whole race. Not persisted.
+    CopyV2Attempt {
+        trader_sig: String,
+        #[serde(default)]
+        loc: u8,
+        #[serde(default)]
+        detected_ms: u64,
+        #[serde(default)]
+        fired_ms: u64,
+        #[serde(default)]
+        build_us: u64,
+    },
 }
 
 /// Bots predating the buy/sell split only ever reported dumps.
 fn default_orderflow_side() -> String {
     "sell".to_owned()
+}
+
+/// One location's fire on an opportunity, as surfaced to the dashboard.
+#[derive(Clone, serde::Serialize)]
+struct V2Attempt {
+    loc: u8,
+    detected_ms: u64,
+    fired_ms: u64,
+    build_us: u64,
+}
+
+/// Bounded, in-memory record of every location's fire, grouped by the
+/// competitor's buy signature (`trader_sig`). Deliberately NOT sled: it is a
+/// live race view, cheap to lose on restart, and keeping it out of the store
+/// means no bincode fallback decoder to maintain. Only the box that wins the
+/// shared nonce also lands a `CopyTradeOpened`; the losers appear only here.
+#[derive(Clone)]
+struct V2AttemptStore {
+    inner: Arc<std::sync::Mutex<V2AttemptInner>>,
+}
+struct V2AttemptInner {
+    by_sig: std::collections::HashMap<String, Vec<V2Attempt>>,
+    /// Insertion order of sigs, for O(1) eviction past `cap`.
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+impl V2AttemptStore {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(V2AttemptInner {
+                by_sig: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                cap,
+            })),
+        }
+    }
+    /// Record a location's attempt. One row per location per opportunity —
+    /// a duplicate/late report for the same loc keeps the earliest fire.
+    fn record(&self, sig: String, row: V2Attempt) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = g.by_sig.get_mut(&sig) {
+            match v.iter_mut().find(|a| a.loc == row.loc) {
+                Some(existing) if row.fired_ms < existing.fired_ms => *existing = row,
+                Some(_) => {}
+                None => v.push(row),
+            }
+            return;
+        }
+        g.by_sig.insert(sig.clone(), vec![row]);
+        g.order.push_back(sig);
+        while g.order.len() > g.cap {
+            if let Some(old) = g.order.pop_front() {
+                g.by_sig.remove(&old);
+            }
+        }
+    }
+    /// Every location's attempt for this opportunity, earliest fire first.
+    fn get(&self, sig: &str) -> Vec<V2Attempt> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v = g.by_sig.get(sig).cloned().unwrap_or_default();
+        v.sort_by_key(|a| a.fired_ms);
+        v
+    }
 }
 
 #[derive(Clone)]
@@ -421,6 +500,9 @@ struct AppState {
     /// `auto_unwrap::spawn` shares the same ArcSwap so operator changes
     /// take effect on the next 30 s tick without restart.
     auto_unwrap_config: Arc<arc_swap::ArcSwap<crate::auto_unwrap::AutoUnwrapConfig>>,
+    /// Live per-location fire records for the copy-trade race view. In-memory
+    /// only — constructed in `serve`, never persisted.
+    v2_attempts: V2AttemptStore,
 }
 
 pub async fn serve(
@@ -463,6 +545,8 @@ pub async fn serve(
         guaranteed,
         fee_config_file,
         auto_unwrap_config,
+        // ~4k recent opportunities' race records; older ones evict silently.
+        v2_attempts: V2AttemptStore::new(4096),
     };
     // TTP sweeper: every 5s, drop expired temporary tip-priority entries.
     // `prune_expired` broadcasts `tip_priority_changed{is_priority:false}`
@@ -1036,14 +1120,49 @@ async fn serve_copy_trades(
     let page = q.page.unwrap_or(0);
     let total = state.copy_trades.count();
     let rows = state.copy_trades.page(page.saturating_mul(limit), limit);
+    // Join each trade with the live per-location race records (in-memory,
+    // keyed by trader_sig). Serialized to Value so we can splice `attempts` in
+    // without adding a sled field (and its bincode fallback decoder).
+    let trades: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|t| {
+            // Group attempts across EVERY rung of the competitor's ladder, not
+            // just the winner's trigger sig: different locations may decode a
+            // different rung first, so keying on one sig alone would drop them.
+            // One row per location — the earliest fire wins.
+            let mut seen: HashSet<u8> = HashSet::new();
+            let mut attempts: Vec<V2Attempt> = Vec::new();
+            let mut keys: Vec<&str> = Vec::with_capacity(1 + t.trader_attempts.len());
+            keys.push(t.trader_sig.as_str());
+            for a in &t.trader_attempts {
+                keys.push(a.sig.as_str());
+            }
+            for k in keys {
+                for r in state.v2_attempts.get(k) {
+                    if seen.insert(r.loc) {
+                        attempts.push(r);
+                    }
+                }
+            }
+            attempts.sort_by_key(|a| a.fired_ms);
+            let mut v = serde_json::to_value(&t).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "attempts".to_owned(),
+                    serde_json::to_value(&attempts).unwrap_or_else(|_| serde_json::json!([])),
+                );
+            }
+            v
+        })
+        .collect();
     Json(serde_json::json!({
         "page": page,
         "limit": limit,
         "total": total,
         "total_pages": total.div_ceil(limit.max(1)),
-        "count": rows.len(),
+        "count": trades.len(),
         "summary": state.copy_trades.summary(),
-        "trades": rows,
+        "trades": trades,
     }))
     .into_response()
 }
@@ -1994,6 +2113,14 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
                         state.copy_trades.record_sell(
                             &buy_sig, sell_sig, sell_price_sol, exit_reason, pnl_sol, ts,
+                        );
+                    }
+                    Ok(ClientMsg::CopyV2Attempt {
+                        trader_sig, loc, detected_ms, fired_ms, build_us,
+                    }) => {
+                        state.v2_attempts.record(
+                            trader_sig,
+                            V2Attempt { loc, detected_ms, fired_ms, build_us },
                         );
                     }
                     Ok(ClientMsg::SigDispatched { prefix }) => {
