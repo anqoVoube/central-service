@@ -393,10 +393,18 @@ enum ClientMsg {
     /// One location fired on an opportunity — its detect time and fire time.
     /// Sent by EVERY location that raced, win or lose: the shared nonce admits
     /// exactly one, but all of them tried, and only the winner also sends
-    /// `CopyTradeOpened`. Grouped in-memory by `trader_sig` (identical at every
-    /// location) so the dashboard row can show the whole race. Not persisted.
+    /// `CopyTradeOpened`. Grouped in-memory by `(pool, amount_in)` — stable
+    /// across the competitor's fan-out, so every location joins the same trade
+    /// even though each decoded a different rung's `trader_sig`. Not persisted.
     CopyV2Attempt {
         trader_sig: String,
+        /// Opportunity identity, stable across every rung of the competitor's
+        /// fan-out (unlike `trader_sig`, which differs per location). Central
+        /// keys attempts by `(pool, amount_in)` so all locations join one trade.
+        #[serde(default)]
+        pool: String,
+        #[serde(default)]
+        amount_in: u64,
         #[serde(default)]
         loc: u8,
         #[serde(default)]
@@ -449,44 +457,85 @@ struct V2AttemptStore {
 }
 struct V2AttemptInner {
     by_sig: std::collections::HashMap<String, Vec<V2Attempt>>,
+    /// The robust index: `"{pool}:{amount_in}"` -> rows. Stable across the
+    /// competitor's whole fan-out, so a location that decoded a different rung
+    /// than the one recorded on the trade still joins here. `by_sig` is kept
+    /// as a fallback for attempts that arrive without a pool (old bots).
+    by_opp: std::collections::HashMap<String, Vec<V2Attempt>>,
     /// Insertion order of sigs, for O(1) eviction past `cap`.
     order: std::collections::VecDeque<String>,
+    /// Insertion order of opportunity keys, evicted independently.
+    opp_order: std::collections::VecDeque<String>,
     cap: usize,
+}
+/// Insert-or-merge one location's row into a keyed bucket, keeping the earliest
+/// fire per location and evicting the oldest key past `cap`.
+fn upsert_attempt(
+    map: &mut std::collections::HashMap<String, Vec<V2Attempt>>,
+    order: &mut std::collections::VecDeque<String>,
+    cap: usize,
+    key: String,
+    row: V2Attempt,
+) {
+    if let Some(v) = map.get_mut(&key) {
+        match v.iter_mut().find(|a| a.loc == row.loc) {
+            Some(existing) if row.fired_ms < existing.fired_ms => *existing = row,
+            Some(_) => {}
+            None => v.push(row),
+        }
+        return;
+    }
+    map.insert(key.clone(), vec![row]);
+    order.push_back(key);
+    while order.len() > cap {
+        if let Some(old) = order.pop_front() {
+            map.remove(&old);
+        }
+    }
 }
 impl V2AttemptStore {
     fn new(cap: usize) -> Self {
         Self {
             inner: Arc::new(std::sync::Mutex::new(V2AttemptInner {
                 by_sig: std::collections::HashMap::new(),
+                by_opp: std::collections::HashMap::new(),
                 order: std::collections::VecDeque::new(),
+                opp_order: std::collections::VecDeque::new(),
                 cap,
             })),
         }
     }
-    /// Record a location's attempt. One row per location per opportunity —
-    /// a duplicate/late report for the same loc keeps the earliest fire.
-    fn record(&self, sig: String, row: V2Attempt) {
+    /// Record a location's attempt under both the sig index and, when the box
+    /// reported one, the stable `(pool, amount_in)` index. One row per location
+    /// per opportunity — a duplicate/late report for the same loc keeps the
+    /// earliest fire.
+    fn record(&self, sig: String, opp_key: Option<String>, row: V2Attempt) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(v) = g.by_sig.get_mut(&sig) {
-            match v.iter_mut().find(|a| a.loc == row.loc) {
-                Some(existing) if row.fired_ms < existing.fired_ms => *existing = row,
-                Some(_) => {}
-                None => v.push(row),
-            }
-            return;
-        }
-        g.by_sig.insert(sig.clone(), vec![row]);
-        g.order.push_back(sig);
-        while g.order.len() > g.cap {
-            if let Some(old) = g.order.pop_front() {
-                g.by_sig.remove(&old);
-            }
+        let cap = g.cap;
+        let V2AttemptInner {
+            by_sig, by_opp, order, opp_order, ..
+        } = &mut *g;
+        upsert_attempt(by_sig, order, cap, sig, row.clone());
+        if let Some(k) = opp_key {
+            upsert_attempt(by_opp, opp_order, cap, k, row);
         }
     }
     /// Every location's attempt for this opportunity, earliest fire first.
     fn get(&self, sig: &str) -> Vec<V2Attempt> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut v = g.by_sig.get(sig).cloned().unwrap_or_default();
+        v.sort_by_key(|a| a.fired_ms);
+        v
+    }
+    /// Every location's attempt keyed by the stable `(pool, amount_in)` — this
+    /// is the join that catches locations that decoded a different rung.
+    fn get_opp(&self, pool: &str, amount_in: u64) -> Vec<V2Attempt> {
+        if pool.is_empty() {
+            return Vec::new();
+        }
+        let key = format!("{pool}:{amount_in}");
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v = g.by_opp.get(&key).cloned().unwrap_or_default();
         v.sort_by_key(|a| a.fired_ms);
         v
     }
@@ -519,6 +568,32 @@ struct AppState {
     /// Live per-location fire records for the copy-trade race view. In-memory
     /// only — constructed in `serve`, never persisted.
     v2_attempts: V2AttemptStore,
+    /// Authoritative fleet firing switch: `-1` = never set by an operator,
+    /// `0` = off, `1` = on. Persisted to a file so a central restart keeps it,
+    /// and replayed to every box on connect — that is what makes ONE toggle
+    /// arm every location, including one that was restarting when it was flipped
+    /// and so missed the broadcast. `-1` pushes nothing (boxes keep their own
+    /// persisted file), so this never surprise-disables a fleet on first deploy.
+    copy_v2_enabled: Arc<std::sync::atomic::AtomicI8>,
+}
+
+/// Where central persists the authoritative copy-v2 firing switch. Cwd-relative,
+/// like `copytrades.db`.
+fn copy_v2_enabled_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("copy_v2_enabled.state")
+}
+fn load_copy_v2_enabled() -> i8 {
+    match std::fs::read_to_string(copy_v2_enabled_path()) {
+        Ok(s) => match s.trim() {
+            "1" => 1,
+            "0" => 0,
+            _ => -1,
+        },
+        Err(_) => -1,
+    }
+}
+fn persist_copy_v2_enabled(enabled: bool) {
+    let _ = std::fs::write(copy_v2_enabled_path(), if enabled { "1" } else { "0" });
 }
 
 pub async fn serve(
@@ -563,7 +638,16 @@ pub async fn serve(
         auto_unwrap_config,
         // ~4k recent opportunities' race records; older ones evict silently.
         v2_attempts: V2AttemptStore::new(4096),
+        copy_v2_enabled: Arc::new(std::sync::atomic::AtomicI8::new(load_copy_v2_enabled())),
     };
+    println!(
+        "[copy-v2] authoritative firing switch loaded: {}",
+        match state.copy_v2_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => "on",
+            0 => "off",
+            _ => "unset (boxes keep their own state)",
+        }
+    );
     // TTP sweeper: every 5s, drop expired temporary tip-priority entries.
     // `prune_expired` broadcasts `tip_priority_changed{is_priority:false}`
     // per removed validator, so bots revert it to default within ~5s of
@@ -1154,6 +1238,17 @@ async fn serve_copy_trades(
             for a in &t.trader_attempts {
                 keys.push(a.sig.as_str());
             }
+            // Primary join: the stable (pool, amount_in) key, which every
+            // location that reacted to this competitor buy shares regardless of
+            // which rung of their fan-out it decoded. This is what surfaces the
+            // out-of-region boxes (NY/AMS/TYO) that a sig-only join dropped.
+            for r in state.v2_attempts.get_opp(&t.pool, t.trader_amount_in) {
+                if seen.insert(r.loc) {
+                    attempts.push(r);
+                }
+            }
+            // Fallback: the sig index, for attempts from bots that predate the
+            // (pool, amount_in) key and reported no pool.
             for k in keys {
                 for r in state.v2_attempts.get(k) {
                     if seen.insert(r.loc) {
@@ -1381,12 +1476,18 @@ async fn serve_copy_v2_enabled(
         println!("[whitelist] reject POST /copy-v2-enabled from {ip}");
         return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
     }
+    // Persist as the authoritative state BEFORE broadcasting, so a box that
+    // connects mid-broadcast still gets it replayed on init from the same value.
+    state
+        .copy_v2_enabled
+        .store(if req.enabled { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    persist_copy_v2_enabled(req.enabled);
     let subs = state
         .tx
         .send(ServerMsg::CopyV2Enabled { enabled: req.enabled })
         .unwrap_or(0);
     println!(
-        "[copy-v2] enabled={} + broadcast copy_v2_enabled (subscribers={subs})",
+        "[copy-v2] enabled={} + persisted + broadcast copy_v2_enabled (subscribers={subs})",
         req.enabled
     );
     (
@@ -1959,6 +2060,23 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
         }
     }
 
+    // Replay the authoritative firing switch to this freshly connected box, so
+    // ONE toggle arms every location — including one that was restarting when
+    // the operator flipped it and missed the broadcast. `-1` (never set) pushes
+    // nothing and lets the box keep its own persisted file.
+    match state.copy_v2_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        v @ (0 | 1) => {
+            let payload = serde_json::to_string(&ServerMsg::CopyV2Enabled { enabled: v == 1 });
+            if let Ok(payload) = payload {
+                if sender.send(Message::Text(payload)).await.is_err() {
+                    return;
+                }
+                println!("[copy-v2] replayed enabled={} to {addr} on connect", v == 1);
+            }
+        }
+        _ => {}
+    }
+
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
@@ -2173,11 +2291,17 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         );
                     }
                     Ok(ClientMsg::CopyV2Attempt {
-                        trader_sig, loc, detected_ms, fired_ms, build_us, senders,
-                        jito_send_us, fee_send_us, tip_send_us,
+                        trader_sig, pool, amount_in, loc, detected_ms, fired_ms,
+                        build_us, senders, jito_send_us, fee_send_us, tip_send_us,
                     }) => {
+                        let opp_key = if pool.is_empty() {
+                            None
+                        } else {
+                            Some(format!("{pool}:{amount_in}"))
+                        };
                         state.v2_attempts.record(
                             trader_sig,
+                            opp_key,
                             V2Attempt {
                                 loc, detected_ms, fired_ms, build_us, senders,
                                 jito_send_us, fee_send_us, tip_send_us,
