@@ -436,6 +436,10 @@ struct Inner {
     /// fallback decoder onto the history every time it flips. The serve path
     /// splices `marked` into the JSON by lookup, the way `attempts` is.
     marked: sled::Tree,
+    /// A SECOND independent operator mark (the green star, next to the yellow
+    /// `marked`). Own tree, same reasoning — a separate curated category the
+    /// operator tags by hand. Spliced into the JSON as `marked2`.
+    marked2: sled::Tree,
     in_flight: Mutex<HashSet<String>>,
     /// Live row count. `count()` used to decode EVERY row, and the dashboard
     /// polls this endpoint on a timer — with `summary()` scanning as well, and
@@ -456,17 +460,22 @@ impl CopyTradeStore {
         let marked = db
             .open_tree("copytrades_marked")
             .context("open copytrades_marked tree")?;
+        let marked2 = db
+            .open_tree("copytrades_marked2")
+            .context("open copytrades_marked2 tree")?;
         let n = tree.iter().count();
         println!(
-            "[copytrades] opened at {} ({n} trades, {} marked)",
+            "[copytrades] opened at {} ({n} trades, {} marked, {} marked2)",
             db_path.display(),
-            marked.len()
+            marked.len(),
+            marked2.len()
         );
         Ok(Self {
             inner: Arc::new(Inner {
                 db: tree,
                 by_buy_sig,
                 marked,
+                marked2,
                 in_flight: Mutex::new(HashSet::new()),
                 total: std::sync::atomic::AtomicUsize::new(n),
             }),
@@ -500,6 +509,35 @@ impl CopyTradeStore {
     pub fn marked_buy_sigs(&self) -> Vec<String> {
         self.inner
             .marked
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter_map(|k| String::from_utf8(k.to_vec()).ok())
+            .collect()
+    }
+
+    /// Toggle the SECOND (green) mark. Same shape as `set_mark`, own tree.
+    pub fn set_mark2(&self, buy_sig: &str, marked: bool) -> anyhow::Result<()> {
+        if marked {
+            self.inner.marked2.insert(buy_sig.as_bytes(), &[1u8])?;
+        } else {
+            self.inner.marked2.remove(buy_sig.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Whether a trade carries the second (green) mark.
+    pub fn is_marked2(&self, buy_sig: &str) -> bool {
+        self.inner
+            .marked2
+            .contains_key(buy_sig.as_bytes())
+            .unwrap_or(false)
+    }
+
+    /// Every buy signature carrying the second (green) mark.
+    pub fn marked2_buy_sigs(&self) -> Vec<String> {
+        self.inner
+            .marked2
             .iter()
             .keys()
             .filter_map(|k| k.ok())

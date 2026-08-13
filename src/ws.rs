@@ -1263,11 +1263,16 @@ async fn serve_copy_trades(
                     "attempts".to_owned(),
                     serde_json::to_value(&attempts).unwrap_or_else(|_| serde_json::json!([])),
                 );
-                // Manual operator mark, spliced in the same way as `attempts` so
-                // the bincode trade row stays untouched.
+                // Manual operator marks, spliced in the same way as `attempts`
+                // so the bincode trade row stays untouched. Two independent
+                // categories: `marked` (yellow) and `marked2` (green).
                 obj.insert(
                     "marked".to_owned(),
                     serde_json::Value::Bool(state.copy_trades.is_marked(&t.buy_sig)),
+                );
+                obj.insert(
+                    "marked2".to_owned(),
+                    serde_json::Value::Bool(state.copy_trades.is_marked2(&t.buy_sig)),
                 );
             }
             v
@@ -1289,6 +1294,9 @@ async fn serve_copy_trades(
 struct CopyTradeMarkReq {
     buy_sig: String,
     marked: bool,
+    /// Which mark: 1 = yellow (default), 2 = green. Absent = 1 for back-compat.
+    #[serde(default)]
+    which: u8,
 }
 
 /// `POST /copytrades/mark {buy_sig, marked}` — set or clear the operator's
@@ -1308,8 +1316,14 @@ async fn serve_copy_trade_mark(
     if sig.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty buy_sig").into_response();
     }
-    match state.copy_trades.set_mark(sig, req.marked) {
-        Ok(()) => Json(serde_json::json!({ "ok": true, "buy_sig": sig, "marked": req.marked }))
+    // which: 2 = green mark, anything else (incl. absent/0/1) = yellow.
+    let result = if req.which == 2 {
+        state.copy_trades.set_mark2(sig, req.marked)
+    } else {
+        state.copy_trades.set_mark(sig, req.marked)
+    };
+    match result {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "buy_sig": sig, "marked": req.marked, "which": req.which }))
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
