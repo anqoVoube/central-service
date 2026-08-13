@@ -599,6 +599,7 @@ pub async fn serve(
         .route("/fee-priority.bin", get(serve_fee_priority_snapshot))
         .route("/orderflow.json", get(serve_orderflow))
         .route("/copytrades.json", get(serve_copy_trades))
+        .route("/copytrades/mark", post(serve_copy_trade_mark))
         .route("/copysells.json", get(serve_copy_sells))
         .route("/tip-priority-status", get(serve_tip_priority_status))
         .route("/guaranteed", post(serve_guaranteed_set))
@@ -1167,6 +1168,12 @@ async fn serve_copy_trades(
                     "attempts".to_owned(),
                     serde_json::to_value(&attempts).unwrap_or_else(|_| serde_json::json!([])),
                 );
+                // Manual operator mark, spliced in the same way as `attempts` so
+                // the bincode trade row stays untouched.
+                obj.insert(
+                    "marked".to_owned(),
+                    serde_json::Value::Bool(state.copy_trades.is_marked(&t.buy_sig)),
+                );
             }
             v
         })
@@ -1181,6 +1188,40 @@ async fn serve_copy_trades(
         "trades": trades,
     }))
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CopyTradeMarkReq {
+    buy_sig: String,
+    marked: bool,
+}
+
+/// `POST /copytrades/mark {buy_sig, marked}` — set or clear the operator's
+/// manual "we were before" mark on one trade. Persists to its own sled tree;
+/// the trade row is untouched. IP-whitelisted like every other mutation here.
+async fn serve_copy_trade_mark(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(req): Json<CopyTradeMarkReq>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting POST /copytrades/mark from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let sig = req.buy_sig.trim();
+    if sig.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty buy_sig").into_response();
+    }
+    match state.copy_trades.set_mark(sig, req.marked) {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "buy_sig": sig, "marked": req.marked }))
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /fee-priority.bin` — bincode `Vec<Pubkey>` of the fee-priority set.

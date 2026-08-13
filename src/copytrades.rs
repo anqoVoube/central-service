@@ -429,6 +429,13 @@ struct Inner {
     /// `buy_sig -> key`, so updating a trade on exit is a point lookup rather
     /// than a scan of the whole tree.
     by_buy_sig: sled::Tree,
+    /// Manual operator marks: `buy_sig -> ()`. A curated set, separate from the
+    /// automatic `verdict`, for trades the operator judges "we were before".
+    /// Its own tree on purpose — `CopyTrade` is bincode (positional), and a
+    /// mutable annotation the operator toggles has no business forcing a new
+    /// fallback decoder onto the history every time it flips. The serve path
+    /// splices `marked` into the JSON by lookup, the way `attempts` is.
+    marked: sled::Tree,
     in_flight: Mutex<HashSet<String>>,
     /// Live row count. `count()` used to decode EVERY row, and the dashboard
     /// polls this endpoint on a timer — with `summary()` scanning as well, and
@@ -446,16 +453,58 @@ impl CopyTradeStore {
         let by_buy_sig = db
             .open_tree("copytrades_by_sig")
             .context("open copytrades_by_sig tree")?;
+        let marked = db
+            .open_tree("copytrades_marked")
+            .context("open copytrades_marked tree")?;
         let n = tree.iter().count();
-        println!("[copytrades] opened at {} ({n} trades)", db_path.display());
+        println!(
+            "[copytrades] opened at {} ({n} trades, {} marked)",
+            db_path.display(),
+            marked.len()
+        );
         Ok(Self {
             inner: Arc::new(Inner {
                 db: tree,
                 by_buy_sig,
+                marked,
                 in_flight: Mutex::new(HashSet::new()),
                 total: std::sync::atomic::AtomicUsize::new(n),
             }),
         })
+    }
+
+    /// Toggle the operator's manual "we were before" mark on one trade, keyed
+    /// by our copy-buy signature. Point write to its own tree — the trade row
+    /// and its bincode layout are never touched.
+    pub fn set_mark(&self, buy_sig: &str, marked: bool) -> anyhow::Result<()> {
+        if marked {
+            self.inner.marked.insert(buy_sig.as_bytes(), &[1u8])?;
+        } else {
+            self.inner.marked.remove(buy_sig.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Whether a trade carries the manual mark. Point lookup, cheap enough for
+    /// the serve path to call once per row.
+    pub fn is_marked(&self, buy_sig: &str) -> bool {
+        self.inner
+            .marked
+            .contains_key(buy_sig.as_bytes())
+            .unwrap_or(false)
+    }
+
+    /// Every marked buy signature. Safe to scan: the tree holds ONLY marked
+    /// trades (a hand-curated few), and nothing polls this — it exists for the
+    /// offline "resolve the leaders on these slots" step.
+    pub fn marked_buy_sigs(&self) -> Vec<String> {
+        self.inner
+            .marked
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .filter_map(|k| String::from_utf8(k.to_vec()).ok())
+            .collect()
     }
 
     /// A copy buy was dispatched and landed. Stores it immediately (so the
