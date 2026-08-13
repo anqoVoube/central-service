@@ -408,6 +408,13 @@ enum ClientMsg {
         /// Sender-group bitmask: tip-bearing = 1, fee-only = 2, jito = 4.
         #[serde(default)]
         senders: u8,
+        /// Fastest send (µs) per lane; 0 = lane not in the fan-out.
+        #[serde(default)]
+        jito_send_us: u64,
+        #[serde(default)]
+        fee_send_us: u64,
+        #[serde(default)]
+        tip_send_us: u64,
     },
 }
 
@@ -425,6 +432,10 @@ struct V2Attempt {
     build_us: u64,
     /// Sender-group bitmask: tip-bearing = 1, fee-only = 2, jito = 4.
     senders: u8,
+    /// Fastest send (µs) per lane; 0 = lane not in the fan-out.
+    jito_send_us: u64,
+    fee_send_us: u64,
+    tip_send_us: u64,
 }
 
 /// Bounded, in-memory record of every location's fire, grouped by the
@@ -2122,10 +2133,14 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     }
                     Ok(ClientMsg::CopyV2Attempt {
                         trader_sig, loc, detected_ms, fired_ms, build_us, senders,
+                        jito_send_us, fee_send_us, tip_send_us,
                     }) => {
                         state.v2_attempts.record(
                             trader_sig,
-                            V2Attempt { loc, detected_ms, fired_ms, build_us, senders },
+                            V2Attempt {
+                                loc, detected_ms, fired_ms, build_us, senders,
+                                jito_send_us, fee_send_us, tip_send_us,
+                            },
                         );
                     }
                     Ok(ClientMsg::SigDispatched { prefix }) => {
