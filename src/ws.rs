@@ -405,6 +405,9 @@ enum ClientMsg {
         fired_ms: u64,
         #[serde(default)]
         build_us: u64,
+        /// Sender-group bitmask: tip-bearing = 1, fee-only = 2, jito = 4.
+        #[serde(default)]
+        senders: u8,
     },
 }
 
@@ -420,6 +423,8 @@ struct V2Attempt {
     detected_ms: u64,
     fired_ms: u64,
     build_us: u64,
+    /// Sender-group bitmask: tip-bearing = 1, fee-only = 2, jito = 4.
+    senders: u8,
 }
 
 /// Bounded, in-memory record of every location's fire, grouped by the
@@ -2116,11 +2121,11 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         );
                     }
                     Ok(ClientMsg::CopyV2Attempt {
-                        trader_sig, loc, detected_ms, fired_ms, build_us,
+                        trader_sig, loc, detected_ms, fired_ms, build_us, senders,
                     }) => {
                         state.v2_attempts.record(
                             trader_sig,
-                            V2Attempt { loc, detected_ms, fired_ms, build_us },
+                            V2Attempt { loc, detected_ms, fired_ms, build_us, senders },
                         );
                     }
                     Ok(ClientMsg::SigDispatched { prefix }) => {
