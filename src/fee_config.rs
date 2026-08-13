@@ -435,6 +435,11 @@ pub struct CopyTradingV2 {
     /// whole bid is folded into the priority fee.
     #[serde(default = "d_false")]
     pub use_fee_only_senders: bool,
+    /// Send the buy and the exit through Jito's block-engine bundle (tip-only).
+    /// Independent toggle. Uses `JITO_AUTH_UUID` from the bot env for the
+    /// authenticated rate tier; without it Jito sends on the public tier.
+    #[serde(default = "d_false")]
+    pub use_jito: bool,
 }
 
 fn d_true() -> bool { true }
@@ -475,6 +480,7 @@ impl Default for CopyTradingV2 {
             max_open_positions: d_max_open(),
             use_tip_senders: d_true(),
             use_fee_only_senders: d_false(),
+            use_jito: d_false(),
         }
     }
 }
@@ -512,7 +518,7 @@ impl CopyTradingV2 {
         // Refused here rather than at fire time. With neither group the buy has
         // nowhere to go, and the bot would discover that one opportunity at a
         // time, in a log line, having already decided to trade.
-        if !self.use_tip_senders && !self.use_fee_only_senders {
+        if !self.use_tip_senders && !self.use_fee_only_senders && !self.use_jito {
             return Err("at least one group of senders must be enabled".into());
         }
         for w in &self.competitors {
