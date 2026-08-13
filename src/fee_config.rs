@@ -440,6 +440,12 @@ pub struct CopyTradingV2 {
     /// authenticated rate tier; without it Jito sends on the public tier.
     #[serde(default = "d_false")]
     pub use_jito: bool,
+    /// Validator identities the copy strategy is allowed to fire on. When the
+    /// upcoming slot's leader is not one of these, the fire is skipped. EMPTY =
+    /// gate off (fire on every leader). Served to the bot, which seeds its
+    /// `COPY_FIRE_LEADER_HANDLE` at boot; a change takes effect on bot restart.
+    #[serde(default)]
+    pub fire_leader_whitelist: Vec<String>,
 }
 
 fn d_true() -> bool { true }
@@ -481,6 +487,7 @@ impl Default for CopyTradingV2 {
             use_tip_senders: d_true(),
             use_fee_only_senders: d_false(),
             use_jito: d_false(),
+            fire_leader_whitelist: Vec::new(),
         }
     }
 }
