@@ -1139,6 +1139,46 @@ pub async fn resolve_block_order(
     true
 }
 
+/// The operator's fire-leader whitelist, read from the live config. These are
+/// the validators already marked (curated from ★ trades).
+fn fire_leader_whitelist_set(state: &AppState) -> std::collections::HashSet<String> {
+    state
+        .fee_config_file
+        .read_bytes()
+        .ok()
+        .and_then(|b| serde_json::from_slice::<crate::fee_config::FeeConfig>(&b).ok())
+        .map(|c| c.copy_trading_v2.fire_leader_whitelist.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Auto-apply the yellow mark to a copy trade whose landed-slot leader is a
+/// validator already in the whitelist — "if the validator was marked, mark the
+/// new trade too". No-op if the whitelist is empty, the trade is already marked,
+/// or the leader cannot be resolved / is not whitelisted.
+async fn auto_mark_if_leader_whitelisted(
+    trades: &crate::copytrades::CopyTradeStore,
+    leaders: &crate::leaders::LeaderStore,
+    whitelist: &std::collections::HashSet<String>,
+    buy_sig: &str,
+    slot: u64,
+) {
+    if whitelist.is_empty() || trades.is_marked(buy_sig) {
+        return;
+    }
+    let Some(leader) = leaders.slot_leader(slot).await else {
+        return;
+    };
+    if whitelist.contains(&leader.to_string()) {
+        match trades.set_mark(buy_sig, true) {
+            Ok(()) => println!(
+                "[auto-mark] buy={} slot={slot} leader={leader} in whitelist → marked yellow",
+                &buy_sig[..buy_sig.len().min(12)]
+            ),
+            Err(e) => tracing::warn!("[auto-mark] set_mark failed buy={buy_sig}: {e:#}"),
+        }
+    }
+}
+
 /// One-shot sweep for rows written before the backfill existed.
 ///
 /// Bounded to the newest `max_rows` and paced at one block per two seconds:
@@ -2274,13 +2314,24 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                         // A reverted buy arrives with no ordering: geyser only
                         // reports fills, and a revert produces none. The block
                         // still has both transactions in it, so resolve it and
-                        // backfill. Async and silent — the row is already
-                        // stored and correct without this, just less useful.
-                        if needs_order {
+                        // backfill. Then AUTO-MARK: if the slot we landed in is
+                        // led by a validator already in the whitelist, star this
+                        // trade yellow too. Async and silent.
+                        let whitelist = fire_leader_whitelist_set(&state);
+                        if needs_order || !whitelist.is_empty() {
                             let details = state.block_details.clone();
                             let trades = state.copy_trades.clone();
+                            let leaders = state.leaders.clone();
                             tokio::spawn(async move {
-                                resolve_block_order(&trades, &details, &buy_sig).await;
+                                if needs_order {
+                                    resolve_block_order(&trades, &details, &buy_sig).await;
+                                }
+                                if let Some(slot) = trades.our_slot_of(&buy_sig) {
+                                    auto_mark_if_leader_whitelisted(
+                                        &trades, &leaders, &whitelist, &buy_sig, slot,
+                                    )
+                                    .await;
+                                }
                             });
                         }
                     }

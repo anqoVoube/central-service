@@ -682,6 +682,13 @@ impl CopyTradeStore {
         Some((t.pool, t.trader_wallet))
     }
 
+    /// The slot our buy landed in, once known. Used by the auto-mark to resolve
+    /// the leader and decide whether this trade sits on a whitelisted validator.
+    pub fn our_slot_of(&self, buy_sig: &str) -> Option<u64> {
+        let key = self.key_for(buy_sig)?;
+        self.get(&key)?.our_slot
+    }
+
     /// Fill in where both transactions sat in the block, without touching the
     /// verdict.
     ///

@@ -139,6 +139,18 @@ impl LeaderStore {
         }
     }
 
+    /// Resolve a SLOT directly to its leader identity via `getSlotLeaders`.
+    /// Unlike `resolve` (sig → slot → leader), the slot is already known, so
+    /// this is a single RPC and is not cached — used by the copy-trade
+    /// auto-mark. `None` on any RPC error or empty result.
+    pub async fn slot_leader(&self, slot: u64) -> Option<Pubkey> {
+        let rpc = RpcClient::new_with_commitment(
+            self.inner.rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        );
+        rpc.get_slot_leaders(slot, 1).await.ok()?.into_iter().next()
+    }
+
     fn cache_get(&self, sig_str: &str) -> Option<Pubkey> {
         let parsed: Signature = sig_str.parse().ok()?;
         let v = self.inner.db.get(parsed.as_ref()).ok()??;
