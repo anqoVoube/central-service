@@ -423,23 +423,15 @@ pub struct CopyTradingV2 {
     pub max_open_positions: u32,
 
     // ---- which services the BUY fan-out goes to ----
-    /// The eight tip-bearing services (helius, zeroslot, stellium, bloxroute,
-    /// node1, nextblock, flashblock, blocksprint).
-    ///
-    /// Buy leg only. The exit always uses these whatever is set here: they are
-    /// the only ones that can pay a tip, and an exit that cannot be sent leaves
-    /// a position open that we have already decided to leave.
+    /// FREE group — tip-bearing services + jito. Carry the FREE (tip-heavy,
+    /// `tip >= fee`) copied bids. The exit always uses the tip-bearing services.
     #[serde(default = "d_true")]
-    pub use_tip_senders: bool,
-    /// The fee-only RPCs (`helius_rpc`, `corvus_rpc`). They take no tip, so the
-    /// whole bid is folded into the priority fee.
-    #[serde(default = "d_false")]
-    pub use_fee_only_senders: bool,
-    /// Send the buy and the exit through Jito's block-engine bundle (tip-only).
-    /// Independent toggle. Uses `JITO_AUTH_UUID` from the bot env for the
-    /// authenticated rate tier; without it Jito sends on the public tier.
-    #[serde(default = "d_false")]
-    pub use_jito: bool,
+    pub use_free: bool,
+    /// PAID group — fee-only RPCs (`helius_rpc`, `corvus_rpc`, jet). Carry the
+    /// PAID (fee-heavy) copied bids (whole budget as priority fee, no tip). PAID
+    /// only reaches marked (whitelisted) leaders — see the fire gate.
+    #[serde(default = "d_true")]
+    pub use_paid: bool,
     /// Validator identities the copy strategy is allowed to fire on. When the
     /// upcoming slot's leader is not one of these, the fire is skipped. EMPTY =
     /// gate off (fire on every leader). Served to the bot, which seeds its
@@ -484,9 +476,8 @@ impl Default for CopyTradingV2 {
             sell_priority_fee_sol: d_sell_fee(),
             sell_slippage_bps: d_sell_slip(),
             max_open_positions: d_max_open(),
-            use_tip_senders: d_true(),
-            use_fee_only_senders: d_false(),
-            use_jito: d_false(),
+            use_free: d_true(),
+            use_paid: d_true(),
             fire_leader_whitelist: Vec::new(),
         }
     }
@@ -525,8 +516,8 @@ impl CopyTradingV2 {
         // Refused here rather than at fire time. With neither group the buy has
         // nowhere to go, and the bot would discover that one opportunity at a
         // time, in a log line, having already decided to trade.
-        if !self.use_tip_senders && !self.use_fee_only_senders && !self.use_jito {
-            return Err("at least one group of senders must be enabled".into());
+        if !self.use_free && !self.use_paid {
+            return Err("at least one group (Free or Paid) must be enabled".into());
         }
         for w in &self.competitors {
             if w.parse::<solana_sdk::pubkey::Pubkey>().is_err() {
