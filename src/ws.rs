@@ -423,6 +423,10 @@ enum ClientMsg {
         fee_send_us: u64,
         #[serde(default)]
         tip_send_us: u64,
+        /// The bid combination this location fired, rendered
+        /// "tip X+fee Y @ N CU | ...". Empty from bots that predate the column.
+        #[serde(default)]
+        our_bids: String,
     },
 }
 
@@ -444,6 +448,10 @@ struct V2Attempt {
     jito_send_us: u64,
     fee_send_us: u64,
     tip_send_us: u64,
+    /// The bid combination this location fired ("tip X+fee Y @ N CU | ..."),
+    /// surfaced to the dashboard's `our bids` column. Empty from older bots.
+    #[serde(default)]
+    our_bids: String,
 }
 
 /// Bounded, in-memory record of every location's fire, grouped by the
@@ -2358,6 +2366,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                     Ok(ClientMsg::CopyV2Attempt {
                         trader_sig, pool, amount_in, loc, detected_ms, fired_ms,
                         build_us, senders, jito_send_us, fee_send_us, tip_send_us,
+                        our_bids,
                     }) => {
                         let opp_key = if pool.is_empty() {
                             None
@@ -2369,7 +2378,7 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             opp_key,
                             V2Attempt {
                                 loc, detected_ms, fired_ms, build_us, senders,
-                                jito_send_us, fee_send_us, tip_send_us,
+                                jito_send_us, fee_send_us, tip_send_us, our_bids,
                             },
                         );
                     }
