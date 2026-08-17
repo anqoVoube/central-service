@@ -84,13 +84,23 @@ pub struct BuyAttempt {
     /// `Buy` → `max_quote_amount_in`. Both are the upper-bound SOL spend.
     pub sol_in_lamports: u64,
     /// The fixed token leg (raw base units): `base_amount_out` on an exact-out
-    /// `Buy`, `min_base_amount_out` on `BuyExactIn`. `sol_in_lamports` divided
-    /// by this is the worst SOL-per-token price the buyer signed — the "max
-    /// buy price" the dashboard shows. 0 when the ix data was unreadable.
+    /// `Buy`, `min_base_amount_out` on `BuyExactIn`. Paired with
+    /// `declared_quote_lamports` to price the trade.
     /// `#[serde(default)]` so pre-existing cached rows keep deserialising
     /// (a bincode miss just re-resolves the block from RPC).
     #[serde(default)]
     pub base_token_amount: u64,
+    /// The SOL cap AS SENT — the raw `max_quote_amount_in` (exact-out) or
+    /// `quote_amount_in` (exact-in) straight from the instruction, BEFORE the
+    /// realised-spend correction applied to `sol_in_lamports`.
+    /// `declared_quote_lamports / base_token_amount` is the max SOL-per-token
+    /// the tx was *sent* with — the buyer's price ceiling / slippage limit —
+    /// which is what the dashboard's "max price" column shows for EVERY row,
+    /// filled or reverted, so ceilings compare like-for-like rather than
+    /// mixing sent ceilings with realised fills. `u64::MAX` when a CPI wrapper
+    /// disabled the cap (no ceiling to show); 0 when the ix was unreadable.
+    #[serde(default)]
+    pub declared_quote_lamports: u64,
     /// `true` if BuyExactIn; `false` if Buy (exact-out).
     pub is_buy_exact_in: bool,
     /// `ComputeBudget::SetComputeUnitLimit` value. 0 if no such ix.
@@ -496,6 +506,7 @@ fn try_parse_pump_buy(
 
     let mut sol_in_lamports: u64 = 0;
     let mut base_token_amount: u64 = 0;
+    let mut declared_quote_lamports: u64 = 0;
     let mut is_buy_exact_in = false;
     let mut found_pump_buy = false;
     let mut cu_limit: u32 = 0;
@@ -537,6 +548,10 @@ fn try_parse_pump_buy(
                         if amount == u64::MAX { 0 } else { amount }
                     };
                     base_token_amount = tokens;
+                    // The cap as SENT (pre realised-spend correction). For
+                    // exact-out this is max_quote_amount_in; for exact-in it is
+                    // quote_amount_in (== sol_in). Priced by the dashboard.
+                    declared_quote_lamports = amount;
                     is_buy_exact_in = exact_in;
                     found_pump_buy = true;
                 }
@@ -605,6 +620,7 @@ fn try_parse_pump_buy(
                                 .unwrap_or(amount)
                         };
                         base_token_amount = tokens;
+                        declared_quote_lamports = amount;
                         is_buy_exact_in = exact_in;
                         found_pump_buy = true;
                         break 'inner_search;
@@ -628,6 +644,7 @@ fn try_parse_pump_buy(
         pool: pool.to_string(),
         sol_in_lamports,
         base_token_amount,
+        declared_quote_lamports,
         is_buy_exact_in,
         cu_limit,
         cu_price,
