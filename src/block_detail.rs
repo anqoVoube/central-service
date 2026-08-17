@@ -83,6 +83,14 @@ pub struct BuyAttempt {
     /// SOL lamports the buyer committed. `BuyExactIn` → `quote_amount_in`;
     /// `Buy` → `max_quote_amount_in`. Both are the upper-bound SOL spend.
     pub sol_in_lamports: u64,
+    /// The fixed token leg (raw base units): `base_amount_out` on an exact-out
+    /// `Buy`, `min_base_amount_out` on `BuyExactIn`. `sol_in_lamports` divided
+    /// by this is the worst SOL-per-token price the buyer signed — the "max
+    /// buy price" the dashboard shows. 0 when the ix data was unreadable.
+    /// `#[serde(default)]` so pre-existing cached rows keep deserialising
+    /// (a bincode miss just re-resolves the block from RPC).
+    #[serde(default)]
+    pub base_token_amount: u64,
     /// `true` if BuyExactIn; `false` if Buy (exact-out).
     pub is_buy_exact_in: bool,
     /// `ComputeBudget::SetComputeUnitLimit` value. 0 if no such ix.
@@ -487,6 +495,7 @@ fn try_parse_pump_buy(
     let sys_pk: Pubkey = SYSTEM_PROGRAM.parse().ok()?;
 
     let mut sol_in_lamports: u64 = 0;
+    let mut base_token_amount: u64 = 0;
     let mut is_buy_exact_in = false;
     let mut found_pump_buy = false;
     let mut cu_limit: u32 = 0;
@@ -501,7 +510,7 @@ fn try_parse_pump_buy(
         };
 
         if *prog == pump_pk {
-            if let Some((amount, exact_in)) = parse_pump_buy_data(&ix.data) {
+            if let Some((amount, tokens, exact_in)) = parse_pump_buy_data(&ix.data) {
                 let pool_idx = ix.accounts.first().copied().unwrap_or(0) as usize;
                 let Some(ix_pool) = all_keys.get(pool_idx) else {
                     continue;
@@ -527,6 +536,7 @@ fn try_parse_pump_buy(
                         // it stays 0 and the page renders it as unknown.
                         if amount == u64::MAX { 0 } else { amount }
                     };
+                    base_token_amount = tokens;
                     is_buy_exact_in = exact_in;
                     found_pump_buy = true;
                 }
@@ -577,7 +587,7 @@ fn try_parse_pump_buy(
                     let Ok(data) = bs58::decode(&c.data).into_vec() else {
                         continue;
                     };
-                    let Some((amount, exact_in)) = parse_pump_buy_data(&data) else {
+                    let Some((amount, tokens, exact_in)) = parse_pump_buy_data(&data) else {
                         continue;
                     };
                     let pool_idx = c.accounts.first().copied().unwrap_or(0) as usize;
@@ -594,6 +604,7 @@ fn try_parse_pump_buy(
                             pool_quote_vault_delta(&tx.meta, &c.accounts)
                                 .unwrap_or(amount)
                         };
+                        base_token_amount = tokens;
                         is_buy_exact_in = exact_in;
                         found_pump_buy = true;
                         break 'inner_search;
@@ -616,6 +627,7 @@ fn try_parse_pump_buy(
         success,
         pool: pool.to_string(),
         sol_in_lamports,
+        base_token_amount,
         is_buy_exact_in,
         cu_limit,
         cu_price,
@@ -710,20 +722,25 @@ fn loaded_addresses(
 
 /// PumpFun BUY: `[disc(8), base_amount_out(8), max_quote_amount_in(8), ...]`.
 /// PumpFun BUY_EXACT_IN: `[disc(8), quote_amount_in(8), min_base_amount_out(8), ...]`.
-/// Returns `(sol_in_lamports, is_buy_exact_in)`.
-fn parse_pump_buy_data(data: &[u8]) -> Option<(u64, bool)> {
+/// Returns `(sol_in_lamports, base_token_amount, is_buy_exact_in)`, where the
+/// token side is the fixed leg of the swap: `base_amount_out` they will receive
+/// on an exact-out `Buy`, or the `min_base_amount_out` floor on `BuyExactIn`.
+/// `sol_in / base_token_amount` is the worst (max) SOL-per-token price signed.
+fn parse_pump_buy_data(data: &[u8]) -> Option<(u64, u64, bool)> {
     if data.len() < 24 {
         return None;
     }
     let disc: [u8; 8] = data[0..8].try_into().ok()?;
     if disc == PUMP_PREFIX_BUY_EXACT_IN {
-        // quote_amount_in (SOL in)
-        let amt = u64::from_le_bytes(data[8..16].try_into().ok()?);
-        Some((amt, true))
+        // quote_amount_in (SOL in), min_base_amount_out (token floor)
+        let sol = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let tokens = u64::from_le_bytes(data[16..24].try_into().ok()?);
+        Some((sol, tokens, true))
     } else if disc == PUMP_PREFIX_BUY {
-        // max_quote_amount_in (SOL upper bound)
-        let amt = u64::from_le_bytes(data[16..24].try_into().ok()?);
-        Some((amt, false))
+        // base_amount_out (tokens out), max_quote_amount_in (SOL upper bound)
+        let tokens = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let sol = u64::from_le_bytes(data[16..24].try_into().ok()?);
+        Some((sol, tokens, false))
     } else {
         None
     }
