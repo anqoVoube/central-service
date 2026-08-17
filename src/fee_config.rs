@@ -430,8 +430,8 @@ pub struct CopyTradingV2 {
     /// JITO bundle tip as a percent of that same largest combo.
     #[serde(default = "d_over_pct")]
     pub jito_over_pct: u64,
-    /// HARMONIC bundle priority fee as a percent of the competitor's SMALLEST
-    /// fan-out priority fee.
+    /// HARMONIC bundle priority fee as a percent of the competitor's LARGEST combo
+    /// (same base as tip & jito).
     #[serde(default = "d_over_pct")]
     pub harmonic_over_pct: u64,
 
