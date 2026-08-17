@@ -422,6 +422,19 @@ pub struct CopyTradingV2 {
     #[serde(default = "d_max_open")]
     pub max_open_positions: u32,
 
+    // ---- per-lane bid over-percents (110 = +10%) ----
+    /// TIP as a percent of the competitor's LARGEST fan-out combo, on the
+    /// tip-bearing HTTP senders.
+    #[serde(default = "d_over_pct")]
+    pub tip_over_pct: u64,
+    /// JITO bundle tip as a percent of that same largest combo.
+    #[serde(default = "d_over_pct")]
+    pub jito_over_pct: u64,
+    /// HARMONIC bundle priority fee as a percent of the competitor's SMALLEST
+    /// fan-out priority fee.
+    #[serde(default = "d_over_pct")]
+    pub harmonic_over_pct: u64,
+
     // ---- which services the BUY fan-out goes to ----
     /// FREE group — tip-bearing services + jito. Carry the FREE (tip-heavy,
     /// `tip >= fee`) copied bids. The exit always uses the tip-bearing services.
@@ -453,6 +466,7 @@ fn d_sell_tip() -> f64 { 0.001 }
 fn d_sell_fee() -> f64 { 0.0001 }
 fn d_sell_slip() -> u32 { 3_000 }
 fn d_max_open() -> u32 { 10 }
+fn d_over_pct() -> u64 { 110 }
 fn d_variants() -> Vec<FeeTipSplit> {
     vec![
         FeeTipSplit { fee_pct: 80, tip_pct: 20 },
@@ -476,6 +490,9 @@ impl Default for CopyTradingV2 {
             sell_priority_fee_sol: d_sell_fee(),
             sell_slippage_bps: d_sell_slip(),
             max_open_positions: d_max_open(),
+            tip_over_pct: d_over_pct(),
+            jito_over_pct: d_over_pct(),
+            harmonic_over_pct: d_over_pct(),
             use_free: d_true(),
             use_paid: d_true(),
             fire_leader_whitelist: Vec::new(),
@@ -512,6 +529,15 @@ impl CopyTradingV2 {
         }
         if self.max_open_positions == 0 {
             return Err("max open positions must be >= 1".into());
+        }
+        for (label, pct) in [
+            ("tip", self.tip_over_pct),
+            ("jito", self.jito_over_pct),
+            ("harmonic", self.harmonic_over_pct),
+        ] {
+            if !(1..=100_000).contains(&pct) {
+                return Err(format!("{label} over-percent must be in [1, 100000] (got {pct})"));
+            }
         }
         // Refused here rather than at fire time. With neither group the buy has
         // nowhere to go, and the bot would discover that one opportunity at a
