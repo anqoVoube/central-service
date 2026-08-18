@@ -9,6 +9,7 @@ pub mod zeroslot;
 pub mod backfill;
 pub mod bans;
 pub mod block_detail;
+pub mod blue_leaders;
 pub mod config;
 pub mod copysells;
 pub mod copytrades;

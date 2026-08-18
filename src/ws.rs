@@ -1322,6 +1322,24 @@ async fn serve_copy_trades(
                     "marked2".to_owned(),
                     serde_json::Value::Bool(state.copy_trades.is_marked2(&t.buy_sig)),
                 );
+                // Blue star: OUR-slot leader is in the mriya landed-validator
+                // set. `buy_sig` is our buy, so its block's leader IS the leader
+                // of `our_slot`. Cache-only lookup so the render never blocks;
+                // on a miss (only meaningful once the buy actually landed) we
+                // kick a deduped background resolve so the next poll has it.
+                let blue = if t.buy_sig.is_empty() || t.our_slot.is_none() {
+                    false
+                } else if let Some(pk) = state.leaders.cached_leader(&t.buy_sig) {
+                    crate::blue_leaders::is_blue(&pk)
+                } else {
+                    let leaders = state.leaders.clone();
+                    let sig = t.buy_sig.clone();
+                    tokio::spawn(async move {
+                        let _ = leaders.resolve(&sig).await;
+                    });
+                    false
+                };
+                obj.insert("blue".to_owned(), serde_json::Value::Bool(blue));
             }
             v
         })

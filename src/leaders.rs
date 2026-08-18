@@ -151,6 +151,14 @@ impl LeaderStore {
         rpc.get_slot_leaders(slot, 1).await.ok()?.into_iter().next()
     }
 
+    /// Cache-only leader lookup: returns the resolved identity if it is already
+    /// in sled, `None` otherwise — never touches the RPC. The dashboard uses
+    /// this on the copy-trades serve path so a page render never blocks on
+    /// resolution; a miss is backfilled in the background via `resolve`.
+    pub fn cached_leader(&self, sig_str: &str) -> Option<Pubkey> {
+        self.cache_get(sig_str)
+    }
+
     fn cache_get(&self, sig_str: &str) -> Option<Pubkey> {
         let parsed: Signature = sig_str.parse().ok()?;
         let v = self.inner.db.get(parsed.as_ref()).ok()??;
