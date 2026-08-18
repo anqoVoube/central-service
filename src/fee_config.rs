@@ -422,6 +422,11 @@ pub struct CopyTradingV2 {
     #[serde(default = "d_max_open")]
     pub max_open_positions: u32,
 
+    /// Buy price ceiling as a percent ABOVE our own intended spend:
+    /// `our_sol_in * (1 + buy_ceiling_pct%)`. Regulated by OUR volume, not theirs.
+    #[serde(default = "d_buy_ceiling")]
+    pub buy_ceiling_pct: f64,
+
     // ---- per-lane bid over-percents (110 = +10%) ----
     /// TIP as a percent of the competitor's LARGEST fan-out combo, on the
     /// tip-bearing HTTP senders.
@@ -467,6 +472,7 @@ fn d_sell_fee() -> f64 { 0.0001 }
 fn d_sell_slip() -> u32 { 3_000 }
 fn d_max_open() -> u32 { 10 }
 fn d_over_pct() -> u64 { 110 }
+fn d_buy_ceiling() -> f64 { 3.0 }
 fn d_variants() -> Vec<FeeTipSplit> {
     vec![
         FeeTipSplit { fee_pct: 80, tip_pct: 20 },
@@ -490,6 +496,7 @@ impl Default for CopyTradingV2 {
             sell_priority_fee_sol: d_sell_fee(),
             sell_slippage_bps: d_sell_slip(),
             max_open_positions: d_max_open(),
+            buy_ceiling_pct: d_buy_ceiling(),
             tip_over_pct: d_over_pct(),
             jito_over_pct: d_over_pct(),
             harmonic_over_pct: d_over_pct(),
@@ -529,6 +536,9 @@ impl CopyTradingV2 {
         }
         if self.max_open_positions == 0 {
             return Err("max open positions must be >= 1".into());
+        }
+        if !(0.0..=100.0).contains(&self.buy_ceiling_pct) {
+            return Err("buy ceiling % must be in [0, 100]".into());
         }
         for (label, pct) in [
             ("tip", self.tip_over_pct),
