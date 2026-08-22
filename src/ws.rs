@@ -306,6 +306,20 @@ enum ClientMsg {
         #[serde(default)]
         priority_fee_lamports: u64,
     },
+    /// RAW all-swaps feed: a bot saw one orderflow tx touch a DEX program.
+    /// Unresolved and unparsed — central just appends it to a bounded in-memory
+    /// ring (`SwapSeenRing`), NO on-chain resolve, NO disk. Reported by every
+    /// location; deduped by sig.
+    OrderflowSwapSeen {
+        sig: String,
+        venue: String,
+        /// The tx signer / fee payer.
+        dumper: String,
+        #[serde(default)]
+        loc: u8,
+        #[serde(default)]
+        ts_ms: u64,
+    },
     /// The SECONDARY copy-trading bot mirrored a trader's buy. Central stores
     /// it and resolves whether we landed before or after the trader — the
     /// front-run check that gates taking this bot out of test.
@@ -576,6 +590,10 @@ struct AppState {
     /// Live per-location fire records for the copy-trade race view. In-memory
     /// only — constructed in `serve`, never persisted.
     v2_attempts: V2AttemptStore,
+    /// RAW all-swaps feed: a bounded in-memory ring of every orderflow tx that
+    /// touched a DEX program, deduped by sig, NO on-chain resolve. In-memory
+    /// only — volatile by design (see `SwapSeenRing`).
+    swaps: crate::orderflow::SwapSeenRing,
     /// Authoritative fleet firing switch: `-1` = never set by an operator,
     /// `0` = off, `1` = on. Persisted to a file so a central restart keeps it,
     /// and replayed to every box on connect — that is what makes ONE toggle
@@ -646,6 +664,8 @@ pub async fn serve(
         auto_unwrap_config,
         // ~4k recent opportunities' race records; older ones evict silently.
         v2_attempts: V2AttemptStore::new(4096),
+        // Last ~8k raw swaps across all venues; older ones rotate out.
+        swaps: crate::orderflow::SwapSeenRing::new(8_000),
         copy_v2_enabled: Arc::new(std::sync::atomic::AtomicI8::new(load_copy_v2_enabled())),
     };
     println!(
@@ -690,6 +710,7 @@ pub async fn serve(
         .route("/tip-priority.bin", get(serve_tip_priority_snapshot))
         .route("/fee-priority.bin", get(serve_fee_priority_snapshot))
         .route("/orderflow.json", get(serve_orderflow))
+        .route("/orderflow-swaps.json", get(serve_orderflow_swaps))
         .route("/copytrades.json", get(serve_copy_trades))
         .route("/copytrades/mark", post(serve_copy_trade_mark))
         .route("/copysells.json", get(serve_copy_sells))
@@ -1099,6 +1120,30 @@ async fn serve_orderflow(
         "has_more": has_more,
         "filtered": filtered,
         "count": rows.len(),
+        "events": rows,
+    }))
+    .into_response()
+}
+
+/// `GET /orderflow-swaps.json?limit=N` — the RAW all-swaps feed: a bounded
+/// in-memory ring of every orderflow tx that touched a DEX program, newest
+/// first, UNRESOLVED and UNPARSED (venue + sig + signer only). Volatile —
+/// empty after a central restart. IP-whitelisted.
+async fn serve_orderflow_swaps(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<OrderflowQuery>,
+) -> Response {
+    if !state.whitelist.contains(&addr.ip()) {
+        let ip = addr.ip();
+        tracing::warn!("rejecting orderflow-swaps.json from non-whitelisted ip {ip}");
+        return (StatusCode::FORBIDDEN, "not whitelisted").into_response();
+    }
+    let limit = q.limit.unwrap_or(500).clamp(1, 8_000);
+    let rows = state.swaps.recent(limit);
+    Json(serde_json::json!({
+        "count": rows.len(),
+        "total_in_ring": state.swaps.len(),
         "events": rows,
     }))
     .into_response()
@@ -2281,6 +2326,18 @@ async fn handle_socket(socket: WebSocket, addr: SocketAddr, state: AppState) {
                             sig, venue, side, pool, dumper, amount_in, min_amount_out, loc, ts,
                             tip_lamports, cu_price, cu_limit, priority_fee_lamports,
                         );
+                    }
+                    Ok(ClientMsg::OrderflowSwapSeen { sig, venue, dumper, loc, ts_ms }) => {
+                        // Raw all-swaps feed: append to the bounded ring, no
+                        // resolve, no disk. Deduped by sig inside `push`.
+                        let ts = if ts_ms > 0 { ts_ms } else { now_unix_ms() };
+                        state.swaps.push(crate::orderflow::SwapSeen {
+                            ts_ms: ts,
+                            sig,
+                            venue,
+                            dumper,
+                            loc,
+                        });
                     }
                     Ok(ClientMsg::CopyTradeOpened {
                         build_us, trader_attempts,

@@ -19,11 +19,88 @@
 //! order and the reader can just take the tail.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+/// A single "swap seen" row for the RAW all-swaps feed.
+///
+/// Deliberately minimal and UNRESOLVED: the bot emits one per orderflow tx that
+/// touches any DEX program, with NO on-chain resolution. See `SwapSeenRing`.
+#[derive(Clone, Serialize)]
+pub struct SwapSeen {
+    pub ts_ms: u64,
+    pub sig: String,
+    pub venue: String,
+    /// The tx fee-payer / signer.
+    pub dumper: String,
+    pub loc: u8,
+}
+
+/// Bounded, in-memory, deduped ring of RAW swap detections — the "all swaps"
+/// feed the operator asked for.
+///
+/// This is DELIBERATELY separate from `OrderflowStore`. The orderflow stream is
+/// the full unfiltered Nozomi firehose (thousands of tx/s), so routing every
+/// swap through `OrderflowStore` — which spawns a per-tx RPC resolve and writes
+/// a growing sled tree that the serve path range-scans — would stall central
+/// (the same failure the cached `count()` fixed, at 1000x). Instead this keeps
+/// only the last `cap` swaps in a `VecDeque`, does NO RPC and NO disk, and
+/// dedups by sig (every location reports the same tx). Rate-safe: it just
+/// rotates. Volatile by design — a restart starts empty.
+pub struct SwapSeenRing {
+    inner: Arc<Mutex<SwapRingInner>>,
+}
+
+struct SwapRingInner {
+    ring: VecDeque<SwapSeen>,
+    seen: HashSet<String>,
+    cap: usize,
+}
+
+impl SwapSeenRing {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SwapRingInner {
+                ring: VecDeque::with_capacity(cap.min(16_384)),
+                seen: HashSet::new(),
+                cap: cap.max(1),
+            })),
+        }
+    }
+
+    /// Append one swap, deduped by sig. Rotates out the oldest past `cap`.
+    pub fn push(&self, s: SwapSeen) {
+        let mut g = self.inner.lock().unwrap();
+        if !g.seen.insert(s.sig.clone()) {
+            return; // already have this tx (another location reported it)
+        }
+        g.ring.push_back(s);
+        while g.ring.len() > g.cap {
+            if let Some(old) = g.ring.pop_front() {
+                g.seen.remove(&old.sig);
+            }
+        }
+    }
+
+    /// The most recent `limit` swaps, newest first.
+    pub fn recent(&self, limit: usize) -> Vec<SwapSeen> {
+        let g = self.inner.lock().unwrap();
+        g.ring.iter().rev().take(limit).cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().ring.len()
+    }
+}
+
+impl Clone for SwapSeenRing {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -46,8 +123,9 @@ const PRUNE_EVERY: u64 = 4_096;
 /// The operator-tracked dumper wallets. Two roles:
 ///  1. INGEST — their never-landed detections are kept (everyone else's are
 ///     dropped as noise; landed/failed are stored for every dumper).
-///  2. SERVE — `page_filtered` returns ONLY these wallets, so the /orderflow
-///     page shows just the tracked competitors and nothing else.
+///  2. SERVE — `page_filtered` shows these wallets in full (buys AND sells),
+///     PLUS any wallet's BUY (the whale-buy feed). Untracked SELLS stay
+///     hidden: the dump path emits one per orderflow sell and they are noise.
 /// Keep this in sync with `copy_trading_v2.competitors` in the fee config.
 const KEEP_NOT_LANDED_DUMPERS: &[&str] = &[
     "hnu5iBK8UoHb51UFsH1RYTUAYdrhjHvV5YMTf9T1CYN",
@@ -326,8 +404,9 @@ impl OrderflowStore {
             let Some(r) = decode_row(&v) else {
                 continue;
             };
-            // Only the operator-tracked dumpers are ever shown on /orderflow.
-            if !KEEP_NOT_LANDED_DUMPERS.contains(&r.dumper.as_str()) {
+            // Tracked dumpers show in full; any other wallet shows only its
+            // BUYS (the whale feed). Untracked sells are dump-path noise.
+            if !KEEP_NOT_LANDED_DUMPERS.contains(&r.dumper.as_str()) && r.side != "buy" {
                 continue;
             }
             if let Some(want) = status {
