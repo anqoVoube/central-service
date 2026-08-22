@@ -450,6 +450,11 @@ pub struct CopyTradingV2 {
     /// only reaches marked (whitelisted) leaders — see the fire gate.
     #[serde(default = "d_true")]
     pub use_paid: bool,
+    /// Reserve-free fallback: when central has not onboarded a pool
+    /// (`pool_not_ready`), the bot builds the copy buy off the COMPETITOR's own
+    /// instruction accounts instead of skipping. PumpFun only. Off by default.
+    #[serde(default = "d_false")]
+    pub use_ix_fallback: bool,
     /// Validator identities the copy strategy is allowed to fire on. When the
     /// upcoming slot's leader is not one of these, the fire is skipped. EMPTY =
     /// gate off (fire on every leader). Served to the bot, which seeds its
@@ -502,6 +507,7 @@ impl Default for CopyTradingV2 {
             harmonic_over_pct: d_over_pct(),
             use_free: d_true(),
             use_paid: d_true(),
+            use_ix_fallback: d_false(),
             fire_leader_whitelist: Vec::new(),
         }
     }
