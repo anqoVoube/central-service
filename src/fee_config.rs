@@ -201,6 +201,9 @@ pub struct FeeConfig {
     /// either branch still loads.
     #[serde(default)]
     pub copy_trading_v2: CopyTradingV2,
+    /// The second, simple copy bot. See `CopySimple`.
+    #[serde(default)]
+    pub copy_simple: CopySimple,
     /// Partial-sell tiers (Usual / Fast schedules per buy-size bucket).
     /// Mirrors `statics::FeeConfig::partial_sell_tiers`. Tiers must be
     /// sorted ascending by `max_sol_lamports`; last tier uses
@@ -360,6 +363,100 @@ pub struct ProfileVariations {
 pub struct FeeTipSplit {
     pub fee_pct: u32,
     pub tip_pct: u32,
+}
+
+/// copy-simple — the second, deliberately simple copy bot.
+///
+/// Separate from `CopyTradingV2` rather than a mode of it, because the two
+/// invert each other: this one sends through jito/nozomi/harmonic (which v2
+/// excludes), reports every dispatch to Nozomi (which v2 must never do), and
+/// backruns instead of racing for block position. Sharing a config block would
+/// make every field ambiguous about which bot it governs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CopySimple {
+    /// Wallets to follow. The MAIN bot reads this too, to know which events are
+    /// worth forwarding over the local feed.
+    #[serde(default)]
+    pub competitors: Vec<String>,
+
+    /// Our buy size as a percentage of THEIR `amount_in`.
+    #[serde(default = "cs_buy_pct")]
+    pub buy_pct_of_theirs: f64,
+    /// Our tip as a percentage of their HIGHEST fan-out tip.
+    ///
+    /// Under 100 on purpose: we want to land behind them, not ahead. This bot
+    /// backruns, so out-tipping the wallet it follows is a cost with no
+    /// benefit.
+    #[serde(default = "cs_tip_pct")]
+    pub tip_pct_of_theirs: f64,
+    /// Hard ceiling on the tip, in SOL, after the percentage is applied.
+    #[serde(default = "cs_max_tip")]
+    pub max_tip_sol: f64,
+
+    /// Ignore their buys below this many SOL. `0` = off.
+    #[serde(default)]
+    pub min_competitor_sol_in: f64,
+    /// Ignore their buys above this many SOL. `0` = no cap.
+    #[serde(default)]
+    pub max_competitor_sol_in: f64,
+
+    #[serde(default = "cs_max_open")]
+    pub max_open_positions: u32,
+    #[serde(default = "cs_buy_slip")]
+    pub buy_slippage_bps: u32,
+    #[serde(default = "cs_sell_slip")]
+    pub sell_slippage_bps: u32,
+}
+
+fn cs_buy_pct() -> f64 { 1.0 }
+fn cs_tip_pct() -> f64 { 50.0 }
+fn cs_max_tip() -> f64 { 0.05 }
+fn cs_max_open() -> u32 { 10 }
+fn cs_buy_slip() -> u32 { 1_500 }
+fn cs_sell_slip() -> u32 { 3_000 }
+
+impl Default for CopySimple {
+    fn default() -> Self {
+        Self {
+            competitors: Vec::new(),
+            buy_pct_of_theirs: cs_buy_pct(),
+            tip_pct_of_theirs: cs_tip_pct(),
+            max_tip_sol: cs_max_tip(),
+            min_competitor_sol_in: 0.0,
+            max_competitor_sol_in: 0.0,
+            max_open_positions: cs_max_open(),
+            buy_slippage_bps: cs_buy_slip(),
+            sell_slippage_bps: cs_sell_slip(),
+        }
+    }
+}
+
+impl CopySimple {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.buy_pct_of_theirs > 0.0 && self.buy_pct_of_theirs <= 100.0) {
+            return Err("copy-simple buy % must be in (0, 100]".into());
+        }
+        if !(self.tip_pct_of_theirs >= 0.0 && self.tip_pct_of_theirs <= 1_000.0) {
+            return Err("copy-simple tip % must be in [0, 1000]".into());
+        }
+        if self.max_tip_sol < 0.0 {
+            return Err("copy-simple max tip must be >= 0".into());
+        }
+        if self.max_competitor_sol_in > 0.0
+            && self.min_competitor_sol_in > self.max_competitor_sol_in
+        {
+            return Err("copy-simple min size must be <= max (0 = no cap)".into());
+        }
+        if self.max_open_positions == 0 {
+            return Err("copy-simple max open positions must be >= 1".into());
+        }
+        for w in &self.competitors {
+            if w.parse::<solana_sdk::pubkey::Pubkey>().is_err() {
+                return Err(format!("copy-simple: not a valid pubkey: {w}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Copy-trading v2 — the whole strategy of the `copy-trading` branch.
@@ -802,6 +899,7 @@ pub fn default_fee_config() -> FeeConfig {
         ttp_ttl_secs: default_ttp_ttl_secs(),
         copy_trading: CopyTrading::default(),
             copy_trading_v2: CopyTradingV2::default(),
+            copy_simple: CopySimple::default(),
         partial_sell_tiers: default_partial_sell_tiers(),
     }
 }
