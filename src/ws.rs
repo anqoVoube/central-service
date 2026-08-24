@@ -1552,6 +1552,14 @@ async fn serve_fee_config_set(
     // as gospel, so a config that would trade wrongly — variants that do not
     // sum to 100, a size outside (0,100], an unparseable wallet — has to be
     // refused at the door rather than persisted and broadcast.
+    if let Err(e) = cfg.copy_simple.validate() {
+        tracing::warn!("rejecting fee-config: {e}");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response();
+    }
     if let Err(e) = cfg.copy_trading_v2.validate() {
         tracing::warn!("rejecting fee-config: {e}");
         return (
