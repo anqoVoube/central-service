@@ -408,6 +408,21 @@ pub struct CopySimple {
     #[serde(default = "cs_sell_tip")]
     pub sell_tip_sol: f64,
 
+    /// Floor under the tip, in SOL.
+    ///
+    /// Our tip is a percentage of theirs, and theirs is sometimes zero — a
+    /// wallet that bids priority fee instead of a tip is ordinary. Both senders
+    /// this bot uses are tip-gated, so a zero tip is not a cheap transaction,
+    /// it is a transaction neither of them will forward.
+    #[serde(default = "cs_min_tip")]
+    pub min_tip_sol: f64,
+    /// Priority fee on entries, in micro-lamports per compute unit.
+    ///
+    /// The tip buys a place in a sender's queue; this is what orders us inside
+    /// the block once we are there. At the 150k CU limit, 500_000 works out to
+    /// 0.000075 SOL.
+    #[serde(default = "cs_buy_cu_price")]
+    pub buy_cu_price: u64,
     #[serde(default = "cs_max_open")]
     pub max_open_positions: u32,
     #[serde(default = "cs_buy_slip")]
@@ -420,6 +435,8 @@ fn cs_buy_pct() -> f64 { 1.0 }
 fn cs_tip_pct() -> f64 { 50.0 }
 fn cs_max_tip() -> f64 { 0.05 }
 fn cs_sell_tip() -> f64 { 0.001 }
+fn cs_min_tip() -> f64 { 0.0005 }
+fn cs_buy_cu_price() -> u64 { 500_000 }
 fn cs_max_open() -> u32 { 10 }
 fn cs_buy_slip() -> u32 { 1_500 }
 fn cs_sell_slip() -> u32 { 3_000 }
@@ -434,6 +451,8 @@ impl Default for CopySimple {
             min_competitor_sol_in: 0.0,
             max_competitor_sol_in: 0.0,
             sell_tip_sol: cs_sell_tip(),
+            min_tip_sol: cs_min_tip(),
+            buy_cu_price: cs_buy_cu_price(),
             max_open_positions: cs_max_open(),
             buy_slippage_bps: cs_buy_slip(),
             sell_slippage_bps: cs_sell_slip(),
@@ -457,6 +476,18 @@ impl CopySimple {
         // not scaled down by anything downstream — it is simply the tip.
         if !(self.sell_tip_sol >= 0.0 && self.sell_tip_sol <= 1.0) {
             return Err("copy-simple sell tip must be in [0, 1] SOL".into());
+        }
+        if !(self.min_tip_sol >= 0.0 && self.min_tip_sol <= 1.0) {
+            return Err("copy-simple min tip must be in [0, 1] SOL".into());
+        }
+        // The floor is clamped to the cap at use, so this is not a correctness
+        // hazard — but a config that says both is a config someone got wrong,
+        // and saying so beats silently ignoring half of it.
+        if self.max_tip_sol > 0.0 && self.min_tip_sol > self.max_tip_sol {
+            return Err("copy-simple min tip must be <= max tip".into());
+        }
+        if self.buy_cu_price > 50_000_000 {
+            return Err("copy-simple buy CU price must be <= 50,000,000".into());
         }
         if self.max_competitor_sol_in > 0.0
             && self.min_competitor_sol_in > self.max_competitor_sol_in
