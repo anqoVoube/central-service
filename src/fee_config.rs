@@ -400,6 +400,14 @@ pub struct CopySimple {
     #[serde(default)]
     pub max_competitor_sol_in: f64,
 
+    /// Fixed tip on exits.
+    ///
+    /// Entries scale their tip from the competitor's, but a `Sell` event
+    /// carries no tip of theirs to scale from — and an exit that cannot land
+    /// is worse than one that overpays slightly.
+    #[serde(default = "cs_sell_tip")]
+    pub sell_tip_sol: f64,
+
     #[serde(default = "cs_max_open")]
     pub max_open_positions: u32,
     #[serde(default = "cs_buy_slip")]
@@ -411,6 +419,7 @@ pub struct CopySimple {
 fn cs_buy_pct() -> f64 { 1.0 }
 fn cs_tip_pct() -> f64 { 50.0 }
 fn cs_max_tip() -> f64 { 0.05 }
+fn cs_sell_tip() -> f64 { 0.001 }
 fn cs_max_open() -> u32 { 10 }
 fn cs_buy_slip() -> u32 { 1_500 }
 fn cs_sell_slip() -> u32 { 3_000 }
@@ -424,6 +433,7 @@ impl Default for CopySimple {
             max_tip_sol: cs_max_tip(),
             min_competitor_sol_in: 0.0,
             max_competitor_sol_in: 0.0,
+            sell_tip_sol: cs_sell_tip(),
             max_open_positions: cs_max_open(),
             buy_slippage_bps: cs_buy_slip(),
             sell_slippage_bps: cs_sell_slip(),
@@ -441,6 +451,12 @@ impl CopySimple {
         }
         if self.max_tip_sol < 0.0 {
             return Err("copy-simple max tip must be >= 0".into());
+        }
+        // Bounded above as well as below. This one is a flat number of SOL
+        // rather than a percentage of anything, so a stray keystroke here is
+        // not scaled down by anything downstream — it is simply the tip.
+        if !(self.sell_tip_sol >= 0.0 && self.sell_tip_sol <= 1.0) {
+            return Err("copy-simple sell tip must be in [0, 1] SOL".into());
         }
         if self.max_competitor_sol_in > 0.0
             && self.min_competitor_sol_in > self.max_competitor_sol_in
