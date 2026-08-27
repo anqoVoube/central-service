@@ -43,3 +43,6 @@ yellowstone-grpc-geyser/config-test.json
 scripts
 .claude
 .env
+
+# Keypair-bearing env files (nonce.env holds a wallet secret)
+*.env
