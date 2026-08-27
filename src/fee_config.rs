@@ -566,8 +566,11 @@ pub struct CopyTradingV2 {
     #[serde(default = "d_max_open")]
     pub max_open_positions: u32,
 
-    /// Buy price ceiling as a percent ABOVE our own intended spend:
-    /// `our_sol_in * (1 + buy_ceiling_pct%)`. Regulated by OUR volume, not theirs.
+    /// Buy PRICE ceiling as a SIGNED percent relative to the COMPETITOR's price:
+    /// positive = that far BELOW their price (undercut, revert unless we buy that
+    /// much cheaper than they did), negative = that far ABOVE it (premium, accept
+    /// fewer tokens and pay up to `|pct|`% more than they did). 0.4 = 0.4% below;
+    /// -0.1 = 0.1% above; 0 = exactly their price.
     #[serde(default = "d_buy_ceiling")]
     pub buy_ceiling_pct: f64,
 
@@ -583,6 +586,11 @@ pub struct CopyTradingV2 {
     /// (same base as tip & jito).
     #[serde(default = "d_over_pct")]
     pub harmonic_over_pct: u64,
+    /// PAID (fee-only) leg priority fee as a percent of OUR OWN entry volume
+    /// (`our_sol_in`), NOT the competitor's fee. 0.6 = 0.6% of our entry, capped
+    /// at `max_priority_fee_sol`. The tip-bearing leg is unaffected.
+    #[serde(default = "d_fee_only_vol")]
+    pub fee_only_vol_pct: f64,
 
     // ---- which services the BUY fan-out goes to ----
     /// FREE group — tip-bearing services + jito. Carry the FREE (tip-heavy,
@@ -621,6 +629,7 @@ fn d_sell_fee() -> f64 { 0.0001 }
 fn d_sell_slip() -> u32 { 3_000 }
 fn d_max_open() -> u32 { 10 }
 fn d_over_pct() -> u64 { 110 }
+fn d_fee_only_vol() -> f64 { 0.6 }
 fn d_buy_ceiling() -> f64 { 3.0 }
 fn d_variants() -> Vec<FeeTipSplit> {
     vec![
@@ -649,6 +658,7 @@ impl Default for CopyTradingV2 {
             tip_over_pct: d_over_pct(),
             jito_over_pct: d_over_pct(),
             harmonic_over_pct: d_over_pct(),
+            fee_only_vol_pct: d_fee_only_vol(),
             use_free: d_true(),
             use_paid: d_true(),
             use_ix_fallback: d_false(),
@@ -687,8 +697,14 @@ impl CopyTradingV2 {
         if self.max_open_positions == 0 {
             return Err("max open positions must be >= 1".into());
         }
-        if !(0.0..=100.0).contains(&self.buy_ceiling_pct) {
-            return Err("buy ceiling % must be in [0, 100]".into());
+        // Signed: negative is a PREMIUM above the competitor's price, which is a
+        // deliberate setting, not a typo. Bounded at -5 because a premium larger
+        // than that stops being a copy and starts being a bid of our own.
+        if !(-5.0..=100.0).contains(&self.buy_ceiling_pct) {
+            return Err("buy ceiling % must be in [-5, 100]".into());
+        }
+        if !(0.0..=10.0).contains(&self.fee_only_vol_pct) {
+            return Err("fee-only volume % must be in [0, 10]".into());
         }
         for (label, pct) in [
             ("tip", self.tip_over_pct),
@@ -1100,5 +1116,55 @@ impl FeeConfigFile {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_config_tests {
+    use super::*;
+
+    /// The exact `copy_trading_v2` block the production hub is serving today.
+    ///
+    /// It exists because this struct was edited on the server and never
+    /// committed, so the branch and the live config had drifted apart: the
+    /// stored `buy_ceiling_pct` of -0.1 would have been REFUSED by the branch's
+    /// old [0, 100] validation, and `fee_only_vol_pct` would have been dropped
+    /// on the next save. Both are load-bearing on an earning bot.
+    #[test]
+    fn the_live_config_survives_this_build() {
+        // Captured from the hub's /fee-config.json. The competitor list is
+        // abbreviated; nothing else is changed.
+        let raw = r#"{
+          "competitors": ["popo3Rj6arKNttyUFpWfbkv2gG8uS13TGtmH6JPMuHz",
+                          "13VK7ZrRrx1uZ4Frm2TjacNsbipun21qqifE8wibPVys"],
+          "min_competitor_sol_in": 5.0, "max_competitor_sol_in": 14.0,
+          "variants": [{"fee_pct": 80, "tip_pct": 20}, {"fee_pct": 20, "tip_pct": 80}],
+          "max_tip_sol": 0.4, "max_priority_fee_sol": 1.0,
+          "case_a_window_ms": 1500, "timer_secs": 5,
+          "sell_tip_sol": 0.0001, "sell_priority_fee_sol": 0.0001,
+          "sell_slippage_bps": 3000, "max_open_positions": 10,
+          "buy_ceiling_pct": -0.1,
+          "tip_over_pct": 300, "jito_over_pct": 300, "harmonic_over_pct": 300,
+          "fee_only_vol_pct": 0.8,
+          "use_free": true, "use_paid": false, "use_ix_fallback": false
+        }"#;
+        let v: CopyTradingV2 = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(v.buy_ceiling_pct, -0.1, "the premium must survive");
+        assert_eq!(v.fee_only_vol_pct, 0.8, "must round-trip, not fall back to the default");
+        v.validate().expect("the live config must pass validation");
+        let back = serde_json::to_string(&v).unwrap();
+        assert!(back.contains("\"fee_only_vol_pct\":0.8"), "must be re-served: {back}");
+    }
+
+    /// A premium beyond the bound is still refused, and so is a nonsense fee.
+    #[test]
+    fn the_widened_bounds_still_have_ends() {
+        let mut v = CopyTradingV2 { competitors: vec![], ..Default::default() };
+        v.buy_ceiling_pct = -5.1;
+        assert!(v.validate().is_err());
+        v.buy_ceiling_pct = -5.0;
+        assert!(v.validate().is_ok());
+        v.fee_only_vol_pct = 10.1;
+        assert!(v.validate().is_err());
     }
 }
